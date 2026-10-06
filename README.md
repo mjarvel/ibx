@@ -30,7 +30,8 @@ IBX connects directly to Interactive Brokers servers — without requiring the o
 
 This local branch carries our bounded paper-login/lifecycle and opt-in strict
 history patch. See [the contract, limits and offline validation](docs/local-patch.md).
-Direct backend production adoption remains gated.
+Direct backend production adoption remains gated. Our fork uses `dev` for work and
+keeps `main` aligned with upstream; see [the fork workflow](docs/fork-workflow.md).
 
 ## Benchmarks
 
