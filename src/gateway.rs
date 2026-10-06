@@ -1583,6 +1583,15 @@ fn reconnect_ccp_attempt(auth: &ReconnectAuth, token_hash: &str, host: &str, dep
 }
 
 
+/// Start the upstream TLS login protocol through the bounded transport. A
+/// refusal is terminal; controlled login never resends or downgrades encryption.
+fn controlled_ccp_login_start<S: Read + Write>(
+    stream: &mut ControlledIo<S>, channel: &mut SecureChannel, request: &[u8],
+) -> io::Result<session::AuthStart> {
+    session::send_plain(stream, request)?;
+    session::recv_auth_start_limited(stream, channel, LOGIN_FRAME_BYTES)
+}
+
 /// Start of a login on the auth connection, then the auth start is read
 /// (ibx#423). In the reference's SSL mode (jts.ini `[Logon] UseSSL=true`,
 /// the setting of the captured gateway, `ssl`) the connect request
@@ -1821,8 +1830,7 @@ impl Gateway {
         // Controlled login uses the upstream TLS protocol without a redundant
         // DH exchange or plaintext/downgrade retries outside our scope.
         let start = if control.is_some() {
-            session::send_plain(&mut tls, connect_req.as_bytes())?;
-            recv_auth_start(&mut tls, &mut channel, control).map(|start| (start, false))
+            controlled_ccp_login_start(&mut tls, &mut channel, connect_req.as_bytes()).map(|start| (start, false))
         } else {
             ccp_login_start(&mut tls, &mut channel, connect_req.as_bytes(), use_ssl)
         };
@@ -3065,6 +3073,47 @@ mod tests {
         assert!(!refused);
     }
 
+    #[test]
+    fn controlled_tls_auth_start_uses_captured_protocol_without_dh() {
+        let control = ConnectionControl::new(Duration::from_secs(1),
+            std::collections::BTreeMap::from([("offline.invalid".into(), vec!["127.0.0.1".parse().unwrap()])]), "offline-hardware".into()).unwrap();
+        let mut wire = ControlledIo::new(AuthWire::new(&[CAPTURED_AUTH_START]), Some(&control));
+        let start = controlled_ccp_login_start(&mut wire, &mut SecureChannel::new(), CAPTURED_CONNECT.as_bytes()).unwrap();
+        assert!(start.password_required);
+        assert_eq!(wire.stream.sent(), vec![CAPTURED_CONNECT.to_string()]);
+        control.cancel();
+        control.join_workers(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn controlled_tls_auth_start_refuses_retry_or_plaintext_downgrade() {
+        let control = ConnectionControl::new(Duration::from_secs(1),
+            std::collections::BTreeMap::from([("offline.invalid".into(), vec!["127.0.0.1".parse().unwrap()])]), "offline-hardware".into()).unwrap();
+        let mut wire = ControlledIo::new(AuthWire::new(&["50;535;private-refusal;1;", CAPTURED_AUTH_START]), Some(&control));
+        let err = controlled_ccp_login_start(&mut wire, &mut SecureChannel::new(), CAPTURED_CONNECT.as_bytes()).unwrap_err();
+        assert!(!err.to_string().contains("private-refusal"));
+        assert_eq!(wire.stream.sent(), vec![CAPTURED_CONNECT.to_string()]);
+        assert!(wire.stream.input.position() < wire.stream.input.get_ref().len() as u64,
+            "a permitted legacy downgrade must leave the later auth start unread");
+        control.cancel();
+        control.join_workers(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn bounded_tls_auth_start_rejects_announced_frame_without_body_read() {
+        let control = ConnectionControl::new(Duration::from_secs(1),
+            std::collections::BTreeMap::from([("offline.invalid".into(), vec!["127.0.0.1".parse().unwrap()])]), "offline-hardware".into()).unwrap();
+        let mut header = ns::NS_MAGIC.to_vec();
+        header.extend_from_slice(&((LOGIN_FRAME_BYTES + 1) as u32).to_be_bytes());
+        let auth = AuthWire { input: io::Cursor::new(header), output: Vec::new() };
+        let mut wire = ControlledIo::new(auth, Some(&control));
+        let err = controlled_ccp_login_start(&mut wire, &mut SecureChannel::new(), CAPTURED_CONNECT.as_bytes()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(wire.stream.input.position(), 8);
+        assert_eq!(wire.stream.sent(), vec![CAPTURED_CONNECT.to_string()]);
+        control.cancel();
+        control.join_workers(Duration::from_secs(1)).unwrap();
+    }
     // ibx#423: a refusal of the encryption with the permission to go on
     // sends the connect request again in clear; the farms of the session
     // then skip their key exchange.
@@ -4107,9 +4156,6 @@ fn check_control(control: Option<&ConnectionControl>) -> io::Result<()> {
 fn recv_ns<S: Read>(stream: &mut S, control: Option<&ConnectionControl>) -> io::Result<(Vec<u8>,usize)> {
     check_control(control)?;
     match control { Some(_) => ns::ns_recv_limited(stream, LOGIN_FRAME_BYTES), None => ns::ns_recv(stream) }
-}
-fn recv_auth_start<S: Read>(stream: &mut S, channel: &mut SecureChannel, control: Option<&ConnectionControl>) -> io::Result<session::AuthStart> {
-    match control { Some(_) => session::recv_auth_start_limited(stream, channel, LOGIN_FRAME_BYTES), None => session::recv_auth_start(stream, channel) }
 }
 fn validate_route(route: &str) -> io::Result<()> {
     if parse_farm_route(route).is_none() { return Err(io::Error::new(io::ErrorKind::InvalidData, "controlled login requires genuine farm routes")); }

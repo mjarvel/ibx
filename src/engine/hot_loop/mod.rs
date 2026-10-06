@@ -1251,7 +1251,7 @@ impl HotLoop {
             // 1b'. Farms opened on demand (#445): read, then connect,
             //      heartbeat and close them by their rules.
             if self.connection_control.is_some() && !self.pool.is_empty() {
-                self.shared.push_connection_notice(1100, "controlled sessions do not support on-demand farm creation".into());
+                log::warn!("controlled sessions do not support on-demand farm creation");
                 self.connection_control.as_ref().unwrap().cancel();
                 if self.stop_if_cancelled() { break; }
             }
@@ -1860,6 +1860,15 @@ impl HotLoop {
                     // These variants exist for future CCP round-trip support.
                 }
                 ControlCommand::Shutdown => {
+                    if let Some(control) = &self.connection_control {
+                        // Controlled shutdown is terminal: do not issue cancels or
+                        // later commands from this batch after signalling stop.
+                        control.cancel();
+                        self.running = false;
+                        self.shared.set_connection_lost();
+                        emit(&self.event_tx, Event::Disconnected);
+                        break;
+                    }
                     // Unsubscribe all active market data before stopping
                     let instruments: Vec<InstrumentId> = self.farm.instrument_md_reqs
                         .iter().map(|(id, _)| *id).collect();
@@ -4681,6 +4690,38 @@ mod tests {
         assert_eq!(engine.context.loop_iterations, 0);
         assert_eq!(engine.control_rx.as_ref().unwrap().len(), 64,
             "stop must bypass the full issuance queue");
+    }
+
+    #[test]
+    fn controlled_shutdown_stops_batch_before_later_wire_commands() {
+        for controlled in [false, true] {
+            let shared = Arc::new(SharedState::new());
+            let (connection, mut peer) = crate::test_support::Peer::pair();
+            let mut engine = HotLoop::new(shared.clone(), None, None);
+            engine.ccp_conn = Some(connection);
+            let (tx, rx) = crossbeam_channel::bounded(2);
+            engine.set_control_rx(rx);
+            let control = lifecycle_control();
+            if controlled {
+                engine.set_connection_control(control.clone()).unwrap();
+            }
+            tx.try_send(ControlCommand::Shutdown).unwrap();
+            tx.try_send(ControlCommand::Ping).unwrap();
+            engine.poll_once();
+            assert!(!engine.is_running());
+            assert!(shared.take_connection_lost());
+            let messages = peer.messages();
+            if controlled {
+                assert!(control.is_cancelled(), "Shutdown must signal the scope immediately");
+                assert!(messages.is_empty(), "a command after Shutdown reached the wire");
+                assert!(engine.hb.pending_ccp_test.is_none());
+            } else {
+                // The same Ping writes a test request on the unchanged legacy path.
+                assert_eq!(messages.len(), 1);
+                assert_eq!(fix::fix_parse(&messages[0]).get(&fix::TAG_MSG_TYPE).map(String::as_str), Some(fix::MSG_TEST_REQUEST));
+            }
+            control.join_workers(Duration::from_secs(1)).unwrap();
+        }
     }
 
     #[test]
