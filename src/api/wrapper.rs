@@ -77,6 +77,8 @@ pub trait Wrapper {
 
     fn contract_details(&mut self, req_id: i64, details: &ContractDetails) {}
     fn contract_details_end(&mut self, req_id: i64) {}
+    /// A bond row of a contract details request (`bondContractDetails`).
+    fn bond_contract_details(&mut self, req_id: i64, details: &ContractDetails) {}
     fn symbol_samples(&mut self, req_id: i64, descriptions: &[ContractDescription]) {}
 
     // ── Tick-by-Tick ──
@@ -226,7 +228,9 @@ pub trait Wrapper {
     fn user_info(&mut self, req_id: i64, white_branding_id: &str) {}
 }
 
-/// Test helpers for Wrapper-based testing. Hidden from docs.
+/// Test helpers for Wrapper-based testing. Hidden from docs; built only
+/// for the tests (`test-support` feature).
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod tests {
     use super::*;
@@ -290,11 +294,17 @@ pub mod tests {
         fn historical_data(&mut self, req_id: i64, bar: &BarData) {
             self.events.push(format!("historical_data:{req_id}:{}", bar.date));
         }
+        fn historical_data_update(&mut self, req_id: i64, bar: &BarData) {
+            self.events.push(format!("historical_data_update:{req_id}:{}:{}:{}:{}", bar.date, bar.close, bar.volume, bar.bar_count));
+        }
         fn historical_data_end(&mut self, req_id: i64, _: &str, _: &str) {
             self.events.push(format!("historical_data_end:{req_id}"));
         }
         fn contract_details(&mut self, req_id: i64, details: &ContractDetails) {
             self.events.push(format!("contract_details:{req_id}:{}", details.contract.symbol));
+        }
+        fn bond_contract_details(&mut self, req_id: i64, details: &ContractDetails) {
+            self.events.push(format!("bond_contract_details:{req_id}:{}", details.contract.con_id));
         }
         fn contract_details_end(&mut self, req_id: i64) {
             self.events.push(format!("contract_details_end:{req_id}"));
@@ -304,15 +314,20 @@ pub mod tests {
         }
         fn tick_by_tick_all_last(
             &mut self, req_id: i64, tick_type: i32, time: i64, price: f64,
-            size: f64, _: &TickAttribLast, exchange: &str, _: &str,
+            size: f64, attrib: &TickAttribLast, exchange: &str, _: &str,
         ) {
-            self.events.push(format!("tbt_last:{req_id}:{tick_type}:{time}:{price}:{size}:{exchange}"));
+            let mask = attrib.past_limit as i32 | (attrib.unreported as i32) << 1;
+            self.events.push(format!("tbt_last:{req_id}:{tick_type}:{time}:{price}:{size}:{exchange}:{mask}"));
         }
         fn tick_by_tick_bid_ask(
             &mut self, req_id: i64, time: i64, bid_price: f64, ask_price: f64,
-            bid_size: f64, ask_size: f64, _: &TickAttribBidAsk,
+            bid_size: f64, ask_size: f64, attrib: &TickAttribBidAsk,
         ) {
-            self.events.push(format!("tbt_bidask:{req_id}:{time}:{bid_price}:{ask_price}:{bid_size}:{ask_size}"));
+            let mask = attrib.bid_past_low as i32 | (attrib.ask_past_high as i32) << 1;
+            self.events.push(format!("tbt_bidask:{req_id}:{time}:{bid_price}:{ask_price}:{bid_size}:{ask_size}:{mask}"));
+        }
+        fn tick_by_tick_mid_point(&mut self, req_id: i64, time: i64, mid_point: f64) {
+            self.events.push(format!("tbt_mid:{req_id}:{time}:{mid_point}"));
         }
         fn tick_req_params(&mut self, ticker_id: i64, min_tick: f64, bbo_exchange: &str, snapshot_permissions: i64) {
             self.events.push(format!("tick_req_params:{ticker_id}:{min_tick}:{bbo_exchange}:{snapshot_permissions}"));
@@ -333,9 +348,9 @@ pub mod tests {
             self.events.push(format!("news_bulletin:{msg_id}:{msg_type}:{message}:{orig_exchange}"));
         }
         fn tick_news(
-            &mut self, _: i64, _: i64, provider_code: &str, article_id: &str, headline: &str, _: &str,
+            &mut self, ticker_id: i64, timestamp: i64, provider_code: &str, article_id: &str, headline: &str, extra_data: &str,
         ) {
-            self.events.push(format!("tick_news:{provider_code}:{article_id}:{headline}"));
+            self.events.push(format!("tick_news:{ticker_id}:{timestamp}:{provider_code}:{article_id}:{headline}:{extra_data}"));
         }
         fn histogram_data(&mut self, req_id: i64, items: &[(f64, i64)]) {
             self.events.push(format!("histogram_data:{req_id}:{}", items.len()));
@@ -346,8 +361,24 @@ pub mod tests {
         fn fundamental_data(&mut self, req_id: i64, _data: &str) {
             self.events.push(format!("fundamental_data:{req_id}"));
         }
+        fn mkt_depth_exchanges(&mut self, descriptions: &[crate::types::DepthMktDataDescription]) {
+            let rows: Vec<String> = descriptions.iter()
+                .map(|d| format!("{}/{}/{}/{}/{}", d.exchange, d.sec_type, d.listing_exch, d.service_data_type, d.agg_group))
+                .collect();
+            self.events.push(format!("mkt_depth_exchanges:{}", rows.join(",")));
+        }
         fn symbol_samples(&mut self, req_id: i64, descriptions: &[ContractDescription]) {
             self.events.push(format!("symbol_samples:{req_id}:{}", descriptions.len()));
+        }
+        fn security_definition_option_parameter(
+            &mut self, req_id: i64, exchange: &str, underlying_con_id: i64,
+            trading_class: &str, multiplier: &str, expirations: &[String], strikes: &[f64],
+        ) {
+            self.events.push(format!("sec_def_opt_param:{req_id}:{exchange}:{underlying_con_id}:{trading_class}:{multiplier}:{}:{:?}",
+                expirations.join(","), strikes));
+        }
+        fn security_definition_option_parameter_end(&mut self, req_id: i64) {
+            self.events.push(format!("sec_def_opt_param_end:{req_id}"));
         }
         fn scanner_data(
             &mut self, req_id: i64, rank: i32, _details: &ContractDetails,

@@ -131,30 +131,56 @@ fn read_or_create_hwid() -> String {
             return format!("{:0>8}", v);
         }
     }
-    let path = hwid_path();
-    if let Ok(s) = std::fs::read_to_string(&path) {
-        let s = s.trim();
-        if !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit()) {
-            return format!("{:0>8}", s);
-        }
+    hwid_at(&hwid_path())
+}
+
+/// The machine_id persisted at `path`, created there when missing.
+fn hwid_at(path: &std::path::Path) -> String {
+    if let Some(id) = read_hwid(path) {
+        return id;
     }
     let mut buf = [0u8; 4];
     rand::rng().fill_bytes(&mut buf);
     let new_hwid = format!("{:08x}", u32::from_be_bytes(buf));
-    let _ = std::fs::write(&path, &new_hwid);
+    // The file is created only when no other caller created it first (two
+    // logons on a fresh machine at once, or two tests): the first id
+    // written is the machine's, and every caller returns it.
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => {
+            let _ = file.write_all(new_hwid.as_bytes());
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            for _ in 0..100 {
+                if let Some(id) = read_hwid(path) {
+                    return id;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // A file without an id: replaced, as before.
+            let _ = std::fs::write(path, &new_hwid);
+        }
+        Err(_) => {}
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444));
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444));
     }
     #[cfg(windows)]
     {
         let _ = std::process::Command::new("attrib")
             .args(["+H", "+R"])
-            .arg(&path)
+            .arg(path)
             .status();
     }
     new_hwid
+}
+
+/// The 8-hex machine_id in the file at `path`, if it holds one.
+fn read_hwid(path: &std::path::Path) -> Option<String> {
+    let s = std::fs::read_to_string(path).ok()?;
+    let s = s.trim();
+    (!s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit())).then(|| format!("{:0>8}", s))
 }
 
 /// Generate hardware info string: `{machine_id}|{MAC}`.
@@ -202,6 +228,73 @@ pub fn get_lan_ip() -> String {
     sock.local_addr()
         .map(|a| a.ip().to_string())
         .unwrap_or_else(|_| "127.0.0.1".into())
+}
+
+/// Send a protocol message in clear: the framed text, not encrypted.
+pub fn send_plain<W: Write>(stream: &mut W, text: &[u8]) -> io::Result<()> {
+    let mut msg = Vec::with_capacity(8 + text.len());
+    msg.extend_from_slice(NS_MAGIC);
+    msg.extend_from_slice(&(text.len() as u32).to_be_bytes());
+    msg.extend_from_slice(text);
+    stream.write_all(&msg)
+}
+
+/// Send a protocol message encrypted when the session is `secure`, in clear
+/// after the server refused the encryption (ibx#423).
+pub fn send_ns<W: Write>(stream: &mut W, channel: &mut SecureChannel, secure: bool, text: &[u8]) -> io::Result<()> {
+    if secure {
+        send_secure(stream, channel, text)
+    } else {
+        send_plain(stream, text)
+    }
+}
+
+/// Read the answer to the key exchange request. `true`: the session is
+/// encrypted from now on. `false`: the server refused the encryption and
+/// lets the login go on in clear (ibx#423). An error answer, a refusal
+/// without that permission and any other message are errors.
+pub fn read_key_exchange_answer<R: Read>(stream: &mut R, channel: &mut SecureChannel) -> io::Result<bool> {
+    let (payload, _) = ns::ns_recv(stream)?;
+    let text = String::from_utf8_lossy(&payload);
+    let parts: Vec<&str> = text.split(';').collect();
+    let msg_type: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    if msg_type == NS_SECURE_ERROR || msg_type == NS_ERROR_RESPONSE {
+        let err = ns_error(msg_type, parts.get(2..).unwrap_or(&[]));
+        if proceeds_in_clear(&err) {
+            return Ok(false);
+        }
+        return Err(err);
+    }
+    if msg_type != NS_SECURE_CONNECTION_START {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Expected 533, got {}", msg_type),
+        ));
+    }
+    channel.process_server_hello(&parts[2..])?;
+    Ok(true)
+}
+
+/// [`recv_auth_start`], for the auth connection: when the server refuses the
+/// encryption and lets the login go on, `refused` is set and the connect
+/// request `connect_req` is sent again in clear, as the reference does
+/// (ibx#423). The farms opened after such a login skip their key exchange.
+pub fn recv_auth_start_ccp<S: Read + Write>(
+    stream: &mut S,
+    channel: &mut SecureChannel,
+    refused: &mut bool,
+    connect_req: &[u8],
+) -> io::Result<AuthStart> {
+    loop {
+        match recv_auth_start(stream, channel) {
+            Err(e) if proceeds_in_clear(&e) => {
+                *refused = true;
+                send_plain(stream, connect_req)?;
+                log::info!("Connect request sent again in clear");
+            }
+            result => return result,
+        }
+    }
 }
 
 /// Send an encrypted protocol message.
@@ -349,18 +442,43 @@ pub fn login_error(e: &io::Error) -> Option<&LoginError> {
     e.get_ref()?.downcast_ref::<LoginError>()
 }
 
+/// A secure-error answer that lets the login go on: the server refused the
+/// encrypted session and the login continues in clear, as the reference
+/// does (ibx#423). Carried inside an `io::Error`; read it with
+/// [`proceeds_in_clear`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProceedInClear {
+    /// Server text.
+    pub text: String,
+}
+
+impl std::fmt::Display for ProceedInClear {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "secure connection refused by the server, the login goes on in clear: {}", self.text)
+    }
+}
+
+impl std::error::Error for ProceedInClear {}
+
+/// True when `e` is a secure-error answer that lets the login go on in
+/// clear (ibx#423).
+pub fn proceeds_in_clear(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<ProceedInClear>())
+}
+
 /// Error for an error answer (`NS_ERROR_RESPONSE`) or a secure-error answer
 /// (`NS_SECURE_ERROR`); `fields` are the fields after the message type.
 ///
-/// A secure-error answer can let the reference go on without the
-/// encryption; that fallback is not supported here, so it always refuses.
+/// A secure-error answer whose proceed flag is `1` gives [`ProceedInClear`]:
+/// the caller goes on without the encryption, as the reference does. Any
+/// other flag is an authorization failure (ibx#423).
 pub fn ns_error(msg_type: u32, fields: &[&str]) -> io::Error {
     let field = |i: usize| fields.get(i).copied().unwrap_or("").to_string();
     if msg_type == NS_SECURE_ERROR {
-        let proceed = field(1) == "1";
-        let mut text = field(0);
-        if proceed {
-            text.push_str(" (the server allows an unencrypted login, which is not supported)");
+        let text = field(0);
+        if field(1) == "1" {
+            log::warn!("Secure connection refused by the server, going on in clear: {}", text);
+            return io::Error::new(io::ErrorKind::Other, ProceedInClear { text });
         }
         return LoginError { kind: LoginErrorKind::SecureConnectionRefused, code: None, text }.into();
     }
@@ -1116,8 +1234,10 @@ pub struct IbKeyChallenge {
 /// secrets vault, etc.) or return an `io::Error` to abort the login.
 ///
 /// The callback runs on its own thread: the login keeps reading the socket
-/// and answering the server keepalives while it waits (ibx#244). The login
-/// deadline still applies; when it fires first the login fails and a later
+/// and answering the server keepalives while it waits (ibx#244). There is
+/// no client deadline by default, as in the reference: the wait ends with
+/// the server's answer or when the server closes the socket (ibx#208). When
+/// a client deadline is set and fires first, the login fails and a later
 /// answer of the callback is dropped.
 pub type CodeProvider = std::sync::Arc<
     dyn Fn(IbKeyChallenge) -> io::Result<String> + Send + Sync,
@@ -1128,9 +1248,20 @@ fn hex_dump(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ")
 }
 
-/// Default deadline for the second-factor gate, matching the server-side
-/// timeout measured in capture run B (~18 min).
-pub const IB_KEY_DEFAULT_TIMEOUT_SECS: u64 = 1080;
+/// Default client deadline for the second-factor gate: none (`0`). The
+/// reference has no client timeout there; the server closes the socket
+/// after about 18 minutes (ibx#208). A value above 0 is a deadline in
+/// seconds.
+pub const IB_KEY_DEFAULT_TIMEOUT_SECS: u64 = 0;
+
+/// The client deadline of the second-factor gate for a timeout in seconds:
+/// none for `0` (ibx#208).
+pub fn ib_key_deadline(timeout_secs: u64) -> Option<std::time::Instant> {
+    if timeout_secs == 0 {
+        return None;
+    }
+    std::time::Instant::now().checked_add(std::time::Duration::from_secs(timeout_secs))
+}
 
 /// Default of [`crate::gateway::GatewayConfig::ib_key_token_sub_type`]:
 /// empty, so the token sub-type sent in the SWCR_TOKEN state=1 body comes
@@ -1151,7 +1282,8 @@ const IB_KEY_HEARTBEAT_CADENCE_SECS: u64 = 20;
 ///    `approval_url` / `session_id`, keep looping
 /// 3. An `NS_TEST_REQUEST` (530) arrives → reply with `NS_HEART_BEAT` (531),
 ///    keep looping
-/// 4. `deadline` expires → `TimedOut` error
+/// 4. `deadline`, when given, expires → `TimedOut` error (no deadline by
+///    default, as in the reference, ibx#208)
 /// 5. Underlying socket close → `ConnectionAborted` error (server's deadline)
 ///
 /// With a `code_provider` the code is asked on a worker thread at state=2 and
@@ -1167,10 +1299,11 @@ const IB_KEY_HEARTBEAT_CADENCE_SECS: u64 = 20;
 pub fn do_ib_key_2fa<S: Read + Write>(
     stream: &mut S,
     token_sub_type: &str,
-    deadline: std::time::Instant,
+    deadline: impl Into<Option<std::time::Instant>>,
     code_provider: Option<&CodeProvider>,
 ) -> io::Result<IbKeyOutcome> {
     use std::time::Instant;
+    let deadline: Option<Instant> = deadline.into();
 
     // Send SWCR_TOKEN state=1. The username slot is empty in state=1; the
     // tokenSubType (account-specific, typically "2a") is the only non-empty
@@ -1196,7 +1329,7 @@ pub fn do_ib_key_2fa<S: Read + Write>(
     let mut frames = NsFramePoller::default();
 
     loop {
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
             return Err(ib_key_err(
                 io::ErrorKind::TimedOut,
                 "2FA approval timed out (client deadline)",
@@ -1382,8 +1515,8 @@ pub enum SoftTokenOutcome {
     Unknown,
 }
 
-pub fn do_soft_token(
-    stream: &mut TcpStream,
+pub fn do_soft_token<S: Read + Write>(
+    stream: &mut S,
     session_token: &BigUint,
     carry: &mut Vec<u8>,
 ) -> io::Result<SoftTokenOutcome> {
@@ -1479,8 +1612,8 @@ fn do_soft_token_impl<S: Read + Write>(stream: &mut S, session_token: &BigUint, 
 /// SRP-6 authentication for farm connections using FIX framing (8=1).
 /// Called as fallback when `do_soft_token` returns `SoftTokenOutcome::Unknown`.
 /// Same SRP math as `do_srp`, different wire framing.
-pub fn do_srp_farm(
-    stream: &mut TcpStream,
+pub fn do_srp_farm<S: Read + Write>(
+    stream: &mut S,
     username: &str,
     password: &str,
     carry: &mut Vec<u8>,
@@ -1884,6 +2017,31 @@ mod tests {
     // created once — see read_or_create_hwid, ib-agent#132), so repeated calls
     // must return the SAME id. This test previously asserted the pre-#132
     // behavior (random id per call) and failed once a hwid file existed.
+    // Callers that find no machine id at the same moment all get the one
+    // id written first.
+    #[test]
+    fn concurrent_first_calls_agree_on_the_machine_id() {
+        let dir = std::env::temp_dir().join(format!("ibx-hwid-{}-{}", std::process::id(), rand::random::<u32>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hwid");
+        let ids: Vec<String> = (0..8)
+            .map(|_| { let p = path.clone(); std::thread::spawn(move || hwid_at(&p)) })
+            .collect::<Vec<_>>()
+            .into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(ids.iter().all(|id| id == &ids[0]), "{ids:?}");
+        assert_eq!(read_hwid(&path).as_deref(), Some(ids[0].as_str()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("attrib").args(["-H", "-R"]).arg(&path).status();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn hw_info_machine_id_is_stable_across_calls() {
         let info1 = get_hw_info();
@@ -2176,18 +2334,86 @@ mod tests {
         assert_eq!(login.unwrap(), LoginError { kind: LoginErrorKind::SiteDown, code: Some(4), text: "site down".into() });
     }
 
-    // ibx#423: a secure-error answer refuses with either proceed flag; the
-    // unencrypted fallback is not supported.
+    // ibx#423: a secure-error answer with the proceed flag 1 lets the login
+    // go on in clear; any other flag is an authorization failure.
     #[test]
-    fn recv_secure_secure_error_refuses_with_either_flag() {
-        for (frame, says_fallback) in [("50;535;text;1;", true), ("50;535;text;0;", false)] {
+    fn recv_secure_secure_error_proceeds_only_with_flag_one() {
+        let (err, login) = recv_secure_login_error(&["50;535;text;1;"]);
+        assert!(login.is_none());
+        assert!(proceeds_in_clear(&err), "{err}");
+        for frame in ["50;535;text;0;", "50;535;text;;", "50;535;text;"] {
             let (err, login) = recv_secure_login_error(&[frame]);
             let login = login.unwrap();
-            assert_eq!(login.kind, LoginErrorKind::SecureConnectionRefused);
+            assert_eq!(login.kind, LoginErrorKind::SecureConnectionRefused, "{frame}");
             assert!(!login.kind.is_retryable());
             assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
-            assert_eq!(err.to_string().contains("not supported"), says_fallback, "{err}");
+            assert!(!proceeds_in_clear(&err));
         }
+    }
+
+    /// A stream that reads `frames` and records what is written.
+    struct Duplex {
+        input: io::Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+
+    impl Duplex {
+        fn new(frames: &[&str]) -> Self {
+            let mut wire = Vec::new();
+            for f in frames {
+                wire.extend_from_slice(&build_ns_frame(f));
+            }
+            Self { input: io::Cursor::new(wire), output: Vec::new() }
+        }
+    }
+
+    impl Read for Duplex {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> { self.input.read(buf) }
+    }
+
+    impl Write for Duplex {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> { self.output.extend_from_slice(buf); Ok(buf.len()) }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+
+    // ibx#423: the answer to the key exchange request.
+    #[test]
+    fn key_exchange_answer_refused_with_proceed_goes_on_in_clear() {
+        let mut channel = SecureChannel::new();
+        assert!(!read_key_exchange_answer(&mut Duplex::new(&["50;535;no crypto;1;"]), &mut channel).unwrap());
+        let err = read_key_exchange_answer(&mut Duplex::new(&["50;535;no crypto;0;"]), &mut channel).unwrap_err();
+        assert_eq!(login_error(&err).unwrap().kind, LoginErrorKind::SecureConnectionRefused);
+        let err = read_key_exchange_answer(&mut Duplex::new(&["50;519;4;site down;"]), &mut channel).unwrap_err();
+        assert_eq!(login_error(&err).unwrap().kind, LoginErrorKind::SiteDown);
+        let err = read_key_exchange_answer(&mut Duplex::new(&["50;520;x;"]), &mut channel).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    // ibx#423: a refusal with proceed while waiting for the auth start sends
+    // the connect request again in clear and waits on; the auth start can
+    // then come in clear.
+    #[test]
+    fn auth_start_wait_sends_the_connect_request_again_in_clear() {
+        let mut stream = Duplex::new(&["50;535;no crypto;1;", "50;520;0;1;;0;"]);
+        let mut channel = SecureChannel::new();
+        let mut refused = false;
+        let start = recv_auth_start_ccp(&mut stream, &mut channel, &mut refused, b"38;521;user;").unwrap();
+        assert!(refused);
+        assert!(start.password_required);
+        assert_eq!(stream.output, build_ns_frame("38;521;user;"), "the connect request, in clear");
+
+        let mut stream = Duplex::new(&["50;535;no crypto;0;"]);
+        let mut refused = false;
+        let err = recv_auth_start_ccp(&mut stream, &mut channel, &mut refused, b"38;521;user;").unwrap_err();
+        assert_eq!(login_error(&err).unwrap().kind, LoginErrorKind::SecureConnectionRefused);
+        assert!(!refused && stream.output.is_empty());
+    }
+
+    #[test]
+    fn send_ns_in_clear_is_the_framed_text() {
+        let mut out = Vec::new();
+        send_ns(&mut out, &mut SecureChannel::new(), false, b"38;526;0;;2;0;").unwrap();
+        assert_eq!(out, build_ns_frame("38;526;0;;2;0;"));
     }
 
     // ibx#423: a backup-host notice is skipped; the next message is read.
@@ -2451,6 +2677,21 @@ mod tests {
 
     fn far_future_deadline() -> std::time::Instant {
         std::time::Instant::now() + std::time::Duration::from_secs(60)
+    }
+
+    // ibx#208: no client deadline by default, as in the reference; a set
+    // timeout is a deadline.
+    #[test]
+    fn ib_key_wait_has_no_client_deadline_by_default() {
+        assert_eq!(IB_KEY_DEFAULT_TIMEOUT_SECS, 0);
+        assert!(ib_key_deadline(IB_KEY_DEFAULT_TIMEOUT_SECS).is_none());
+        assert!(ib_key_deadline(30).is_some_and(|d| d > std::time::Instant::now()));
+        let challenge = xyz::xyz_build(xyz::XYZ_MSG_SWCR_TOKEN, 2, "user", &["", "580 820", "https://www.example.com/s"]);
+        let auth_finish = xyz::xyz_build(xyz::XYZ_MSG_TOKEN_AUTH, 5, "user", &["PASSED"]);
+        let mut incoming = frame_xyz(&challenge);
+        incoming.extend_from_slice(&frame_xyz(&auth_finish));
+        let outcome = do_ib_key_2fa(&mut ScriptedStream::new(incoming), "2a", None, None).unwrap();
+        assert!(matches!(outcome, IbKeyOutcome::Approved { .. }), "{outcome:?}");
     }
 
     #[test]

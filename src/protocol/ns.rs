@@ -81,6 +81,9 @@ pub fn parse_test_request_timestamp(payload: &[u8]) -> Option<String> {
     fields.into_iter().find(|f| !f.is_empty())
 }
 
+/// Buffer reserved at once for an NS payload; a longer one grows as it comes.
+const NS_READ_CHUNK: usize = 64 * 1024;
+
 /// Receive one `#%#%` framed message. Returns (payload_bytes, total_len).
 pub fn ns_recv<R: Read>(reader: &mut R) -> io::Result<(Vec<u8>, usize)> {
     ns_recv_impl(reader, i32::MAX as usize, true)
@@ -111,12 +114,18 @@ fn ns_recv_impl<R: Read>(reader: &mut R, max_payload_bytes: usize, peer_diagnost
             if peer_diagnostics { format!("NS frame length {:#010x} is negative", raw_len) } else { "invalid bounded NS frame length".to_string() },
         ));
     }
+    // The payload grows as its bytes come: a length the peer does not send
+    // costs nothing. A buffer of the stated length was allocated at once,
+    // up to 2 GB from one 8-byte header (ibx#488).
     let payload_len = raw_len as usize;
     if payload_len > max_payload_bytes {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "NS frame exceeds payload byte limit"));
     }
-    let mut payload = vec![0u8; payload_len];
-    reader.read_exact(&mut payload)?;
+    let mut payload = Vec::with_capacity(payload_len.min(NS_READ_CHUNK));
+    reader.by_ref().take(raw_len as u64).read_to_end(&mut payload)?;
+    if payload.len() < payload_len {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "NS frame cut short"));
+    }
     Ok((payload, payload_len + 8))
 }
 

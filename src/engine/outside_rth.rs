@@ -39,6 +39,17 @@ pub(crate) struct RthTypes {
     /// (PEGMKT; PEGMID or PEGMID2) are in the list (ibx#414).
     pub peg_mkt: bool,
     pub peg_mid: bool,
+    /// The keys of market with protection (MKTPROT) and stop with
+    /// protection (STPPROT) are in the list (ibx#493).
+    pub mkt_prot: bool,
+    pub stp_prot: bool,
+    /// The price check key (PRICECHK) is in the list (ibx#492).
+    pub price_chk: bool,
+    /// The all-or-none key (AON) is in the list (ibx#263).
+    pub aon: bool,
+    /// SMART is a valid exchange of the contract (tag 6046 names it BEST;
+    /// `jclient.dy.dI()`), for the redirect precaution (ibx#486).
+    pub smart: bool,
 }
 
 impl RthTypes {
@@ -65,6 +76,10 @@ impl RthTypes {
                 "RTH4MKT" => t.rth4mkt = true,
                 "PEGMKT" => t.peg_mkt = true,
                 "PEGMID" | "PEGMID2" => t.peg_mid = true,
+                "MKTPROT" => t.mkt_prot = true,
+                "STPPROT" => t.stp_prot = true,
+                "PRICECHK" => t.price_chk = true,
+                "AON" => t.aon = true,
                 _ => {}
             }
         }
@@ -104,7 +119,7 @@ impl RthKind {
 
 /// True when outside-RTH stays on the order (ib-agent#199, conditions A and
 /// B). `exchange` is the order's exchange as sent (BEST for SMART); `tif` the
-/// time-in-force byte. ibx sends no combo, volatility, algo AccuDistr,
+/// time-in-force byte. ibx sends no volatility, algo AccuDistr,
 /// relative-discretionary or OMS container order, so those conditions pass.
 pub(crate) fn outside_rth_applies(kind: RthKind, tif: u8, exchange: &str, types: &RthTypes) -> bool {
     // A4: a market-like type is regular-hours only on a US stock or
@@ -121,7 +136,16 @@ pub(crate) fn outside_rth_applies(kind: RthKind, tif: u8, exchange: &str, types:
     let tif_ok = !kind.moc_loc
         && !matches!(tif, b'?' | b'4' | b'3')
         && (tif != b'2' || exchange == "ARCA");
-    if !((types.rth && tif_ok) || (types.lth && kind.stop_or_touched)) { return false; }
+    // A combo (ibx#470, its BAG definition): never with a market-like
+    // type, else when the time in force allows it or the type is a stop
+    // or touched one (`OutsideRth.a(pe, list, type, exch, tif)` step 2).
+    // Whether the combo's exchange enables outside RTH for combos (A3) is
+    // not known here; it is taken as enabled.
+    if types.sec_type == "BAG" {
+        if kind.market_like || !(tif_ok || kind.stop_or_touched) { return false; }
+    } else if !((types.rth && tif_ok) || (types.lth && kind.stop_or_touched)) {
+        return false;
+    }
     // A9: not the overnight venues.
     if matches!(exchange, "OVERNIGHT" | "IBEOS") { return false; }
     // B: session-only lists.
@@ -145,7 +169,7 @@ pub(crate) fn rth_parts(req: &mut OrderRequest) -> Option<(Option<u32>, RthKind,
         R::SubmitStopLimitGtc { instrument, outside_rth, .. } =>
             Some((Some(*instrument), RthKind::of(&OrderKind::StopLimit { price: 0, stop_price: 0 }), b'1', None, outside_rth)),
         R::SubmitTrailingStopPctEx { instrument, tif, attrs, .. } =>
-            Some((Some(*instrument), RthKind::of(&OrderKind::TrailPct { trail_pct: 0, trail_stop_price: 0 }), *tif, None, &mut attrs.outside_rth)),
+            Some((Some(*instrument), RthKind::of(&OrderKind::TrailPct { trail_percent: 0, trail_stop_price: 0 }), *tif, None, &mut attrs.outside_rth)),
         R::SubmitLimitEx { instrument, tif, attrs, .. }
         | R::SubmitAdaptive { instrument, tif, attrs, .. }
         | R::SubmitAlgo { instrument, tif, attrs, .. } => Some((Some(*instrument), limit, *tif, None, &mut attrs.outside_rth)),
@@ -156,20 +180,52 @@ pub(crate) fn rth_parts(req: &mut OrderRequest) -> Option<(Option<u32>, RthKind,
     }
 }
 
+/// Text of error 10257: all-or-none on an order whose contract's
+/// order-type list for its exchange has no AON key (ibx#263).
+pub(crate) const ALL_OR_NONE_NOT_ALLOWED: &str = "The 'All or None' order attribute may not be specified for this order.";
+
+/// An order with all-or-none, checked against the order-type list: the
+/// reference refuses it with 10257 when the contract's list for the
+/// order's exchange is known and has no AON key
+/// (`trader.order.proc.aN.a(pe,OcoScope,Q,pe,boolean)@12594-12650`,
+/// `jattrib.attribs.AllOrNone.h(pe)` → `jattrib.Attribute.a(jibtypes.i)`:
+/// no list, or the empty one, allows it). Some(the instrument, None for a
+/// replace, whose instrument is the order's) for a request with
+/// all-or-none set; None otherwise.
+pub(crate) fn all_or_none_check(req: &OrderRequest) -> Option<Option<u32>> {
+    match req {
+        OrderRequest::Modify { attrs, .. } => attrs.all_or_none.then_some(None),
+        other => {
+            let (_, attrs) = other.new_order_side()?;
+            attrs?.all_or_none.then(|| other.instrument())
+        }
+    }
+}
+
 /// Text of error 387, the reference's refusal of an order type the
 /// contract's list does not allow on the order's exchange (ibx#414).
 pub(crate) const UNSUPPORTED_ORDER_TYPE: &str = "Unsupported order type for this exchange and security type.";
 
-/// A new pegged-to-market or pegged-to-midpoint order and its instrument:
-/// the reference refuses it with 387 when the contract's order-type list
-/// for its exchange lacks the type (ib-agent#192 B8b, ibx#414).
+/// A new order of a type checked against the order-type list, and its
+/// instrument: the reference refuses it with 387 when the contract's
+/// order-type list for its exchange lacks the type's key
+/// (`trader.order.proc.aN.a(pe,OcoScope,Q,pe,boolean)@5275-5352`: the key
+/// `jibtypes.s.i()` is not in the list and the type is not in the list's
+/// order types either). Checked for pegged to market and pegged to
+/// midpoint (ib-agent#192 B8b, ibx#414), and for market and stop with
+/// protection, keys MKTPROT and STPPROT (`jibtypes.L.i()`,
+/// `jibtypes.ae.i()`; ibx#493: neither is in the SPY list on BEST).
 pub(crate) fn pegged_type_check(req: &OrderRequest) -> Option<(u32, fn(&RthTypes) -> bool)> {
     use OrderRequest as R;
     let mkt: fn(&RthTypes) -> bool = |t| t.peg_mkt;
     let mid: fn(&RthTypes) -> bool = |t| t.peg_mid;
+    let mkt_prot: fn(&RthTypes) -> bool = |t| t.mkt_prot;
+    let stp_prot: fn(&RthTypes) -> bool = |t| t.stp_prot;
     match req {
         R::SubmitPegMkt { instrument, .. } | R::SubmitEx { instrument, kind: OrderKind::PegMkt { .. }, .. } => Some((*instrument, mkt)),
         R::SubmitPegMid { instrument, .. } | R::SubmitEx { instrument, kind: OrderKind::PegMid { .. }, .. } => Some((*instrument, mid)),
+        R::SubmitMktPrt { instrument, .. } | R::SubmitEx { instrument, kind: OrderKind::MktPrt, .. } => Some((*instrument, mkt_prot)),
+        R::SubmitStpPrt { instrument, .. } | R::SubmitEx { instrument, kind: OrderKind::StpPrt { .. }, .. } => Some((*instrument, stp_prot)),
         _ => None,
     }
 }
@@ -192,7 +248,7 @@ mod tests {
         let cases = [
             ("STP DAY", k(OrderKind::Stop { stop_price: 1 }), b'0', "BEST", false),
             ("TRAIL amount DAY", k(OrderKind::TrailingStop { trail_amt: 1, trail_stop_price: 0 }), b'0', "BEST", false),
-            ("TRAIL percent GTC", k(OrderKind::TrailPct { trail_pct: 1, trail_stop_price: 0 }), b'1', "BEST", false),
+            ("TRAIL percent GTC", k(OrderKind::TrailPct { trail_percent: 1, trail_stop_price: 0 }), b'1', "BEST", false),
             ("STP LMT GTC", k(OrderKind::StopLimit { price: 1, stop_price: 1 }), b'1', "BEST", true),
             ("TRAIL LIMIT GTC", k(OrderKind::TrailingStopLimit { lmt_offset: 1, lmt_price: None, trail_amt: 1, trail_stop_price: 1 }), b'1', "BEST", true),
             ("MIT GTC", k(OrderKind::Mit { stop_price: 1 }), b'1', "BEST", false),
@@ -201,7 +257,7 @@ mod tests {
             ("LMT FOK", k(OrderKind::Limit { price: 1 }), b'4', "BEST", false),
             ("LMT IOC", k(OrderKind::Limit { price: 1 }), b'3', "BEST", false),
             ("LMT OPG", k(OrderKind::Limit { price: 1 }), b'2', "BEST", false),
-            ("REL DAY", k(OrderKind::Rel { offset: 1 }), b'0', "BEST", true),
+            ("REL DAY", k(OrderKind::Rel { price: 0, offset: 1 }), b'0', "BEST", true),
             ("LMT DAY", k(OrderKind::Limit { price: 1 }), b'0', "BEST", true),
             ("LMT GTC", k(OrderKind::Limit { price: 1 }), b'1', "BEST", true),
         ];

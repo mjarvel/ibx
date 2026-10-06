@@ -9,12 +9,6 @@ use super::super::contract::Contract;
 
 #[pymethods]
 impl EClient {
-    /// Set news provider codes for per-contract news ticks (e.g. "BRFG*BRFUPDN").
-    #[pyo3(signature = (providers))]
-    fn set_news_providers(&self, providers: &str) {
-        self.core.set_news_providers(providers);
-    }
-
     /// Request market data for a contract.
     #[pyo3(signature = (req_id, contract, generic_tick_list="", snapshot=false, regulatory_snapshot=false, mkt_data_options=Vec::new()))]
     fn req_mkt_data(
@@ -27,14 +21,44 @@ impl EClient {
         regulatory_snapshot: bool,
         mkt_data_options: Vec<Py<PyAny>>,
     ) -> PyResult<()> {
-        if let Some(r) = self.not_connected(req_id as i64) { return r; }
+        if let Some(r) = self.not_connected(req_id) { return r; }
+        if !crate::client_core::ClientCore::ids_fit("req_mkt_data", &[req_id, contract.con_id]) { return Ok(()); }
         let tx = self.tx()?;
         let shared = self.shared_state()?;
-        if let Some((code, text)) = self.core.duplicate_ticker_refusal(req_id) {
-            shared.orders.push_order_error(req_id as u64, code, text);
+        // A contract with no exchange: 321, the reference's first check.
+        // An invalid generic tick list of a request that is no snapshot:
+        // 321 (ibx#450).
+        if let Some((code, text)) = crate::client_core::ClientCore::market_data_exchange_refusal(&contract.exchange, &contract.sec_type)
+            .or_else(|| self.core.generic_tick_list_refusal(generic_tick_list, snapshot, &contract.sec_type))
+        {
+            shared.orders.push_order_error(req_id, code, text);
             return Ok(());
         }
+        // The snapshot checks come before the duplicate check, as the
+        // reference's (ibx#446).
+        if snapshot
+            && let Some((code, text)) = self.core.snapshot_refusal(&shared, generic_tick_list, &contract.sec_type)
+        {
+            shared.orders.push_order_error(req_id, code, text);
+            return Ok(());
+        }
+        if let Some((code, text)) = self.core.duplicate_ticker_refusal(req_id) {
+            shared.orders.push_order_error(req_id, code, text);
+            return Ok(());
+        }
+        // A regulatory snapshot goes through its own fetcher (ibx#446).
+        if regulatory_snapshot {
+            let _ = mkt_data_options;
+            return py.detach(|| self.core.start_regulatory_snapshot(
+                &shared, &tx, req_id, contract.con_id, &contract.symbol, &contract.exchange, &contract.sec_type,
+            )).map_err(PyRuntimeError::new_err);
+        }
 
+        // The news tick of a known contract is checked first (ibx#458).
+        if let Some((code, text)) = self.core.news_tick_refusal(&shared, generic_tick_list, contract.con_id, &contract.sec_type) {
+            shared.orders.push_order_error(req_id, code, text);
+            return Ok(());
+        }
         let filters = SecDefFilters {
             primary_exchange: contract.primary_exchange.clone(),
             local_symbol: contract.local_symbol.clone(),
@@ -46,6 +70,7 @@ impl EClient {
             sec_id: contract.sec_id.clone(),
             sec_id_type: contract.sec_id_type.clone(),
             include_expired: contract.include_expired,
+            issuer_id: String::new(),
         };
         // The registration waits for the engine: interpreter lock released
         // (ibx#271).
@@ -70,24 +95,32 @@ impl EClient {
             });
         }
 
-        let _ = (regulatory_snapshot, mkt_data_options);
+        let _ = mkt_data_options;
 
         Ok(())
     }
 
     /// Cancel market data.
     pub fn cancel_mkt_data(&self, py: Python<'_>, req_id: i64) -> PyResult<()> {
-        if let Some(r) = self.not_connected(req_id as i64) { return r; }
-        let (instrument, needs_news_unsub) = self.core.unregister_mkt_data(req_id);
-        if let Some(instrument) = instrument {
-            let tx = self.tx()?;
-            send_cmd(py, &tx, ControlCommand::Unsubscribe { instrument })?;
-            if needs_news_unsub {
-                let _ = send_cmd(py, &tx, ControlCommand::UnsubscribeNews { instrument });
+        if let Some(r) = self.not_connected(req_id) { return r; }
+        if !crate::client_core::ClientCore::ids_fit("cancel_mkt_data", &[req_id]) { return Ok(()); }
+        // A running regulatory snapshot stops silently (ibx#446).
+        if let Ok(tx) = self.tx() {
+            if self.core.cancel_regulatory_snapshot(req_id, &tx) {
+                return Ok(());
+            }
+        }
+        let shared = self.shared_state()?;
+        if let Some(cancel) = self.core.unregister_mkt_data(&shared, req_id) {
+            // The subscription ends with the last request of the contract;
+            // its news entries go with it (ibx#458, ibx#444).
+            for command in cancel.commands() {
+                let tx = self.tx()?;
+                send_cmd(py, &tx, command)?;
             }
         } else {
             // An unknown request id: error 300, as the reference (ibx#444).
-            self.shared_state()?.orders.push_order_error(req_id as u64, 300, format!("Can't find EId with tickerId:{}", req_id));
+            shared.orders.push_order_error(req_id, 300, format!("Can't find EId with tickerId:{}", req_id));
         }
         Ok(())
     }
@@ -103,20 +136,27 @@ impl EClient {
         number_of_ticks: i32,
         ignore_size: bool,
     ) -> PyResult<()> {
-        if let Some(r) = self.not_connected(req_id as i64) { return r; }
+        if let Some(r) = self.not_connected(req_id) { return r; }
+        if !crate::client_core::ClientCore::ids_fit("req_tick_by_tick_data", &[req_id, contract.con_id]) { return Ok(()); }
         let tx = self.tx()?;
 
         // The reference's checks: 321 for a bad type or a combo, 10189 when
         // the logon turns it off, 10190 past the contract limit (ibx#455).
         let shared = self.shared_state()?;
         let local_symbol = if contract.local_symbol.is_empty() { &contract.symbol } else { &contract.local_symbol };
-        let tbt_type = match self.core.tbt_refusal(&shared, contract.con_id, &contract.sec_type, tick_type, local_symbol) {
+        let tbt_type = match self.core.tbt_refusal(&shared, &contract.sec_type, tick_type, local_symbol) {
             Ok(t) => t,
             Err((code, text)) => {
-                shared.orders.push_order_error(req_id as u64, code, text);
+                shared.orders.push_order_error(req_id, code, text);
                 return Ok(());
             }
         };
+        // A contract without a conId is looked up first, as the reference
+        // does (captured 05/10/2026).
+        if contract.con_id == 0 {
+            return self.core.register_tbt_by_symbol(&tx, req_id, &contract.to_api(), tbt_type, number_of_ticks, ignore_size)
+                .map_err(PyRuntimeError::new_err);
+        }
         send_cmd(py, &tx, ControlCommand::RegisterInstrument {
             con_id: contract.con_id,
             symbol: contract.symbol.clone(),
@@ -128,7 +168,8 @@ impl EClient {
         // (ibx#271).
         py.detach(|| self.core.register_tbt(
             &shared, &tx, req_id,
-            contract.con_id, &contract.symbol, tbt_type, number_of_ticks, ignore_size,
+            contract.con_id, &contract.symbol, &contract.exchange, &contract.sec_type,
+            tbt_type, number_of_ticks, ignore_size,
         )).map_err(|e| PyRuntimeError::new_err(e))?;
         Ok(())
     }
@@ -136,9 +177,10 @@ impl EClient {
     /// Cancel tick-by-tick data.
     fn cancel_tick_by_tick_data(&self, py: Python<'_>, req_id: i64) -> PyResult<()> {
         if let Some(r) = self.not_connected(-1) { return r; }
-        if let Some(instrument) = self.core.unregister_tbt(req_id) {
+        if !crate::client_core::ClientCore::ids_fit("cancel_tick_by_tick_data", &[req_id]) { return Ok(()); }
+        if self.core.unregister_tbt(req_id).is_some() {
             let tx = self.tx()?;
-            send_cmd(py, &tx, ControlCommand::UnsubscribeTbt { instrument })?;
+            send_cmd(py, &tx, ControlCommand::UnsubscribeTbt { req_id })?;
         }
         Ok(())
     }
@@ -174,7 +216,7 @@ impl EClient {
         if let Some(r) = self.not_connected(-1) { return r; }
         let tx = self.tx()?;
         if let Some((code, text)) = py.detach(|| self.core.set_market_data_type(&tx, market_data_type)) {
-            self.shared_state()?.orders.push_order_error(-1i64 as u64, code, text);
+            self.shared_state()?.orders.push_order_error(-1, code, text);
         }
         Ok(())
     }
@@ -190,13 +232,16 @@ impl EClient {
         is_smart_depth: bool,
         mkt_depth_options: Vec<Py<PyAny>>,
     ) -> PyResult<()> {
-        if let Some(r) = self.not_connected(req_id as i64) { return r; }
+        if let Some(r) = self.not_connected(req_id) { return r; }
+        if !crate::client_core::ClientCore::ids_fit("req_mkt_depth", &[req_id, contract.con_id]) { return Ok(()); }
         let _ = mkt_depth_options;
-        let exchange = if contract.exchange.is_empty() { "SMART".to_string() } else { contract.exchange.clone() };
+        // An empty exchange is refused by the engine, as the reference
+        // refuses it (#452).
+        let exchange = contract.exchange.clone();
         let sec_type = if contract.sec_type.is_empty() { "STK".to_string() } else { contract.sec_type.clone() };
         let tx = self.tx()?;
         send_cmd(py, &tx, ControlCommand::SubscribeDepth {
-            req_id: req_id as u32,
+            req_id,
             con_id: contract.con_id,
             exchange,
             sec_type,
@@ -210,9 +255,10 @@ impl EClient {
     #[pyo3(signature = (req_id, is_smart_depth=false))]
     fn cancel_mkt_depth(&self, py: Python<'_>, req_id: i64, is_smart_depth: bool) -> PyResult<()> {
         if let Some(r) = self.not_connected(-1) { return r; }
+        if !crate::client_core::ClientCore::ids_fit("cancel_mkt_depth", &[req_id]) { return Ok(()); }
         let _ = is_smart_depth;
         let tx = self.tx()?;
-        send_cmd(py, &tx, ControlCommand::UnsubscribeDepth { req_id: req_id as u32 })?;
+        send_cmd(py, &tx, ControlCommand::UnsubscribeDepth { req_id })?;
         Ok(())
     }
 
@@ -228,26 +274,30 @@ impl EClient {
         use_rth: i32,
         real_time_bars_options: Vec<Py<PyAny>>,
     ) -> PyResult<()> {
-        if let Some(r) = self.not_connected(req_id as i64) { return r; }
+        if let Some(r) = self.not_connected(req_id) { return r; }
+        if !crate::client_core::ClientCore::ids_fit("req_real_time_bars", &[req_id, contract.con_id]) { return Ok(()); }
         let tx = self.tx()?;
         let _ = (bar_size, real_time_bars_options);
-        send_cmd(py, &tx, ControlCommand::SubscribeRealTimeBar {
-            req_id: req_id as u32,
+        // A contract without a conId is looked up first, as the reference
+        // does (captured 05/10/2026).
+        send_cmd(py, &tx, crate::client_core::ClientCore::resolve_first(req_id, &contract.to_api(), ControlCommand::SubscribeRealTimeBar {
+            req_id,
             con_id: contract.con_id,
             symbol: contract.symbol.clone(),
             sec_type: contract.sec_type.clone(),
             exchange: contract.exchange.clone(),
             what_to_show: what_to_show.to_string(),
             use_rth: use_rth != 0,
-        })?;
+        }))?;
         Ok(())
     }
 
     /// Cancel real-time bars.
     fn cancel_real_time_bars(&self, py: Python<'_>, req_id: i64) -> PyResult<()> {
-        if let Some(r) = self.not_connected(req_id as i64) { return r; }
+        if let Some(r) = self.not_connected(req_id) { return r; }
+        if !crate::client_core::ClientCore::ids_fit("cancel_real_time_bars", &[req_id]) { return Ok(()); }
         let tx = self.tx()?;
-        send_cmd(py, &tx, ControlCommand::CancelRealTimeBar { req_id: req_id as u32 })?;
+        send_cmd(py, &tx, ControlCommand::CancelRealTimeBar { req_id })?;
         Ok(())
     }
 

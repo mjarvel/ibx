@@ -8,6 +8,8 @@
 #[derive(Debug, Clone, PartialEq)]
 pub struct StrictHistoricalBar {
     pub time: String,
+    /// Original optional endTime of this bar, never overall response coverage.
+    pub end_time: Option<String>,
     pub open: f64,
     pub high: f64,
     pub low: f64,
@@ -15,6 +17,8 @@ pub struct StrictHistoricalBar {
     pub volume: Option<i64>,
     /// Raw finite WAP; interpreting -1 requires the request's price-family context.
     pub wap: Option<f64>,
+    /// Native timeAvg of a Bid/Ask leg, kept separate from volume-weighted WAP.
+    pub time_average: Option<f64>,
     pub count: Option<u32>,
 }
 
@@ -273,7 +277,7 @@ fn finite(text: &str, field: &'static str) -> ParseResult<f64> {
 }
 
 fn parse_bar(body: &str) -> ParseResult<StrictHistoricalBar> {
-    let mut values = [None; 8];
+    let mut values = [None; 10];
     let names = [
         "time",
         "open",
@@ -283,6 +287,8 @@ fn parse_bar(body: &str) -> ParseResult<StrictHistoricalBar> {
         "volume",
         "weightedAvg",
         "count",
+        "endTime",
+        "timeAvg",
     ];
     let mut fields = body;
     while let Some(field) = next_element(&mut fields)? {
@@ -329,6 +335,7 @@ fn parse_bar(body: &str) -> ParseResult<StrictHistoricalBar> {
         .flatten();
     Ok(StrictHistoricalBar {
         time: required(0)?.to_owned(),
+        end_time: optional(8).map(str::to_owned),
         open: finite(required(1)?, "open")?,
         high: finite(required(2)?, "high")?,
         low: finite(required(3)?, "low")?,
@@ -336,6 +343,9 @@ fn parse_bar(body: &str) -> ParseResult<StrictHistoricalBar> {
         volume,
         wap: optional(6)
             .map(|text| finite(text, "weightedAvg"))
+            .transpose()?,
+        time_average: optional(9)
+            .map(|text| finite(text, "timeAvg"))
             .transpose()?,
         count,
     })
@@ -562,11 +572,54 @@ mod tests {
     }
 
     #[test]
-    fn strict_history_leaves_legacy_zero_default_parser_unchanged() {
+    fn strict_history_preserves_upstream_bar_end_and_leg_average_as_distinct_raw_metadata() {
+        let xml = frame(
+            &bar(
+                "20260227-20:30:00",
+                "<endTime>20260227-20:31:00</endTime><timeAvg>266.466</timeAvg>",
+            ),
+            "true",
+        );
+        let response = parse(&xml).unwrap();
+        assert_eq!(
+            response.bars[0].end_time.as_deref(),
+            Some("20260227-20:31:00")
+        );
+        assert_eq!(response.bars[0].time_average, Some(266.466));
+        assert_eq!(response.bars[0].wap, None);
+        assert_eq!(
+            parse(&frame(&bar("20261006", ""), "false")).unwrap().bars[0].end_time,
+            None
+        );
+        assert_eq!(
+            parse(&frame(&bar("20261006", "<endTime/><timeAvg/>"), "true"))
+                .unwrap()
+                .bars[0]
+                .time_average,
+            None
+        );
+        for metadata in [
+            "<timeAvg>NaN</timeAvg>",
+            "<timeAvg>bad</timeAvg>",
+            "<endTime>x</endTime><endTime>y</endTime>",
+            "<timeAvg>1</timeAvg><timeAvg>2</timeAvg>",
+        ] {
+            assert!(parse(&frame(&bar("20261006", metadata), "true")).is_err());
+        }
+    }
+
+    #[test]
+    fn strict_history_preserves_legacy_parser_required_defaults_and_upstream_missing_stats() {
         let xml = frame("<Bar><time>20261006</time><open>bad</open></Bar>", "true");
         let legacy = super::super::parse_bar_response(&xml).unwrap();
         assert_eq!(legacy.bars[0].open, 0.0);
-        assert_eq!(legacy.bars[0].count, 0);
+        // Reconciled upstream represents missing statistics with -1 (ibx#429),
+        // while malformed/missing required OHLC still becomes an apparent zero.
+        assert_eq!(legacy.bars[0].count, -1);
+        assert_eq!(legacy.bars[0].volume, -1);
+        assert_eq!(legacy.bars[0].wap, -1.0);
+        assert!(legacy.start.is_empty());
+        assert!(legacy.end.is_empty());
         assert!(parse(&xml).is_err());
     }
 }

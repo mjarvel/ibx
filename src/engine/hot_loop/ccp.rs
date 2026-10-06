@@ -9,19 +9,35 @@ use crate::protocol::connection::{Connection, Frame};
 use crate::protocol::fix;
 use crate::protocol::fixcomp;
 use crate::types::{
-    CompletedOrder, Fill, InstrumentId, MidnightSeed, NewsBulletin,
+    CompletedOrder, Fill, MidnightSeed, NewsBulletin, OrderId, ReqId,
     PositionInfo, Price, Qty, Side, PRICE_SCALE, QTY_SCALE,
 };
 use crossbeam_channel::Sender;
 
 use super::{HeartbeatState, emit, clone_for_event, parse_price_tag, parse_qty, decode_tif};
 
-/// Bound for an in-flight contract-details request (secdef reply or
-/// per-exchange fan-out). Refreshed on fan-out activity; on expiry the
-/// request surfaces error 200 + contract_details_end instead of hanging
-/// forever (ibx#227). A gateway rejection arrives in well under a second,
-/// and a full 27-exchange fan-out completes within a few.
+/// API error 10159 of a matching-symbols request that could not be sent
+/// (ibx#369).
+pub(crate) const MATCHING_SYMBOLS_SEND_FAILED: &str =
+    "Failed to request matching symbols:Error sending message to a CCP.";
+/// Head of the API error 10159 of a matching-symbols reply that carries an
+/// error text: the text follows (ibx#369).
+const MATCHING_SYMBOLS_FAILED: &str = "Failed to request matching symbols:";
+/// Pause after each matching-symbols send, as the reference (ibx#369).
+const MATCHING_SYMBOLS_SEND_GAP: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// How long an internal contract lookup of ibx (cache fill, scanner
+/// enrichment: ids from 0xF000_0000) waits for its answer. A caller's
+/// contract details request has no deadline, as in the reference: its
+/// contract definition requests (`jclient.mE`, the 6 s sweep of
+/// `jclient.pN`) give up only for an order's lookup (`jextend.dx.a()`,
+/// 30 s), and the API request waits for its answer (ibx#485).
 const SECDEF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether a lookup is an internal one of ibx, not a caller's request.
+fn internal_lookup(req_id: ReqId) -> bool {
+    req_id >= 0xF000_0000
+}
 /// Error 200 text for a lookup that found no contract (ibx#400).
 pub(crate) const NO_SECURITY_DEFINITION: &str = "No security definition has been found for the request";
 
@@ -70,16 +86,23 @@ pub(crate) fn fix_utc_to_unix_secs(s: &str) -> Option<i64> {
 }
 
 /// Text of warning 399 for an order message (ibx#465): "Order Message:
-/// {action} {quantity} {symbol} {exchange} {text}". The exchange is the
-/// listing as the contract details give it, `{primaryExchange}.{marketName}`
-/// (NASDAQ.NMS for AAPL, as in the capture; the form is only checked for
-/// AAPL), else the primary exchange, else the order's exchange.
+/// {action} {quantity} {symbol} {exchange}
+/// {text}", three lines (the API
+/// message of the four-leg recordings, ibx#486). The exchange is the
+/// listing of the contract's definition: the primary exchange (6470) and
+/// its suffix (8224) when the definition has one (NASDAQ.NMS for AAPL,
+/// ARCA for SPY, which has none: the recordings of 26/09 to 02/10/2026),
+/// else the order's exchange. A combo
+/// shows its own symbol and "Combo" (captured 26/09/2026,
+/// i105_combo_stock_smart and i105_combo_leg_prices: "BUY 1 QQQ,SPY Combo"
+/// where the report says 55=IECombo; ibx#487).
 fn order_message_399(
     parsed: &std::collections::HashMap<u32, String>,
     text: &str,
     context: &Context,
-    clord_id: u64,
+    clord_id: OrderId,
     shared: &SharedState,
+    combo: Option<&api::Contract>,
 ) -> String {
     let action = match parsed.get(&54).map(|s| s.as_str()) {
         Some("1") => "BUY",
@@ -92,6 +115,11 @@ fn order_message_399(
         },
     };
     let quantity = parsed.get(&38).cloned().unwrap_or_default();
+    if let Some(c) = combo {
+        return format!("Order Message:
+{} {} {} Combo
+{}", action, quantity, c.symbol, text);
+    }
     let con_id: i64 = parsed.get(&6008).and_then(|s| s.parse().ok()).unwrap_or(0);
     let cached = shared.reference.get_contract(con_id);
     let symbol = parsed.get(&55).cloned()
@@ -99,13 +127,13 @@ fn order_message_399(
         .unwrap_or_default();
     let primary = cached.as_ref().map(|c| c.primary_exchange.clone()).filter(|p| !p.is_empty());
     let exchange = match (primary, shared.reference.market_name(con_id)) {
-        (Some(p), Some(m)) => format!("{}.{}", p, m),
-        (Some(p), None) => p,
+        (Some(p), Some(m)) if !p.ends_with(&format!(".{m}")) => format!("{}.{}", p, m),
+        (Some(p), _) => p,
         (None, _) => parsed.get(&207).or_else(|| parsed.get(&6004))
             .map(|e| crate::control::contracts::exchange_from_fix(e).to_string())
             .unwrap_or_default(),
     };
-    format!("Order Message: {} {} {} {} {}", action, quantity, symbol, exchange, text)
+    format!("Order Message:\n{} {} {} {}\n{}", action, quantity, symbol, exchange, text)
 }
 
 /// Split an execution id into the id without its revision and the
@@ -121,6 +149,23 @@ pub(crate) fn split_exec_revision(exec_id: &str) -> (&str, u64) {
     }
 }
 
+/// The report of a combo's leg (ibx#470): 6013 gives the leg index (-1
+/// for the combo itself) and the leg count, 442 = 2 on a leg's report.
+fn is_leg_report(parsed: &std::collections::HashMap<u32, String>) -> bool {
+    match parsed.get(&6013).and_then(|v| v.split(':').next()).and_then(|i| i.parse::<i32>().ok()) {
+        Some(index) => index >= 0,
+        None => parsed.get(&442).map(|s| s.as_str()) == Some("2"),
+    }
+}
+
+/// Every value of `tag` in a message, in wire order.
+fn all_values(msg: &[u8], tag: u32) -> impl Iterator<Item = &str> {
+    let prefix = format!("{tag}=");
+    msg.split(|&b| b == fix::SOH)
+        .filter_map(|p| std::str::from_utf8(p).ok())
+        .filter_map(move |p| p.strip_prefix(prefix.as_str()))
+}
+
 /// What a fill report says about its execution beyond the fill numbers.
 fn fill_exec_of(parsed: &std::collections::HashMap<u32, String>, exec_id: &str) -> crate::bridge::FillExec {
     let tag = |t: u32| parsed.get(&t).filter(|s| !s.is_empty());
@@ -128,10 +173,77 @@ fn fill_exec_of(parsed: &std::collections::HashMap<u32, String>, exec_id: &str) 
         exec_id: exec_id.to_string(),
         time_secs: tag(6699).or_else(|| tag(60)).or_else(|| tag(52))
             .and_then(|s| fix_utc_to_unix_secs(s)),
-        exchange: tag(100).or_else(|| tag(207)).cloned().unwrap_or_default(),
+        // A smart route is shown as SMART, as on the report of a combo
+        // (captured 30/09/2026: 100=BEST, execDetails exchange SMART).
+        exchange: tag(100).or_else(|| tag(207))
+            .map(|e| if e == "BEST" { "SMART".to_string() } else { e.clone() })
+            .unwrap_or_default(),
         client_id: tag(6119).and_then(|s| s.parse().ok()).unwrap_or(0),
         model_code: tag(6700).cloned().unwrap_or_default(),
         order_ref: tag(6010).cloned().unwrap_or_default(),
+        last_liquidity: tag(851).and_then(|s| s.parse().ok()).unwrap_or(0),
+        combo: None,
+        other_client: false,
+    }
+}
+
+/// The permId of a report's order: the id part of its ClOrdID (11), as
+/// the reference gives it (`pe.aY().a()`, the long of `jfix.cx`; captured
+/// 01/10/2026: openOrder permId 1790865742870063 for 11=1790865742870063.0).
+/// 0 for none.
+fn perm_id_of(parsed: &std::collections::HashMap<u32, String>) -> i64 {
+    parsed.get(&11)
+        .map(|s| s.strip_prefix('C').unwrap_or(s))
+        .and_then(|s| s.split('.').next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// The API order id a report gives (6121), 0 when it gives none
+/// (`jexec.fq.k()`: absent reads as the int maximum, shown as 0).
+fn report_api_order_id(parsed: &std::collections::HashMap<u32, String>) -> OrderId {
+    parsed.get(&6121).and_then(|s| s.parse::<OrderId>().ok())
+        .filter(|&id| id != i32::MAX as OrderId)
+        .unwrap_or(0)
+}
+
+/// Note the API order id (6121) of a report for its API client (6119, 0
+/// when absent): the reference keeps the highest order id each client used
+/// (`jextend.H.c(int)`), and moves it for every order it shows the client
+/// (`jextend.dL.c(List, int, jclient.pe, jfix.ct, String, Runnable)@1039`).
+/// Only positive ids: the reference keeps negative ones apart.
+fn note_reported_order_id(parsed: &std::collections::HashMap<u32, String>, shared: &SharedState) {
+    let id = report_api_order_id(parsed);
+    if id <= 0 || id >= i32::MAX as OrderId {
+        return;
+    }
+    let client = parsed.get(&6119).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+    shared.orders.note_reported_order_id(client, id);
+}
+
+/// The execution of a fill report, as stored for `req_executions`.
+fn report_execution(
+    parsed: &std::collections::HashMap<u32, String>,
+    exec_id: &str,
+    side: Side,
+    last_shares: Qty,
+    last_px: f64,
+    account_id: &str,
+    order_id: OrderId,
+) -> api::Execution {
+    api::Execution {
+        exec_id: exec_id.to_string(),
+        acct_number: parsed.get(&1).filter(|s| !s.is_empty()).cloned()
+            .unwrap_or_else(|| account_id.to_string()),
+        side: match side { Side::Buy => "BOT", Side::Sell | Side::ShortSell => "SLD" }.to_string(),
+        shares: last_shares as f64 / QTY_SCALE as f64,
+        price: last_px,
+        perm_id: perm_id_of(parsed),
+        order_id,
+        cum_qty: parsed.get(&14).and_then(|s| parse_qty(s)).unwrap_or(0) as f64 / QTY_SCALE as f64,
+        avg_price: parsed.get(&6).and_then(|s| s.parse().ok()).unwrap_or(0.0),
+        last_liquidity: parsed.get(&851).and_then(|s| s.parse().ok()).unwrap_or(0),
+        ..Default::default()
     }
 }
 
@@ -145,33 +257,25 @@ fn parent_order_id(parsed: &std::collections::HashMap<u32, String>, context: &Co
         return 0;
     };
     let id_part = link.split('.').next().unwrap_or(link);
-    let Ok(id) = id_part.parse::<u64>() else {
+    let Ok(id) = id_part.parse::<OrderId>() else {
         return 0;
     };
+    if context.recovered_keys.contains_key(&id) {
+        return context.key_of(id);
+    }
     let same_id = |clord: &String| clord.split('.').next() == Some(id_part);
     if context.order(id).is_some() || context.last_clord.get(&id).is_some_and(same_id) {
-        return id as i64;
+        return id;
     }
     context.last_clord.iter()
         .find(|(_, clord)| same_id(clord))
-        .map_or(id as i64, |(&order_id, _)| order_id as i64)
-}
-
-fn perm_id_from_fix_order_id(s: &str) -> i64 {
-    // Hash only the stable prefix: "00cf16ed.000225ed.69ca0941" (drop ".0001")
-    let stable = match s.rmatch_indices('.').next() {
-        Some((idx, _)) if s[..idx].contains('.') => &s[..idx],
-        _ => s, // no dots or only one segment — hash entire string
-    };
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in stable.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    (h >> 1) as i64
+        .map_or(id, |(&order_id, _)| order_id)
 }
 
 pub(crate) struct CcpState {
+    /// The group of each account summary subscription, which its cancel
+    /// restates (ibx#486).
+    pub(crate) summary_groups: std::collections::HashMap<String, String>,
     pub(crate) seen_exec_ids: HashSet<String>,
     /// Insertion order for `seen_exec_ids`, oldest at the front. Used to evict
     /// one entry at a time once the dedup window is full, instead of clearing
@@ -187,33 +291,64 @@ pub(crate) struct CcpState {
     /// commission window.
     pub(crate) exec_realized: std::collections::HashMap<String, (i64, f64)>,
     /// Order messages already reported as 399, by order and text (ibx#465).
-    pub(crate) order_messages_sent: HashSet<(u64, String)>,
+    pub(crate) order_messages_sent: HashSet<(OrderId, String)>,
+    /// The per-leg prices (6879) of the report being read, in leg order
+    /// (ibx#470): the parsed map keeps one value per tag.
+    pub(crate) report_leg_prices: Vec<f64>,
     pub(crate) exec_realized_order: VecDeque<String>,
-    pub(crate) news_subscriptions: Vec<(InstrumentId, u32)>,
     pub(crate) disconnected: bool,
     /// (req_id, is_single_shot). Single-shot = known-conId lookup whose
     /// first 35=d reply is also the last (server emits no 323=5/6 terminator
     /// for these). Multi-record by-symbol/matching-symbols requests push
     /// `false` and rely on the response-type sentinel for is_last.
-    /// In-flight secdef requests: (req_id, single_shot, deadline). The
-    /// deadline is swept by `sweep_contract_details` so a request the
-    /// gateway never answers (SessionReject, dead socket, lost reply)
-    /// surfaces error 200 + contract_details_end instead of hanging
-    /// forever (ibx#227).
-    pub(crate) pending_secdef: Vec<(u32, bool, Instant)>,
+    /// In-flight secdef requests: (req_id, single_shot, deadline). Only an
+    /// internal lookup is dropped at its deadline (`sweep_contract_details`);
+    /// a caller's request waits for its answer, as in the reference
+    /// (ibx#485).
+    pub(crate) pending_secdef: Vec<(ReqId, bool, Instant)>,
     /// By-symbol lookups in flight: the request multiplier and the strike
     /// retry (ibx#410, ibx#435).
     pub(crate) pending_lookups: Vec<PendingLookup>,
+    /// CONTFUT and FUT+CONTFUT requests in flight (ibx#438).
+    pub(crate) pending_continuous: Vec<ContinuousLookup>,
     /// Known market rule per (conId, exchange), from the records of every
     /// definition reply; a fan-out asks only for the unknown ones (ibx#435).
-    pub(crate) market_rule_by_exchange: std::collections::HashMap<(u32, String), u32>,
-    pub(crate) pending_matching_symbols: Vec<u32>,
-    /// keepUpToDate historical queries routed through CCP: (query_id, req_id)
-    pub(crate) pending_kut_historical: Vec<(String, u32)>,
-    /// tickerId → req_id mapping for keepUpToDate 35=G bar updates
-    pub(crate) kut_ticker_map: std::collections::HashMap<u32, u32>,
-    /// tickerId → minTick for bar decoding
-    pub(crate) kut_min_tick: std::collections::HashMap<u32, f64>,
+    pub(crate) market_rule_by_exchange: std::collections::HashMap<(i64, String), u32>,
+    /// Industry, category and subcategory of an underlying, from the
+    /// company lookups of derivative rows (ibx#436).
+    pub(crate) company_by_underlying: std::collections::HashMap<i64, (String, String, String)>,
+    /// Company lookups in flight: request id sent, underlying conId.
+    pub(crate) pending_company: Vec<(String, i64)>,
+    /// Matching-symbols requests sent and not answered: (own request id
+    /// sent, API reqId). No deadline, as in the reference; cleared without
+    /// an answer when the auth link drops (ibx#369).
+    pub(crate) pending_matching_symbols: Vec<(u32, ReqId)>,
+    /// Next own request id of a matching-symbols request (ibx#369).
+    pub(crate) next_matching_symbols_id: u32,
+    /// The matching-symbols request waiting to be sent: only the latest
+    /// one is kept, a replaced one gets no answer, as in the reference
+    /// (ibx#369).
+    pub(crate) matching_waiting: Option<(ReqId, String)>,
+    /// Send permits of the matching-symbols pacing (ibx#369): one request
+    /// in flight until its pending mark or its answer; the loss of the
+    /// auth link gives one back.
+    pub(crate) matching_permits: u32,
+    /// No matching-symbols request goes out before this time: 1 s after
+    /// each send (ibx#369).
+    pub(crate) matching_next_send: Option<Instant>,
+    /// Requests whose pending mark came (their permit was given back).
+    pub(crate) matching_acked: Vec<u32>,
+    /// Data permission stamp of the last logon reply or logon update
+    /// (6764, ibx#421).
+    pub(crate) data_permissions: Option<String>,
+    /// The feature list of the last logon update has DENYAPI (ibx#421).
+    pub(crate) deny_api: bool,
+    /// A logon update or a relogin changed the data permission stamp: the
+    /// hot loop runs the reference's permission change (ibx#421).
+    pub(crate) permissions_changed: bool,
+    /// The SSL farm list (8449) of the last logon update, for the hot
+    /// loop (ibx#276); None when no update came since it was taken.
+    pub(crate) ssl_farms_update: Option<String>,
     /// HMAC signing key for XML-carrying CCP messages (selective signing).
     pub(crate) ccp_sign_key: Vec<u8>,
     /// HMAC signing IV — advances only for signed messages, independent of unsigned ones.
@@ -229,6 +364,10 @@ pub(crate) struct CcpState {
     pub(crate) next_fanout_id: u32,
     /// Counter for internal secdef req IDs (auto-fetch on cold-cache positions).
     pub(crate) next_internal_secdef_id: u32,
+    /// Option calculations and their model inputs (ibx#442).
+    pub(crate) optcalc: super::optcalc::OptCalc,
+    /// Option chain parameter requests and their answers (ibx#440).
+    pub(crate) optparams: super::optparams::OptParams,
     /// conIds we've already auto-fetched secdef for, keyed by con_id (dedup).
     pub(crate) auto_fetched_conids: HashSet<i64>,
     /// Scanner results awaiting per-conId contract-detail enrichment.
@@ -250,6 +389,12 @@ pub(crate) struct CcpState {
     pub(crate) next_trades_request: u32,
     /// Set by a reconnect until the end frame of the order status replay.
     pub(crate) awaiting_status_replay: bool,
+    /// Set at the logon until the end frame of its order status replay:
+    /// open-order requests wait for it, as in the reference (ibx#251).
+    pub(crate) awaiting_login_replay: bool,
+    /// The request id (6556) of the trades request sent after a reconnect,
+    /// until the end frame of its reply: the fills of the outage (ibx#251).
+    pub(crate) fill_up_pending: Option<String>,
     /// When the end frame of the post-reconnect status replay came; the
     /// engine reports the restored link from it (ibx#399).
     pub(crate) status_replay_end_at: Option<Instant>,
@@ -260,9 +405,8 @@ pub(crate) struct PendingResolve {
     /// Request number of the lookup.
     pub lookup_id: u32,
     /// API request id of the waiting request.
-    pub req_id: u32,
+    pub req_id: ReqId,
     pub request: crate::types::ControlCommand,
-    pub deadline: Instant,
 }
 
 /// Request numbers of the contract lookups of historical-data requests
@@ -272,29 +416,26 @@ pub(crate) const HIST_LOOKUP_FIRST_ID: u32 = 0xD000_0000;
 pub(crate) const HIST_LOOKUP_IDS: u32 = 0x1000_0000;
 
 /// `request` with its contract conId set (ibx#427).
-pub(crate) fn request_with_con_id(request: crate::types::ControlCommand, con_id: u32) -> crate::types::ControlCommand {
+pub(crate) fn request_with_con_id(mut request: crate::types::ControlCommand, con_id: i64) -> crate::types::ControlCommand {
     use crate::types::ControlCommand as C;
-    let id = con_id as i64;
-    match request {
-        C::FetchHistorical { req_id, symbol, sec_type, exchange, end_date_time, duration, bar_size, what_to_show, use_rth, keep_up_to_date, include_expired, .. } =>
-            C::FetchHistorical { req_id, con_id: id, symbol, sec_type, exchange, end_date_time, duration, bar_size, what_to_show, use_rth, keep_up_to_date, include_expired },
-        C::FetchHeadTimestamp { req_id, sec_type, exchange, what_to_show, use_rth, .. } =>
-            C::FetchHeadTimestamp { req_id, con_id: id, sec_type, exchange, what_to_show, use_rth },
-        C::FetchHistogramData { req_id, sec_type, exchange, use_rth, period, .. } =>
-            C::FetchHistogramData { req_id, con_id, sec_type, exchange, use_rth, period },
-        C::FetchHistoricalTicks { req_id, sec_type, exchange, start_date_time, end_date_time, number_of_ticks, what_to_show, use_rth, .. } =>
-            C::FetchHistoricalTicks { req_id, con_id: id, sec_type, exchange, start_date_time, end_date_time, number_of_ticks, what_to_show, use_rth },
-        C::FetchHistoricalSchedule { req_id, sec_type, exchange, end_date_time, duration, use_rth, .. } =>
-            C::FetchHistoricalSchedule { req_id, con_id: id, sec_type, exchange, end_date_time, duration, use_rth },
-        C::FetchFundamentalData { req_id, report_type, .. } =>
-            C::FetchFundamentalData { req_id, con_id, report_type },
-        other => other,
+    match &mut request {
+        C::FetchHistorical { con_id: c, .. }
+        | C::FetchHeadTimestamp { con_id: c, .. }
+        | C::FetchHistogramData { con_id: c, .. }
+        | C::FetchHistoricalTicks { con_id: c, .. }
+        | C::FetchHistoricalSchedule { con_id: c, .. }
+        | C::FetchFundamentalData { con_id: c, .. }
+        | C::SubscribeTbt { con_id: c, .. }
+        | C::SubscribeRealTimeBar { con_id: c, .. }
+        | C::CalcOption { con_id: c, .. } => *c = con_id,
+        _ => {}
     }
+    request
 }
 
 /// Scanner result parked for contract-detail fan-out.
 pub(crate) struct PendingScannerEnrichment {
-    pub api_req_id: u32,
+    pub api_req_id: ReqId,
     pub result: crate::control::scanner::ScannerResult,
     pub awaiting: HashSet<i64>,
     pub deadline: Instant,
@@ -303,7 +444,7 @@ pub(crate) struct PendingScannerEnrichment {
 /// A contract row waiting for its trading schedule. The lookup's
 /// contract_details_end follows once none of its rows waits.
 pub(crate) struct PendingSchedulePair {
-    pub api_req_id: u32,
+    pub api_req_id: ReqId,
     pub join_key: String,
     pub def: crate::control::contracts::ContractDefinition,
     pub deadline: Instant,
@@ -314,22 +455,22 @@ pub(crate) struct PendingSchedulePair {
 /// Their replies only fill the market rules; the records wait here and
 /// become the rows once every request is answered (ibx#435).
 pub(crate) struct PendingFanout {
-    pub api_req_id: u32,
+    pub api_req_id: ReqId,
     /// Requests not answered yet: (request id, conId, exchange).
-    pub outstanding: Vec<(String, u32, String)>,
+    pub outstanding: Vec<(String, i64, String)>,
     /// Number of requests sent.
     pub total: usize,
     /// The records of the lookup, in reply order.
     pub records: Vec<crate::control::contracts::ContractDefinition>,
-    /// Idle deadline, refreshed on every per-exchange reply. One lost or
-    /// unparseable fan-out reply out of ~27 previously left the lookup
-    /// waiting forever (ibx#227).
+    /// Idle deadline of an internal lookup, refreshed on every
+    /// per-exchange reply; a caller's lookup waits for every reply, as in
+    /// the reference (ibx#485).
     pub deadline: Instant,
 }
 
 /// A by-symbol lookup in flight, kept for its answer (ibx#410, ibx#435).
 pub(crate) struct PendingLookup {
-    pub req_id: u32,
+    pub req_id: ReqId,
     pub lookup: SymbolLookup,
     /// Strike text of the one retry still allowed.
     pub retry_strike: Option<String>,
@@ -343,6 +484,37 @@ pub(crate) struct SymbolLookup {
     pub exchange: String,
     pub currency: String,
     pub filters: crate::types::SecDefFilters,
+    /// The continuous future lookup of a CONTFUT request (ibx#438).
+    pub continuous: bool,
+}
+
+/// A CONTFUT or FUT+CONTFUT request (ibx#438): the continuous future
+/// lookup goes first and its records are kept; with FUT+CONTFUT the
+/// futures lookup follows, and its rows come after the kept ones.
+pub(crate) struct ContinuousLookup {
+    pub req_id: ReqId,
+    pub with_futures: bool,
+    /// The records of the continuous future reply, once it came.
+    pub kept: Option<Vec<crate::control::contracts::ContractDefinition>>,
+}
+
+/// The value of the lead-futures-only tag of a continuous future lookup,
+/// the current lead future (captured 02/10/2026: `6857=2`).
+const CURRENT_LEAD_FUTURE: &str = "2";
+
+/// How an API security type reads for a contract lookup, as the reference
+/// decodes it (ibx#438): the security type to ask, whether a continuous
+/// future lookup is made, and whether the futures lookup is made too. A
+/// bond issuer id makes the lookup one for fixed income.
+fn lookup_sec_type<'a>(sec_type: &'a str, filters: &crate::types::SecDefFilters) -> (&'a str, bool, bool) {
+    if !filters.issuer_id.trim().is_empty() {
+        return ("FIXED", false, false);
+    }
+    match sec_type {
+        "CONTFUT" => ("FUT", true, false),
+        "FUT+CONTFUT" | "CONTFUT+FUT" => ("FUT", true, true),
+        other => (other, false, false),
+    }
 }
 
 impl SymbolLookup {
@@ -370,7 +542,7 @@ impl SymbolLookup {
 /// field. The request id is the request number after the name of the
 /// lookup, and a lookup by symbol with a source asks for expired contracts
 /// when the caller does (ibx#229).
-fn secdef_by_symbol_fields(req_id: u32, lookup: &SymbolLookup, strike: &str) -> Vec<(u32, String)> {
+fn secdef_by_symbol_fields(req_id: ReqId, lookup: &SymbolLookup, strike: &str) -> Vec<(u32, String)> {
     use crate::control::contracts::{lookup_symbol, SECDEF_BY_IDENTIFIER_NAME, SECDEF_BY_SYMBOL_NAME,
         TAG_IB_LOCAL_SYMBOL, TAG_IB_SOURCE, TAG_IB_TRADING_CLASS, TAG_SYMBOL};
     let f = &lookup.filters;
@@ -380,7 +552,9 @@ fn secdef_by_symbol_fields(req_id: u32, lookup: &SymbolLookup, strike: &str) -> 
     fields.push((fix::TAG_MSG_TYPE, "c".into()));
     fields.push((320, format!("{}{}", name, req_id)));
     fields.push((321, "2".into()));
-    if strike.is_empty() {
+    // The continuous future lookup is a copy of the request without its
+    // source and without expired contracts, as the reference (ibx#438).
+    if strike.is_empty() && !lookup.continuous {
         fields.push((TAG_IB_SOURCE, "Socket".into()));
         if f.include_expired && !identifier {
             fields.push((6320, "1".into()));
@@ -392,6 +566,29 @@ fn secdef_by_symbol_fields(req_id: u32, lookup: &SymbolLookup, strike: &str) -> 
         // (ib-agent#174).
         fields.push((22, lookup.sec_id_source().into()));
         fields.push((48, f.sec_id.clone()));
+    } else if lookup.continuous {
+        // Continuous future (ibx#438): the symbol and trading class, then
+        // the futures fields with the current lead future.
+        let symbol = lookup_symbol(&lookup.symbol);
+        if !symbol.is_empty() {
+            fields.push((TAG_SYMBOL, symbol.into_owned()));
+        }
+        if !f.trading_class.is_empty() {
+            fields.push((8362, f.trading_class.clone()));
+        }
+        fields.push((167, "FUT".into()));
+        let expiry = &f.last_trade_date_or_contract_month;
+        if expiry.eq_ignore_ascii_case("NOEXP") {
+            fields.push((541, "NOEXP".into()));
+        } else if expiry.len() == 6 {
+            fields.push((200, expiry.clone()));
+        } else if expiry.len() > 6 {
+            fields.push((541, expiry.clone()));
+        }
+        fields.push((6857, CURRENT_LEAD_FUTURE.into()));
+        if !f.multiplier.is_empty() {
+            fields.push((231, f.multiplier.clone()));
+        }
     } else {
         let symbol = lookup_symbol(&lookup.symbol);
         let has_class = !f.trading_class.is_empty();
@@ -431,19 +628,28 @@ fn secdef_by_symbol_fields(req_id: u32, lookup: &SymbolLookup, strike: &str) -> 
             fields.push((231, f.multiplier.clone()));
         }
     }
-    // Exchange and primary exchange are two fields (ibx#229).
+    // Exchange and primary exchange are two fields (ibx#229); an empty
+    // field is not written, as the reference (ibx#438).
     let exchange = if lookup.exchange == "SMART" { "BEST" } else { lookup.exchange.as_str() };
-    fields.push((100, exchange.into()));
+    if !exchange.is_empty() {
+        fields.push((100, exchange.into()));
+    }
     if !identifier && !f.primary_exchange.is_empty() {
         fields.push((207, f.primary_exchange.clone()));
     }
-    fields.push((15, lookup.currency.clone()));
+    if !lookup.currency.is_empty() {
+        fields.push((15, lookup.currency.clone()));
+    }
+    // The bond issuer, last (ibx#438).
+    if !identifier && !f.issuer_id.is_empty() {
+        fields.push((6454, f.issuer_id.clone()));
+    }
     fields
 }
 
 /// Write one by-symbol lookup on `conn` (ibx#410; also the conId lookup of
 /// a market data request, ibx#278).
-pub(crate) fn send_symbol_lookup_on(conn: &mut Connection, req_id: u32, lookup: &SymbolLookup, strike: &str) {
+pub(crate) fn send_symbol_lookup_on(conn: &mut Connection, req_id: ReqId, lookup: &SymbolLookup, strike: &str) {
     let ts = chrono_free_timestamp();
     let body = secdef_by_symbol_fields(req_id, lookup, strike);
     let mut fields: Vec<(u32, &str)> = Vec::with_capacity(body.len() + 1);
@@ -457,13 +663,13 @@ pub(crate) fn send_symbol_lookup_on(conn: &mut Connection, req_id: u32, lookup: 
 fn push_contract_row(
     shared: &SharedState,
     event_tx: &Option<Sender<Event>>,
-    req_id: u32,
+    req_id: ReqId,
     def: crate::control::contracts::ContractDefinition,
 ) {
     // The zone of its trading hours, for the zone rule of an order's
     // expiry (ibx#335).
     if let Some(zone) = &def.time_zone_id {
-        shared.reference.cache_time_zone_id(def.con_id as i64, zone);
+        shared.reference.cache_time_zone_id(def.con_id, zone);
     }
     let for_event = clone_for_event(event_tx, &def);
     shared.reference.push_contract_details(req_id, def);
@@ -474,7 +680,7 @@ fn push_contract_row(
 
 /// Error 200 for a user lookup that found no contract, with no end, as
 /// the reference (ibx#400). Internal lookups end silently.
-fn push_not_found(req_id: u32, shared: &SharedState) {
+fn push_not_found(req_id: ReqId, shared: &SharedState) {
     if req_id < 0xF000_0000 {
         log::info!("Secdef lookup req_id={}: no security definition", req_id);
         shared.reference.push_historical_error(req_id, 200, NO_SECURITY_DEFINITION.to_string());
@@ -497,22 +703,34 @@ fn strike_divided_by_100(strike: &str) -> String {
 impl CcpState {
     pub(crate) fn new() -> Self {
         Self {
+            summary_groups: std::collections::HashMap::new(),
             seen_exec_ids: HashSet::with_capacity(256),
             exec_id_order: VecDeque::with_capacity(256),
             commission_revisions: std::collections::HashMap::with_capacity(256),
             commission_order: VecDeque::with_capacity(256),
             exec_realized: std::collections::HashMap::with_capacity(256),
             order_messages_sent: HashSet::new(),
+            report_leg_prices: Vec::new(),
             exec_realized_order: VecDeque::with_capacity(256),
-            news_subscriptions: Vec::new(),
             disconnected: false,
             pending_secdef: Vec::new(),
+            optcalc: super::optcalc::OptCalc::default(),
+            optparams: super::optparams::OptParams::default(),
             pending_lookups: Vec::new(),
+            pending_continuous: Vec::new(),
             market_rule_by_exchange: std::collections::HashMap::new(),
+            company_by_underlying: std::collections::HashMap::new(),
+            pending_company: Vec::new(),
             pending_matching_symbols: Vec::new(),
-            pending_kut_historical: Vec::new(),
-            kut_ticker_map: std::collections::HashMap::new(),
-            kut_min_tick: std::collections::HashMap::new(),
+            next_matching_symbols_id: 1,
+            matching_waiting: None,
+            matching_permits: 1,
+            matching_next_send: None,
+            matching_acked: Vec::new(),
+            data_permissions: None,
+            deny_api: false,
+            permissions_changed: false,
+            ssl_farms_update: None,
             ccp_sign_key: Vec::new(),
             ccp_sign_iv: std::sync::Mutex::new(Vec::new()),
             pending_schedule_pair: Vec::new(),
@@ -529,6 +747,8 @@ impl CcpState {
             // The login sends the first trades request.
             next_trades_request: 5,
             awaiting_status_replay: false,
+            awaiting_login_replay: false,
+            fill_up_pending: None,
             status_replay_end_at: None,
         }
     }
@@ -746,8 +966,26 @@ impl CcpState {
             Some(t) => t.as_str(),
             None => return,
         };
+        // The server time of a test request or of an eligible 35=U message
+        // refreshes the clock offset, at most every 30 s (ibx#421).
+        if crate::control::logon::message_sets_clock(msg_type, parsed.get(&6040).map(String::as_str), parsed.contains_key(&1)) {
+            match parsed.get(&fix::TAG_SENDING_TIME).and_then(|v| crate::control::logon::server_time_ms(v)) {
+                Some(server_ms) => {
+                    let zone = crate::gateway::machine_tz();
+                    if let Some(offset) = shared.reference.clock().apply_message(server_ms, crate::control::logon::local_now_ms(), &zone) {
+                        log::debug!("Setting time offset to {} ms (35={})", offset, msg_type);
+                    }
+                }
+                None => log::error!("No time in the message seqNum:{:?}", parsed.get(&34)),
+            }
+        }
         match msg_type {
-            fix::MSG_EXEC_REPORT => self.handle_exec_report(&parsed, context, shared, event_tx, account_id),
+            fix::MSG_LOGON => self.handle_logon_update(&parsed, shared, event_tx),
+            fix::MSG_EXEC_REPORT => {
+                self.report_leg_prices = all_values(msg, 6879).filter_map(|v| v.parse().ok()).collect();
+                self.handle_exec_report(&parsed, context, shared, event_tx, account_id);
+                self.report_leg_prices.clear();
+            }
             fix::MSG_CANCEL_REJECT => self.handle_cancel_reject(&parsed, ccp_conn, context, shared, event_tx, hb, account_id),
             fix::MSG_NEWS => self.handle_news_bulletin(&parsed, shared),
             fix::MSG_HEARTBEAT => {}
@@ -768,8 +1006,8 @@ impl CcpState {
                 let ref_tag = parsed.get(&371).map(|s| s.as_str()).unwrap_or("?");
                 // The reject carries no request id: like the reference, it is
                 // only logged, and a lookup it hit gets neither an error nor
-                // an end from it (ibx#400). Such a lookup stays pending and
-                // the deadline sweep (ibx#227) still ends it.
+                // an end from it (ibx#400). Such a lookup stays pending, as
+                // in the reference (no deadline, ibx#485).
                 log::warn!("SessionReject: reason='{}' refTag={}", reason, ref_tag);
             }
             "U" => {
@@ -788,121 +1026,42 @@ impl CcpState {
                             // P&L midnight seed — store for client-side daily P&L computation
                             handle_pnl_response(msg, shared);
                         }
-                        "186" => {
-                            if let Some(matches) = crate::control::contracts::parse_matching_symbols_response(msg) {
-                                // A 186 frame is the real answer only when it
-                                // carries the match-count tag 146 — present
-                                // even when the count is zero. Frames without
-                                // it are not-ready acks: popping on one would
-                                // deliver a bogus empty answer and orphan the
-                                // data frame that follows (observed live; the
-                                // same ack-then-data shape as the what-if
-                                // path). See ibx#228.
-                                if extract_tag_value(msg, b"146=").is_none() {
-                                    log::debug!("matching-symbols ack frame (no tag 146) — awaiting data frame");
-                                } else {
-                                // Match the reply to its request by the req_id
-                                // the server echoes in tag 320, NOT by queue
-                                // order: FIFO cross-attributes out-of-order
-                                // replies (ibx#228, same fix as pending_secdef).
-                                let echoed = extract_tag_value(msg, b"320=")
-                                    .and_then(|v| v.parse::<u32>().ok());
-                                let pos = match echoed {
-                                    Some(rid) => self.pending_matching_symbols.iter().position(|p| *p == rid),
-                                    // No echo on the wire: attribution is only
-                                    // safe with a single request in flight.
-                                    None if self.pending_matching_symbols.len() == 1 => Some(0),
-                                    None => None,
-                                };
-                                if let Some(pos) = pos {
-                                    let req_id = self.pending_matching_symbols.remove(pos);
-                                    // An empty result is a legitimate answer
-                                    // ("no such symbol") and MUST be delivered:
-                                    // dropping it left the caller waiting forever
-                                    // and the stale queue head misattributed
-                                    // every later reply (ibx#228).
-                                    shared.reference.push_matching_symbols(req_id, matches);
-                                } else {
-                                    log::warn!(
-                                        "matching-symbols reply not attributable: echoed={:?} pending={:?}",
-                                        echoed, self.pending_matching_symbols,
-                                    );
-                                }
-                                }
+                        "20" => {
+                            // Reference-data answer: inputs of the option model (ibx#442).
+                            if let (Some(id), Some(xml)) = (parsed.get(&320), parsed.get(&6118)) {
+                                let (id, xml) = (id.clone(), xml.clone());
+                                self.optcalc.xml_reply(&id, &xml, ccp_conn, hb, shared);
                             }
+                        }
+                        "186" => self.handle_matching_symbols_reply(msg, &parsed, shared),
+                        // Option chain parameters (ibx#440): the derivative
+                        // answer and the chain answer.
+                        "5" => {
+                            let connected = !self.disconnected;
+                            self.optparams.underlying_reply(msg, ccp_conn, connected, hb, shared);
+                        }
+                        "139" => {
+                            let connected = !self.disconnected;
+                            self.optparams.chain_reply(msg, ccp_conn, connected, hb, shared);
                         }
                         "60" => self.handle_commission_report(&parsed, shared),
-                        "102" => self.handle_exchange_list(msg, shared),
+                        // The combo multiplier and the leg confirmation of
+                        // a combo set-up (ibx#470).
+                        "36" | "7" => {
+                            if let Some(progress) = context.combos.user_reply(&parsed, &chrono_free_timestamp()) {
+                                super::order_builder::combo_progress(context, ccp_conn, hb, progress);
+                            }
+                        }
+                        // An algo definition answer (ibx#263).
+                        "54" => if let Some(xml) = parsed.get(&6118) {
+                            log::info!("Algo definitions received for {:?}", parsed.get(&6364));
+                            shared.reference.add_algo_definitions(xml);
+                        },
+                        // The exchange directory: not the depth exchanges,
+                        // which come from the routing table (#453).
+                        "102" => {}
                         "107" => self.handle_schedule_reply(msg, shared, event_tx),
                         _ => {}
-                    }
-                }
-            }
-            "W" => {
-                // keepUpToDate historical data responses routed through CCP
-                if let Some(xml_tag) = parsed.get(&6118) {
-                    if let Some(resp) = crate::control::historical::parse_bar_response(xml_tag) {
-                        if let Some(pos) = self.pending_kut_historical.iter().position(|(qid, _)| *qid == resp.query_id) {
-                            let (_, req_id) = self.pending_kut_historical[pos];
-                            shared.reference.push_historical_data(req_id, resp.clone());
-                            if resp.is_complete {
-                                // Initial batch done — keep entry for streaming
-                            }
-                        }
-                    }
-                    else if let Some(ticker_id_str) = crate::control::historical::parse_ticker_id(xml_tag) {
-                        let ticker_id: u32 = ticker_id_str.parse().unwrap_or(0);
-                        let min_tick = crate::control::historical::extract_xml_tag(xml_tag, "minTick")
-                            .and_then(|s| s.parse::<f64>().ok())
-                            .unwrap_or(0.01);
-                        // Match ticker to a pending keepUpToDate query
-                        for (qid, req_id) in &self.pending_kut_historical {
-                            if xml_tag.contains(qid) {
-                                self.kut_ticker_map.insert(ticker_id, *req_id);
-                                self.kut_min_tick.insert(ticker_id, min_tick);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            "G" => {
-                // keepUpToDate streaming bar updates (same binary format as rtbar)
-                let body = match super::find_body_after_tag(msg, b"35=G\x01") {
-                    Some(b) => b,
-                    None => return,
-                };
-                let sig_pos = body.windows(6).position(|w| w == b"\x018349=");
-                let body = if let Some(pos) = sig_pos { &body[..pos] } else { body };
-                if body.len() >= 11 {
-                    let ticker_id = u32::from_be_bytes([body[2], body[3], body[4], body[5]]);
-                    let timestamp = u32::from_be_bytes([body[6], body[7], body[8], body[9]]);
-                    let payload_len = body[10] as usize;
-                    if body.len() >= 11 + payload_len {
-                        if let Some(&req_id) = self.kut_ticker_map.get(&ticker_id) {
-                            let min_tick = self.kut_min_tick.get(&ticker_id).copied().unwrap_or(0.01);
-                            let payload = &body[11..11 + payload_len];
-                            if let Some(mut bar) = crate::control::historical::decode_bar_payload(payload, min_tick) {
-                                bar.timestamp = timestamp;
-                                let hist_bar = crate::control::historical::HistoricalBar {
-                                    time: format!("{}", timestamp),
-                                    open: bar.open,
-                                    high: bar.high,
-                                    low: bar.low,
-                                    close: bar.close,
-                                    volume: bar.volume as i64,
-                                    wap: bar.wap,
-                                    count: bar.count as u32,
-                                };
-                                let resp = crate::control::historical::HistoricalResponse {
-                                    query_id: String::new(),
-                                    timezone: String::new(),
-                                    bars: vec![hist_bar],
-                                    is_complete: true,
-                                };
-                                shared.reference.push_historical_data(req_id, resp);
-                            }
-                        }
                     }
                 }
             }
@@ -914,6 +1073,89 @@ impl CcpState {
                 log::debug!("CCP unhandled 35={}: {} bytes", other, msg.len());
             }
         }
+    }
+
+    /// A logon message on the logged-on auth connection (ibx#421). With a
+    /// session epoch (6059) it is a solicited logon, which the reference
+    /// ignores with a warning. Without one it is a logon update
+    /// (`jclient.gi.j(jfix.dk)`), whose steps run in the reference's order:
+    /// the pending accounts (8092, when present, `@61-76`); the feature
+    /// list (6542), where DENYAPI turning on stops the API, as the
+    /// reference stops its API connections (`jfix.s.c(jfix.dk)@587-620`,
+    /// `jclient.gi.dT()`); the private label misc URLs (6321, when not
+    /// empty, `jfix.d0.a(jfix.dk)`, `@171-231`); a changed data permission
+    /// stamp (6764, `@235-308`), which makes the hot loop run the
+    /// permission change; the SSL farm list (8449, `@427-506`), replaced
+    /// by the update's (empty when absent).
+    pub(crate) fn handle_logon_update(
+        &mut self,
+        parsed: &std::collections::HashMap<u32, String>,
+        shared: &SharedState,
+        event_tx: &Option<Sender<Event>>,
+    ) {
+        if parsed.get(&6059).is_some_and(|v| !v.is_empty()) {
+            log::warn!("Solicited logon while logged on: ignored");
+            return;
+        }
+        log::info!("Handling logon update");
+        if let Some(v) = parsed.get(&crate::gateway::TAG_PENDING_ACCOUNTS) {
+            log::debug!("In AccountManager.updatePendingAccounts(): tag={} val=[{}]", crate::gateway::TAG_PENDING_ACCOUNTS, v);
+            shared.reference.set_pending_accounts(crate::control::logon::pending_accounts(v));
+        }
+        if let Some(features) = parsed.get(&6542) {
+            let deny_api = crate::control::logon::ApiFeatures::parse(features).deny_api;
+            log::info!("Updated Enabled features: {}", features);
+            if deny_api != self.deny_api {
+                self.deny_api = deny_api;
+                if deny_api {
+                    log::warn!("we have running API but got disabled in allowed feature - stopping API");
+                    shared.set_connection_lost();
+                    emit(event_tx, Event::Disconnected);
+                }
+            }
+        }
+        if let Some(urls) = parsed.get(&crate::gateway::TAG_MISC_URLS).filter(|v| !v.is_empty()) {
+            log::info!("Private label misc URLs updated ({} bytes)", urls.len());
+            shared.reference.set_misc_urls(crate::gateway::parse_misc_urls(urls));
+        }
+        match parsed.get(&crate::gateway::TAG_DATA_PERMISSIONS).filter(|v| !v.is_empty()) {
+            Some(stamp) => {
+                if self.data_permissions_seen(stamp) {
+                    self.permissions_changed = true;
+                }
+            }
+            None => log::info!("Data permissions are not changed"),
+        }
+        let ssl_farms = parsed.get(&crate::gateway::TAG_SSL_FARMS).cloned().unwrap_or_default();
+        self.ssl_farms_update = Some(ssl_farms);
+    }
+
+    /// A data permission stamp of a logon update: kept and logged when it
+    /// changed, as the reference (ibx#421). True when it changed.
+    pub(crate) fn data_permissions_seen(&mut self, stamp: &str) -> bool {
+        if self.data_permissions.as_deref() == Some(stamp) {
+            log::info!("Data permissions are not changed");
+            return false;
+        }
+        self.data_permissions = Some(stamp.to_string());
+        log::info!("Data permissions are changed. Market data is to be resubscribed");
+        true
+    }
+
+    /// The data permission stamp of a relogin's logon reply (ibx#421): a
+    /// change only when the old and the new stamp are both set and differ;
+    /// the new one is kept in any case, even unset
+    /// (`jclient.gi.a(jfix.dk, jfix.bb, LogonType)@297-388`). True when it
+    /// changed.
+    pub(crate) fn relogin_data_permissions(&mut self, stamp: Option<&str>) -> bool {
+        let changed = matches!((self.data_permissions.as_deref(), stamp), (Some(old), Some(new)) if old != new);
+        if changed {
+            log::info!("Data permissions are changed. Market data is to be resubscribed");
+        } else {
+            log::info!("Data permissions are not changed");
+        }
+        self.data_permissions = stamp.map(String::from);
+        changed
     }
 
     /// A reply to a what-if preview (ibx#462). The gateway may first send a
@@ -941,22 +1183,61 @@ impl CcpState {
             log::info!("What-if reply for {} that this session did not send: dropped", clord);
             return;
         };
-        if parsed.get(&39).map(|s| s.as_str()) == Some("8") {
+        // A reject report (150=8, or 39=8: the reference reads the report
+        // kind from 39 unless 150 is 8, `jexec.fq.<init>@2690-2752`) takes
+        // the reject path, error 201 alone (`jclient.dS.a(dk, fq, pe, long,
+        // boolean)@168-189`, `trader.order.h.a(pe, fq)`), unless it is a
+        // status report (20=3): those go to the preview's reply handling
+        // whatever their status (`dS.a(dk, fq, pe, boolean, boolean)@262-345`).
+        let tag = |t: u32| parsed.get(&t).map(|s| s.as_str());
+        let reject = tag(150) == Some("8") || tag(39) == Some("8");
+        if reject && tag(20) != Some("3") {
             context.what_ifs.remove(clord.as_str());
             let reason = parsed.get(&58).map(|s| s.as_str()).unwrap_or("");
             shared.orders.push_order_error(order_id, 201, format!("Order rejected - reason:{}", reason));
             return;
         }
         const MARGIN_TAGS: [u32; 6] = [6826, 6827, 6828, 6092, 6093, 6094];
-        let is_data_frame = MARGIN_TAGS.iter().any(|tag| {
-            parsed.get(tag)
-                .and_then(|s| s.parse::<f64>().ok())
-                .is_some_and(|f| f.is_finite())
-        });
-        if !is_data_frame {
+        let number = |tag: u32| parsed.get(&tag)
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|f| f.is_finite());
+        let is_data_frame = MARGIN_TAGS.iter().any(|tag| number(*tag).is_some());
+        // A frame with an order message gives an open order with that
+        // message as its warning text, and the preview waits for its data
+        // frame (ibx#462, `trader.order.bQ.a(gi, e3, fq)@263-321`).
+        let warning_text = parsed.get(&6361).cloned().unwrap_or_default();
+        // A status report that rejects the preview is its final reply, with
+        // or without numbers: the open order, then error 201.
+        let is_data_frame = is_data_frame || (reject && parsed.contains_key(&58));
+        if !is_data_frame && warning_text.is_empty() {
             return;
         }
-        context.what_ifs.remove(clord.as_str());
+        let final_reply = warning_text.is_empty();
+        if final_reply {
+            context.what_ifs.remove(clord.as_str());
+        }
+        let text = |tag: u32| parsed.get(&tag).cloned().unwrap_or_default();
+        let state = crate::types::WhatIfState {
+            status: what_if_status(parsed).to_string(),
+            init_margin_before: number(6826),
+            maint_margin_before: number(6827),
+            equity_with_loan_before: number(6828),
+            init_margin_after: number(6092),
+            maint_margin_after: number(6093),
+            equity_with_loan_after: number(6094),
+            commission: number(6378),
+            commission_currency: text(6381),
+            margin_currency: text(8130),
+            suggested_size: text(6552),
+            warning_text,
+            // A data frame with a reason: the open order, then error 201
+            // (captured 02/10/2026: a what-if of 10,000,000 shares).
+            reject_reason: if final_reply { text(58) } else { String::new() },
+            // The reference's preview openOrder has the permId of its order
+            // (ibx#486, b1_462_whatif of 02/10/2026).
+            perm_id: perm_id_of(parsed),
+            con_id: parsed.get(&6008).and_then(|s| s.parse().ok()).unwrap_or(0),
+        };
         let response = crate::types::WhatIfResponse {
             order_id,
             instrument,
@@ -967,14 +1248,21 @@ impl CcpState {
             maint_margin_after: parse_price_tag(parsed.get(&6093)),
             equity_with_loan_after: parse_price_tag(parsed.get(&6094)),
             commission: parse_price_tag(parsed.get(&6378)),
+            state,
+            final_reply,
         };
         log::info!("WhatIf response: clord={} order={} initMargin={:.2}->{:.2} commission={:.2}",
             clord, order_id,
             response.init_margin_before as f64 / PRICE_SCALE as f64,
             response.init_margin_after as f64 / PRICE_SCALE as f64,
             response.commission as f64 / PRICE_SCALE as f64);
-        shared.orders.push_what_if(response);
-        emit(event_tx, Event::WhatIf(response));
+        // The engine event is the preview's answer: the data reply only.
+        // An order-message reply before it goes to the API's open_order
+        // alone (phase 72 took it for the answer, paper 02/10/2026).
+        shared.orders.push_what_if(response.clone());
+        if response.final_reply {
+            emit(event_tx, Event::WhatIf(response));
+        }
     }
 
     fn handle_exec_report(
@@ -985,21 +1273,40 @@ impl CcpState {
         event_tx: &Option<Sender<Event>>,
         account_id: &str,
     ) {
+        // This client's id, for whose reports are given to it.
+        context.api_client_id = shared.reference.api_client_id();
         // End markers are not orders (ibx#399): the end of a trades reply
         // (it carries the request id), and the end of the order status
         // replay (wildcard order id).
         if let Some(request) = parsed.get(&6556).filter(|r| !r.starts_with("PT.")) {
             log::info!("ExecReport: end of trades request {}", request);
+            if self.fill_up_pending.as_ref() == Some(request) {
+                self.fill_up_pending = None;
+            }
             return;
         }
         if parsed.get(&11).map(|s| s.as_str()) == Some("*") {
             if self.awaiting_status_replay {
                 self.awaiting_status_replay = false;
                 self.status_replay_end_at = Some(Instant::now());
+                // The held open-order requests are answered from the
+                // corrected orders (ibx#251).
+                shared.orders.set_open_orders_held(false);
+                shared.notify();
+            }
+            // The replay of the logon: the requests made since the connect
+            // are answered now, with no restored-link message (ibx#251).
+            if std::mem::take(&mut self.awaiting_login_replay) {
+                shared.orders.set_open_orders_held(false);
+                shared.notify();
             }
             log::debug!("ExecReport: end of order status replay");
             return;
         }
+
+        // The API order id the report gives for its client: the order ids
+        // a client used, for its next valid id (ibx#466).
+        note_reported_order_id(parsed, shared);
 
         // A what-if reply goes to the preview, before anything reads the
         // frame as an order: by the ClOrdID the preview was sent under, or
@@ -1011,40 +1318,52 @@ impl CcpState {
             return;
         }
 
-        // CCP recovery push format A (ib-agent#155, captured against live):
-        // 35=8 with 150=0/39=0, tag 11 carries `<permId>.0`, the originating
-        // orderId is in tag 6121. For these, prefer 6121 as the local key so
-        // cancel_order(<prior-session orderId>) finds the right ClOrdID.
-        // Format B (paper account, observed live): tag 11 carries the
-        // originating orderId directly with `.0` suffix, tags 6119/6121
-        // absent — the existing tag-11 split below already gives the right
-        // value. The unwrap_or_else fallback handles both.
-        let recovery_origin_order_id: Option<u64> = if parsed.get(&150).map(|s| s.as_str()) == Some("0")
-            && parsed.get(&39).map(|s| s.as_str()) == Some("0")
-            && parsed.contains_key(&6121)
-        {
-            parsed.get(&6121).and_then(|s| s.parse::<u64>().ok())
-        } else {
-            None
+        // Orders are looked up by the server's order id, the part of the
+        // ClOrdID before its version, as the reference does (ibx#466). An
+        // order of an earlier session is kept under the API order id its
+        // report gives, so cancel_order(<that id>) finds it; its reports
+        // all come under the server's id.
+        let server_id = parsed.get(&11).and_then(|s| {
+            let stripped = s.strip_prefix('C').unwrap_or(s);
+            // Strip versioned suffix (.0, .1, .2) from modify-chained ClOrdIDs
+            let base = stripped.split('.').next().unwrap_or(stripped);
+            base.parse::<OrderId>().ok()
+        }).unwrap_or(0);
+        let mut clord_id = context.key_of(server_id);
+
+        // An order this session does not hold, reported working: an order
+        // of another session or client, put in the book so it can be
+        // cancelled, by its id or by a global cancel, and its reports reach
+        // it (ibx#191). The reference makes an order of any report of an
+        // unknown order (`jclient.pe.<init>(jexec.fq, boolean,
+        // jclient.dy)`: API order id 6121, client id 6119, ClOrdID 11); the
+        // logon replay reports an order not routed yet as 39=A (captured
+        // 01/10/2026: 8 orders of earlier sessions, 150=A 20=3 39=A), which
+        // was left out when only 150=0 39=0 was taken (paper 04/10/2026:
+        // 10147 on their cancel, nothing sent by a global cancel).
+        let replayed_status = match parsed.get(&39).map(|s| s.as_str()) {
+            Some("0" | "5") => {
+                let routed = parsed.get(&100).is_some_and(|s| !s.is_empty())
+                    || parsed.get(&198).is_some_and(|s| s != "NONE" && !s.is_empty());
+                Some(if routed { crate::types::OrderStatus::Submitted } else { crate::types::OrderStatus::PreSubmitted })
+            }
+            Some("A") => Some(crate::types::OrderStatus::PreSubmitted),
+            Some("1") => Some(crate::types::OrderStatus::PartiallyFilled),
+            Some("6" | "D") => Some(crate::types::OrderStatus::PendingCancel),
+            _ => None,
         };
-
-        let clord_id = recovery_origin_order_id.unwrap_or_else(|| {
-            parsed.get(&11).and_then(|s| {
-                let stripped = s.strip_prefix('C').unwrap_or(s);
-                // Strip versioned suffix (.0, .1, .2) from modify-chained ClOrdIDs
-                let base = stripped.split('.').next().unwrap_or(stripped);
-                base.parse::<u64>().ok()
-            }).unwrap_or(0)
-        });
-
-        // Recovery insert: a 35=8 with status New/New (150=0/39=0) for an order
-        // that is NOT in this session's context is a cross-session recovery entry
-        // pushed by CCP on session establishment. Insert into context.open_orders
-        // so subsequent cancel/modify ACKs at ~line 668 can match via
-        // context.order(clord_id) and emit OrderUpdate events to the user. ibx#191.
-        let is_new_ack = parsed.get(&150).map(|s| s.as_str()) == Some("0")
-            && parsed.get(&39).map(|s| s.as_str()) == Some("0");
-        if is_new_ack && context.order(clord_id).is_none() {
+        let replayed_status = replayed_status
+            .filter(|_| context.order(clord_id).is_none() && context.finished_status(clord_id).is_none());
+        if let Some(replayed_status) = replayed_status {
+            // The API order id only names the order to the caller (ibx#466):
+            // taken when no order of this session has it.
+            let api_id = parsed.get(&6121).and_then(|s| s.parse::<OrderId>().ok())
+                .filter(|&id| id != 0 && id != server_id && context.order(id).is_none()
+                    && !context.server_ids.contains_key(&id));
+            if let Some(api_id) = api_id {
+                context.bind_server_id(api_id, server_id);
+                clord_id = api_id;
+            }
             let con_id: i64 = parsed.get(&6008).and_then(|s| s.parse().ok()).unwrap_or(0);
             let side = match parsed.get(&54).map(|s| s.as_str()) {
                 Some("1") => Side::Buy,
@@ -1075,8 +1394,8 @@ impl CcpState {
                 None
             };
             if let Some(instrument) = instrument {
-                // req_global_cancel walks ids below this count; without it a
-                // recovered order on a new contract was never cancelled.
+                // The shared count covers the contract of the order, for the
+                // per-instrument requests that walk ids below it.
                 shared.market.set_instrument_count(context.market.count());
                 if let Some(sym) = parsed.get(&55) {
                     context.set_symbol(instrument, sym.clone());
@@ -1087,12 +1406,28 @@ impl CcpState {
                     side,
                     price: limit_price_i64,
                     qty_fixed: qty,
-                    filled_fixed: 0,
-                    status: crate::types::OrderStatus::Submitted,
+                    filled_fixed: parsed.get(&14).and_then(|s| parse_qty(s)).unwrap_or(0),
+                    status: replayed_status,
                     ord_type: ord_type_byte,
                     tif: tif_byte,
                     stop_price: stop_price_i64,
                 });
+                // Its ClOrdID version, the one the server gives: the next
+                // cancel or replace goes out under the next one.
+                let version = parsed.get(&11)
+                    .and_then(|c| c.split_once('.')).and_then(|(_, v)| v.parse::<u32>().ok()).unwrap_or(0);
+                context.modify_versions.insert(clord_id, version);
+                // Its API client (0 when the report names none, as the
+                // reference reads it).
+                if let Some(entry) = context.book.get_mut(&clord_id) {
+                    entry.owner = Some(parsed.get(&6119).and_then(|s| s.parse().ok()).unwrap_or(0));
+                }
+                // The API order id the client sees: the report's, 0 for
+                // none (captured 01/10/2026: openOrder orderId 0).
+                let api_id = report_api_order_id(parsed);
+                if api_id != clord_id {
+                    shared.orders.set_api_order_id(clord_id, api_id);
+                }
                 log::info!("CCP recovery: inserted orderId={} sym={:?} side={:?} qty={} px={}",
                     clord_id, parsed.get(&55), side, qty as f64 / QTY_SCALE as f64,
                     limit_price_i64 as f64 / PRICE_SCALE as f64);
@@ -1108,6 +1443,13 @@ impl CcpState {
             return;
         }
 
+        // Who gets the reports of this order (`jextend.ba.d(dK)`): its client,
+        // else client 0; its errors and notices only its client
+        // (`pe.gY()`, `trader.order.bg.a`). Captured 01/10/2026: client 193
+        // got nothing of the cancel of 8 orders of client 0.
+        let delivered = context.delivered(clord_id);
+        let owned = context.owned(clord_id);
+
         // Record the ClOrdID exactly as the server reports it so subsequent
         // cancel/modify can echo back the same string. Skip reports of a
         // cancel: they carry the cancel request's own id, not the order's
@@ -1120,6 +1462,55 @@ impl CcpState {
             if !is_cancel_request && raw_clord != "*" {
                 context.last_clord.insert(clord_id, raw_clord.clone());
             }
+        }
+
+        // A fill of an order of this session in the trades reply after a
+        // reconnect, that is a fill made while the link was lost: the
+        // reference books it (executions, position, commission report) and
+        // gives no execDetails and no orderStatus; once filled, the order is
+        // unknown to the client (a cancel gets 10147). Captured 30/09/2026
+        // (ib-agent#192 C4). A combo keeps its own path.
+        if self.fill_up_pending.is_some()
+            && matches!(parsed.get(&150).map(String::as_str), Some("F" | "1" | "2"))
+            && parsed.get(&32).and_then(|s| parse_qty(s)).is_some_and(|q| q > 0)
+            && context.order(clord_id).is_some()
+            && !context.combos.orders.contains_key(&clord_id)
+        {
+            self.handle_outage_fill(parsed, context, shared, clord_id, account_id);
+            return;
+        }
+
+        // A combo order (ibx#470): the report of a leg is an execution of
+        // the leg, not a report of the order (captured 30/09/2026: after
+        // the combo's fill, one fill per leg under the order's id, with
+        // 6013 = leg index : leg count). The combo's own reports keep its
+        // totals for the legs' callbacks.
+        let combo_view = context.combos.orders.contains_key(&clord_id)
+            .then(|| shared.orders.combo_view(clord_id)).flatten();
+        if let Some(combo) = context.combos.orders.get_mut(&clord_id) {
+            if is_leg_report(parsed) {
+                let combo = combo.clone();
+                self.handle_combo_leg_report(parsed, context, shared, clord_id, &combo);
+                return;
+            }
+            let qty = |tag: u32| parsed.get(&tag).and_then(|s| parse_qty(s));
+            let px = |tag: u32| parsed.get(&tag).and_then(|s| s.parse::<f64>().ok())
+                .map(|v| (v * PRICE_SCALE as f64).round() as i64);
+            if let Some(v) = qty(14) { combo.cum_qty = v; }
+            if let Some(v) = qty(151) { combo.leaves_qty = v; }
+            if let Some(v) = px(6) { combo.avg_price = v; }
+            if qty(32).is_some_and(|q| q > 0) && let Some(v) = px(31) {
+                combo.last_price = v;
+            }
+            // The leg prices the report carries, in leg order (6879 per
+            // leg, captured 26/09/2026), or none.
+            let legs = parsed.get(&6079).and_then(|n| n.parse::<usize>().ok()).unwrap_or(combo.combo.legs.len());
+            let reported = if self.report_leg_prices.len() == legs {
+                self.report_leg_prices.clone()
+            } else {
+                vec![f64::MAX; legs]
+            };
+            shared.orders.set_combo_leg_prices(clord_id, reported);
         }
 
         let ord_status = parsed.get(&39).map(|s| s.as_str()).unwrap_or("");
@@ -1141,6 +1532,25 @@ impl CcpState {
                 ord_status, exec_type, clord_id,
                 parsed.get(&58).map(|s| s.as_str()).unwrap_or(""),
                 parsed.get(&103).map(|s| s.as_str()).unwrap_or(""));
+        }
+
+        // The parent and OCA group the server gives for a held order, as
+        // the reference's book keeps them for its global cancel.
+        if context.order(clord_id).is_some() && (parsed.contains_key(&6107) || parsed.contains_key(&583)) {
+            let parent = parsed.contains_key(&6107).then(|| parent_order_id(parsed, context)).filter(|&p| p > 0);
+            let group = parsed.get(&583).map(String::as_str);
+            context.set_links(clord_id, parent, group);
+        }
+
+        // A bracket key on a report: kept for an order that has none, and
+        // the next bracket group goes past it, as the reference (ibx#248).
+        if let Some(key) = parsed.get(&6531).and_then(|k| crate::engine::bracket::BracketKey::parse(k)) {
+            let parent = parent_order_id(parsed, context);
+            if context.order(clord_id).is_some() {
+                context.brackets().reported(clord_id, (parent > 0).then_some(parent), key);
+            } else {
+                context.bracket_groups = context.bracket_groups.max(key.group);
+            }
         }
 
         // 39=0 is New on the wire, but the gateway reports PreSubmitted
@@ -1209,26 +1619,38 @@ impl CcpState {
         // 39=I, ibx#472).
         // The answer to a status request after a refused cancel or modify
         // sets the status, back to working too (ibx#252).
-        let queried = is_status_report && !context.status_queries.is_empty()
-            && context.status_queries.remove(&clord_id);
+        // The replay after a reconnect answers a status request for every
+        // working order: its status is set as the server gives it, as for
+        // a single status request (ibx#251).
+        let replayed = is_status_report && self.awaiting_status_replay;
+        let queried = replayed || (is_status_report && !context.status_queries.is_empty()
+            && context.status_queries.remove(&clord_id));
         let change = if queried {
             context.apply_queried_status(clord_id, status)
         } else {
             context.apply_order_status(clord_id, status)
         };
         let status_changed = change == crate::engine::context::StatusChange::Changed;
-        let report_status = matches!(change,
-            crate::engine::context::StatusChange::Changed | crate::engine::context::StatusChange::Same)
+        // A working report of an order whose cancel went out: the reference
+        // reports it with the order's PendingCancel status (ibx#486,
+        // modify_cancelled of 26/09/2026: 39=A and 39=0 after the 35=F).
+        let pending_cancel = change == crate::engine::context::StatusChange::Stale
+            && !status.is_terminal()
+            && context.order(clord_id).is_some_and(|o| o.status == crate::types::OrderStatus::PendingCancel);
+        let report_status = (pending_cancel || matches!(change,
+            crate::engine::context::StatusChange::Changed | crate::engine::context::StatusChange::Same))
             && !matches!(ord_status, "E" | "I");
 
         // The reference reports a server reject as error 201 with the
-        // server's reason (ib-agent#192 C1, ibx#250). Only on the first
-        // transition of an order this session tracks: the "No such order"
-        // frames that follow a cancel of an order already gone are not
-        // shown by the reference (C2).
+        // server's reason (ib-agent#192 C1, ibx#250), after the Inactive
+        // status (ibx#486). Only on the first transition of an order this
+        // session tracks: the "No such order" frames that follow a cancel
+        // of an order already gone are not shown by the reference (C2).
+        // The notice is queued after this report's status, below.
+        let mut notice_out: Option<(i64, String)> = None;
         if status == crate::types::OrderStatus::Rejected && status_changed {
             let reason = parsed.get(&58).map(|s| s.as_str()).unwrap_or("");
-            shared.orders.push_order_error(clord_id, 201, format!("Order rejected - reason:{}", reason));
+            notice_out = Some((201, format!("Order rejected - reason:{}", reason)));
         }
         // The limit offset, limit price and stop price the server reports
         // for a TRAIL LIMIT (6370, 44, 6117): the offset is restated on its
@@ -1237,6 +1659,7 @@ impl CcpState {
             let reported = |tag: u32| parsed.get(&tag).and_then(|s| s.parse::<f64>().ok())
                 .map(|v| (v * PRICE_SCALE as f64).round() as i64);
             let stop = reported(6117);
+            if let Some(stop) = stop { context.reported_stop.insert(clord_id, stop); }
             if let Some(offset) = reported(6370) {
                 let previous_stop = context.trail_limit_reported.get(&clord_id).map_or(0, |r| r.stop);
                 context.trail_limit_reported.insert(clord_id, crate::engine::context::TrailLimitReported {
@@ -1249,24 +1672,25 @@ impl CcpState {
             }
         }
         // A cancel of an order of this session: error 202 with the server's
-        // reason, before the Cancelled status, as the reference (ibx#465;
-        // captured 25/09/2026, empty reason for a user cancel). Not for a
-        // status report in the rejected state: the reference sets that one
-        // cancelled without the notice (ibx#252).
+        // reason, after the Cancelled status, as the reference (ibx#465,
+        // ibx#486: every four-leg recording of 26/09 to 02/10/2026; empty
+        // reason for a user cancel). Not for a status report in the
+        // rejected state: the reference sets that one cancelled without the
+        // notice (ibx#252).
         if status == crate::types::OrderStatus::Cancelled && status_changed && ord_status != "8" {
             let reason = parsed.get(&58).map(|s| s.as_str()).unwrap_or("");
-            shared.orders.push_order_error(clord_id, 202, format!("Order Canceled - reason:{}", reason));
+            notice_out = Some((202, format!("Order Canceled - reason:{}", reason)));
         }
         // An order message of the server (6360 type, 6361 text): the
         // reference reports the TIME one as warning 399, once, and the order
         // keeps its status (ibx#465; captured 25/09/2026 on an OPG order:
-        // "Order Message: BUY 1 AAPL NASDAQ.NMS Warning: your order will not
-        // be placed at the exchange until ..."). The other types (PRICECAP
+        // "Order Message:\nBUY 1 AAPL NASDAQ.NMS\nWarning: your order will
+        // not be placed at the exchange until ..."). The other types (PRICECAP
         // in the capture) did not reach the API.
-        if parsed.get(&6360).map(|s| s.as_str()) == Some("TIME") && context.order(clord_id).is_some() {
+        if parsed.get(&6360).map(|s| s.as_str()) == Some("TIME") && context.order(clord_id).is_some() && owned {
             if let Some(text) = parsed.get(&6361).filter(|t| !t.is_empty()) {
                 if self.order_messages_sent.insert((clord_id, text.clone())) {
-                    let message = order_message_399(parsed, text, context, clord_id, shared);
+                    let message = order_message_399(parsed, text, context, clord_id, shared, combo_view.as_ref().map(|v| &v.contract));
                     shared.orders.push_order_error(clord_id, 399, message);
                 }
             }
@@ -1319,25 +1743,39 @@ impl CcpState {
                     Side::Buy => last_shares,
                     Side::Sell | Side::ShortSell => -last_shares,
                 };
-                context.update_position_fixed(order.instrument, delta);
-                // notify_fill inlined
-                let exec = fill_exec_of(parsed, exec_id);
-                shared.portfolio.set_position_fixed(fill.instrument, context.position_fixed(fill.instrument));
-                if let Some(con_id) = context.market.con_id(order.instrument) {
-                    self.record_exec_con_id(&exec.exec_id, con_id);
-                    // The daily P&L counts the cash of this session's fills
-                    // (sell positive, buy negative). Stock orders only, so
-                    // no multiplier.
-                    let shares = last_shares as f64 / QTY_SCALE as f64;
-                    let cash = match order.side {
-                        Side::Buy => -shares * last_px,
-                        Side::Sell | Side::ShortSell => shares * last_px,
+                let mut exec = fill_exec_of(parsed, exec_id);
+                // The fill of a combo moves no position: its legs' fills do
+                // (ibx#470). Its execution shows the combo contract without
+                // its legs (captured 30/09/2026).
+                if let Some(view) = &combo_view {
+                    let contract = api::Contract {
+                        combo_legs: Vec::new(), combo_legs_descrip: String::new(), ..view.contract.clone()
                     };
-                    shared.portfolio.add_money_since_seed(con_id, cash);
-                    // The position moves with the fill, as the reference's
-                    // position store does; the server's average cost follows
-                    // with its position feed.
-                    shared.portfolio.apply_fill_to_position(con_id, delta, fill.price);
+                    exec.combo = Some(Box::new(crate::bridge::ComboExec { contract, leg: None }));
+                    if let Some(con_id) = context.market.con_id(order.instrument) {
+                        self.record_exec_con_id(&exec.exec_id, con_id);
+                    }
+                }
+                if combo_view.is_none() {
+                    context.update_position_fixed(order.instrument, delta);
+                    // notify_fill inlined
+                    shared.portfolio.set_position_fixed(fill.instrument, context.position_fixed(fill.instrument));
+                    if let Some(con_id) = context.market.con_id(order.instrument) {
+                        self.record_exec_con_id(&exec.exec_id, con_id);
+                        // The daily P&L counts the cash of this session's fills
+                        // (sell positive, buy negative). Stock orders only, so
+                        // no multiplier.
+                        let shares = last_shares as f64 / QTY_SCALE as f64;
+                        let cash = match order.side {
+                            Side::Buy => -shares * last_px,
+                            Side::Sell | Side::ShortSell => shares * last_px,
+                        };
+                        shared.portfolio.add_money_since_seed(con_id, cash);
+                        // The position moves with the fill, as the reference's
+                        // position store does; the server's average cost follows
+                        // with its position feed.
+                        shared.portfolio.apply_fill_to_position(con_id, delta, fill.price);
+                    }
                 }
                 fill_out = Some((fill, exec));
                 had_fill = true;
@@ -1352,19 +1790,28 @@ impl CcpState {
 
         if report_status && !had_fill {
             if let Some(order) = context.order(clord_id).copied() {
-                let perm_id: i64 = parsed.get(&37).map(|s| perm_id_from_fix_order_id(s)).unwrap_or(0);
+                let perm_id: i64 = perm_id_of(parsed);
                 let parent_id = parent_order_id(parsed, context);
                 // Average fill price rides on status reports too (ibx#315).
                 let avg_px = parsed.get(&6).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
                 // Filled so far as the server counts it (tag 14): an order
                 // recovered at session start has no prints in this session.
                 let filled = parsed.get(&14).and_then(|s| parse_qty(s)).unwrap_or(order.filled_fixed);
+                // A cancel or a reject reports 151=0; the reference's
+                // remaining stays what was not filled (every four-leg
+                // recording of 26/09 to 02/10/2026: Cancelled and Inactive
+                // with 1 remaining of 1, ibx#486).
+                let remaining = match order.status {
+                    crate::types::OrderStatus::Cancelled | crate::types::OrderStatus::Rejected =>
+                        (order.qty_fixed - filled).max(0),
+                    _ => leaves_qty,
+                };
                 let update = crate::types::OrderUpdate {
                     order_id: clord_id,
                     instrument: order.instrument,
                     status: order.status,
                     filled_qty_fixed: filled,
-                    remaining_qty_fixed: leaves_qty,
+                    remaining_qty_fixed: remaining,
                     avg_fill_price: (avg_px * PRICE_SCALE as f64).round() as i64,
                     perm_id,
                     parent_id,
@@ -1384,12 +1831,17 @@ impl CcpState {
             let con_id: i64 = parsed.get(&6008).and_then(|s| s.parse().ok()).unwrap_or(0);
             let local_symbol = parsed.get(&6035).cloned().unwrap_or_default();
             let _routing_exchange = parsed.get(&6004).cloned().unwrap_or_default();
-            let perm_id: i64 = parsed.get(&37).map(|s| perm_id_from_fix_order_id(s)).unwrap_or(0);
+            let perm_id: i64 = perm_id_of(parsed);
             let total_qty: f64 = parsed.get(&38).and_then(|s| s.parse().ok()).unwrap_or(0.0);
             let ord_type_tag = parsed.get(&40).map(|s| s.as_str()).unwrap_or("");
             let limit_price: f64 = parsed.get(&44).and_then(|s| s.parse().ok()).unwrap_or(0.0);
             let stop_px: f64 = parsed.get(&99).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            let outside_rth = parsed.get(&6433).map(|s| s == "1").unwrap_or(false);
+            // Kept once a report gave it: the reference's order shows it
+            // from then on, also when later reports leave it out (ibx#486,
+            // premarket_order_types of 28/09/2026: an IOC placed without
+            // it, a report with 6433=1, then openOrder outsideRth true).
+            let outside_rth = parsed.get(&6433).is_some_and(|s| s == "1")
+                || shared.orders.get_order_info(clord_id).is_some_and(|i| i.order.outside_rth);
             let clearing_intent = parsed.get(&6419).cloned().unwrap_or_default();
             let auto_cancel_date = parsed.get(&6596).cloned().unwrap_or_default();
             let exec_exchange = parsed.get(&30).cloned().unwrap_or_default();
@@ -1447,7 +1899,11 @@ impl CcpState {
                 0
             };
 
-            let contract = if resolved_con_id != 0 {
+            let contract = if let Some(view) = &combo_view {
+                // A combo order shows its combo, not the report's contract
+                // (55=IECombo) (ibx#470).
+                view.contract.clone()
+            } else if resolved_con_id != 0 {
                 if let Some(mut cached) = shared.reference.get_contract(resolved_con_id) {
                     if !symbol.is_empty() { cached.symbol = symbol.clone(); }
                     if !sec_type_str.is_empty() { cached.sec_type = sec_type_str.to_string(); }
@@ -1500,7 +1956,9 @@ impl CcpState {
                 _ => 3, // default
             };
             let algo_strategy = parsed.get(&847).cloned().unwrap_or_default();
-            let use_price_mgmt_algo: i32 = if algo_strategy == "Adaptive" { 1 } else { 0 };
+            // The price management flag the server echoes, 0 without it
+            // (ibx#492).
+            let use_price_mgmt_algo: i32 = i32::from(parsed.get(&8339).is_some_and(|v| v == "1"));
             let trail_stop_price: f64 = parsed.get(&6117)
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(f64::MAX);
@@ -1517,7 +1975,7 @@ impl CcpState {
                 _ => trail_stop_price,
             };
             let order = api::Order {
-                order_id: clord_id as i64,
+                order_id: clord_id,
                 action: if action.is_empty() { fb_action.to_string() } else { action.to_string() },
                 total_quantity: total_qty,
                 order_type: if order_type_str.is_empty() { fb_ord_type.to_string() } else { order_type_str.to_string() },
@@ -1539,10 +1997,21 @@ impl CcpState {
                 algo_strategy,
                 // The orderRef the server echoes (ibx#466).
                 order_ref: parsed.get(&6010).cloned().unwrap_or_default(),
+                // The cash quantity the server echoes in 152, which the
+                // reference reads into the order's cash quantity
+                // (`jexec.fq.<init>(dk, boolean)@2005-2120`, ibx#263).
+                cash_qty: parsed.get(&152).and_then(|s| s.parse().ok()).unwrap_or(0.0),
                 // A TRAIL LIMIT's offset as the server reports it (ib-agent#194).
                 lmt_price_offset: trail_limit.map_or(f64::MAX, |r| r.offset as f64 / PRICE_SCALE as f64),
+                // A combo's per-leg prices as reported (ibx#470).
+                order_combo_legs: shared.orders.combo_view(clord_id).map(|v| v.leg_prices).unwrap_or_default(),
+                // The order's API client (6119, 0 when absent) and order id.
+                client_id: parsed.get(&6119).and_then(|s| s.parse().ok()).unwrap_or(0),
                 ..Default::default()
             };
+            if let Some(entry) = context.book.get(&clord_id) {
+                shared.orders.note_book(clord_id, entry.seq, context.book_peak);
+            }
 
             let completed_time = if matches!(status,
                 crate::types::OrderStatus::Filled |
@@ -1580,7 +2049,7 @@ impl CcpState {
                 } else { String::new() },
                 shares: last_shares as f64,
                 price: last_px,
-                order_id: clord_id as i64,
+                order_id: clord_id,
                 cum_qty,
                 avg_price: avg_px,
                 last_liquidity: last_liq,
@@ -1599,13 +2068,27 @@ impl CcpState {
             });
         }
 
-        if let Some((fill, exec)) = fill_out {
-            shared.orders.push_fill_with_exec(fill, exec);
+        if let Some((fill, mut exec)) = fill_out {
+            if delivered {
+                shared.orders.push_fill_with_exec(fill, exec);
+            } else {
+                // An execution of another client's order: stored, no
+                // callback.
+                exec.other_client = true;
+                let execution = report_execution(parsed, exec_id, fill.side, fill.qty_fixed, last_px,
+                    account_id, shared.orders.api_order_id(clord_id));
+                shared.orders.push_untracked_execution(report_contract(parsed, shared), execution, exec);
+            }
             emit(event_tx, Event::Fill(fill));
         }
         if let Some(update) = update_out {
-            shared.orders.push_order_update(update);
+            if delivered {
+                shared.orders.push_order_update(update);
+            }
             emit(event_tx, Event::OrderUpdate(update));
+        }
+        if let Some((code, text)) = notice_out.filter(|_| owned) {
+            shared.orders.push_order_notice(clord_id, code, text);
         }
 
         if matches!(status,
@@ -1623,6 +2106,134 @@ impl CcpState {
                 });
             }
             context.finish_order(clord_id, status);
+            context.combos.finished(clord_id);
+        }
+    }
+
+    /// The report of one leg of a combo order's fill (ibx#470; captured
+    /// 30/09/2026): an execution of the leg, under the combo order, that
+    /// moves the leg's position. Its execDetails shows the leg's contract
+    /// on the execution's exchange, the leg's side (54=5 is a sale), size,
+    /// price and totals; the orderStatus that goes with it keeps the
+    /// combo's totals and last price. The order's own state does not move.
+    fn handle_combo_leg_report(
+        &mut self,
+        parsed: &std::collections::HashMap<u32, String>,
+        context: &mut Context,
+        shared: &SharedState,
+        order_id: OrderId,
+        combo: &crate::engine::combo::ComboOrder,
+    ) {
+        let exec_id = parsed.get(&17).map(|s| s.as_str()).unwrap_or("");
+        let last_shares: Qty = parsed.get(&32).and_then(|s| parse_qty(s)).unwrap_or(0);
+        if last_shares <= 0 { return; }
+        if !exec_id.is_empty() && !self.record_exec_id(exec_id) {
+            log::warn!("Duplicate ExecID={}: leg fill not booked again", exec_id);
+            return;
+        }
+        if !exec_id.is_empty() {
+            let time = parsed.get(&60).or_else(|| parsed.get(&52)).cloned().unwrap_or_default();
+            self.last_exec = Some((exec_id.to_string(), time));
+        }
+        let con_id: i64 = parsed.get(&6008).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let buy = parsed.get(&54).map(|s| s.as_str()) == Some("1");
+        let price = parsed.get(&31).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        let shares = last_shares as f64 / QTY_SCALE as f64;
+        let delta = if buy { last_shares } else { -last_shares };
+        if con_id != 0 {
+            if let Some(instrument) = context.market.try_register(con_id) {
+                shared.market.set_instrument_count(context.market.count());
+                context.update_position_fixed(instrument, delta);
+                shared.portfolio.set_position_fixed(instrument, context.position_fixed(instrument));
+            }
+            self.record_exec_con_id(exec_id, con_id);
+            shared.portfolio.add_money_since_seed(con_id, if buy { -shares * price } else { shares * price });
+            shared.portfolio.apply_fill_to_position(con_id, delta, (price * PRICE_SCALE as f64) as i64);
+        }
+        let leg = combo.combo.legs.iter().find(|l| l.con_id == con_id);
+        let mut exec = fill_exec_of(parsed, exec_id);
+        let sec_type = match parsed.get(&167).map(|s| s.as_str()) {
+            Some("CS") | Some("COMMON") | None => "STK".to_string(),
+            Some(other) => other.to_string(),
+        };
+        let contract = api::Contract {
+            con_id,
+            symbol: parsed.get(&55).cloned().or_else(|| leg.map(|l| l.symbol.clone())).unwrap_or_default(),
+            sec_type,
+            exchange: exec.exchange.clone(),
+            currency: parsed.get(&15).cloned().unwrap_or_default(),
+            local_symbol: parsed.get(&6035).cloned().unwrap_or_default(),
+            ..Default::default()
+        };
+        let qty = |tag: u32| parsed.get(&tag).and_then(|s| parse_qty(s)).unwrap_or(0) as f64 / QTY_SCALE as f64;
+        exec.combo = Some(Box::new(crate::bridge::ComboExec {
+            contract,
+            leg: Some(crate::bridge::LegExec {
+                side: if buy { "BOT" } else { "SLD" }.to_string(),
+                shares,
+                price,
+                cum_qty: qty(14),
+                avg_price: parsed.get(&6).and_then(|s| s.parse().ok()).unwrap_or(0.0),
+            }),
+        }));
+        let order = context.order(order_id).copied();
+        let fill = Fill {
+            instrument: order.map_or(0, |o| o.instrument),
+            order_id,
+            side: order.map_or(Side::Buy, |o| o.side),
+            price: combo.last_price,
+            qty_fixed: last_shares,
+            remaining_fixed: combo.leaves_qty,
+            cum_qty_fixed: combo.cum_qty,
+            avg_price: combo.avg_price,
+            commission: 0,
+            timestamp_ns: context.now_ns(),
+        };
+        log::info!("Combo order {} leg fill: con_id={} {} {} @ {}", order_id, con_id, if buy { "BOT" } else { "SLD" }, shares, price);
+        shared.orders.push_fill_with_exec(fill, exec);
+    }
+
+    /// A fill made while the auth link was lost, in the trades reply after
+    /// the reconnect (ibx#251): booked as the fill of an untracked order
+    /// (kept for `req_executions`, moves the position, its commission
+    /// report goes out), with no fill event and no status. When it ends the
+    /// order, the order leaves the engine and the client without a status,
+    /// and is not kept as finished: a later cancel of its id gets 10147, as
+    /// the reference's (captured 30/09/2026, ib-agent#192 C4).
+    fn handle_outage_fill(
+        &mut self,
+        parsed: &std::collections::HashMap<u32, String>,
+        context: &mut Context,
+        shared: &SharedState,
+        clord_id: OrderId,
+        account_id: &str,
+    ) {
+        let exec_id = parsed.get(&17).map(|s| s.as_str()).unwrap_or("");
+        let last_px = parsed.get(&31).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        let last_shares: Qty = parsed.get(&32).and_then(|s| parse_qty(s)).unwrap_or(0);
+        if !exec_id.is_empty() && self.seen_exec_ids.contains(exec_id) {
+            log::warn!("Duplicate ExecID={}: fill not booked again", exec_id);
+        } else {
+            if !exec_id.is_empty() {
+                let time = parsed.get(&60).or_else(|| parsed.get(&52)).cloned().unwrap_or_default();
+                self.last_exec = Some((exec_id.to_string(), time));
+            }
+            if let Some((execution, exec)) = self.book_untracked_fill(
+                parsed, context, shared, clord_id, exec_id, last_px, last_shares, account_id)
+            {
+                if !exec_id.is_empty() {
+                    self.record_exec_id(exec_id);
+                }
+                shared.orders.push_untracked_execution(report_contract(parsed, shared), execution, exec);
+            }
+        }
+        let leaves: Qty = parsed.get(&151).and_then(|s| parse_qty(s)).unwrap_or(0);
+        let ended = leaves == 0 || parsed.get(&39).map(String::as_str) == Some("2");
+        log::info!("Fill {} of order {} made while the link was lost: no fill event{}", exec_id, clord_id,
+            if ended { ", the order is dropped" } else { "" });
+        if ended {
+            context.forget_order(clord_id);
+            shared.orders.push_forgotten_order(clord_id);
         }
     }
 
@@ -1640,7 +2251,7 @@ impl CcpState {
         parsed: &std::collections::HashMap<u32, String>,
         context: &mut Context,
         shared: &SharedState,
-        clord_id: u64,
+        clord_id: OrderId,
         exec_id: &str,
         last_px: f64,
         last_shares: Qty,
@@ -1682,24 +2293,17 @@ impl CcpState {
         shared.portfolio.add_money_since_seed(con_id, cash);
         shared.portfolio.apply_fill_to_position(con_id, delta, (last_px * PRICE_SCALE as f64) as i64);
 
-        let execution = api::Execution {
-            exec_id: exec_id.to_string(),
-            acct_number: parsed.get(&1).filter(|s| !s.is_empty()).cloned()
-                .unwrap_or_else(|| account_id.to_string()),
-            side: match side { Side::Buy => "BOT", Side::Sell | Side::ShortSell => "SLD" }.to_string(),
-            shares,
-            price: last_px,
-            perm_id: parsed.get(&37).map(|s| perm_id_from_fix_order_id(s)).unwrap_or(0),
-            // The placing client's order id when the report carries it.
-            order_id: parsed.get(&6121).and_then(|s| s.parse().ok()).unwrap_or(clord_id as i64),
-            cum_qty: parsed.get(&14).and_then(|s| parse_qty(s)).unwrap_or(0) as f64 / QTY_SCALE as f64,
-            avg_price: parsed.get(&6).and_then(|s| s.parse().ok()).unwrap_or(0.0),
-            last_liquidity: parsed.get(&851).and_then(|s| s.parse().ok()).unwrap_or(0),
-            ..Default::default()
-        };
+        // The placing client's order id when the report carries it.
+        let order_id = parsed.get(&6121).and_then(|s| s.parse().ok()).unwrap_or(clord_id);
+        let execution = report_execution(parsed, exec_id, side, last_shares, last_px, account_id, order_id);
         log::info!("Fill {} of untracked order {}: con_id={} {:?} {} @ {}, stored",
             exec_id, clord_id, con_id, side, shares, last_px);
-        Some((execution, fill_exec_of(parsed, exec_id)))
+        // The execution's reports go to its client, else to client 0
+        // (`jextend.ba.a(dq, aQ)`).
+        let mut exec = fill_exec_of(parsed, exec_id);
+        let me = context.api_client_id;
+        exec.other_client = me != 0 && exec.client_id != me;
+        Some((execution, exec))
     }
 
     /// A cancel or modify the server refused (ibx#252). As the reference:
@@ -1725,14 +2329,16 @@ impl CcpState {
         log::warn!("CancelReject: clord={} type={} code={} reason={}",
             clord, reject_type, reason_code, reason);
 
-        let Some((oid, version)) = clord.split_once('.')
-            .and_then(|(id, ver)| Some((id.parse::<u64>().ok()?, ver.parse::<u32>().ok()?)))
+        let Some((server, version)) = clord.split_once('.')
+            .and_then(|(id, ver)| Some((id.parse::<OrderId>().ok()?, ver.parse::<u32>().ok()?)))
         else { return };
+        // The order held under the server's id of the ClOrdID.
+        let oid = context.key_of(server);
         if version == 0 || context.modify_versions.get(&oid) != Some(&version) {
             log::info!("CancelReject: {} is not the current version of order {}, ignored", clord, oid);
             return;
         }
-        let lowered = format!("{}.{}", oid, version - 1);
+        let lowered = format!("{}.{}", server, version - 1);
         context.modify_versions.insert(oid, version - 1);
         // A refused modify had set the order's ClOrdID on record.
         if context.last_clord.get(&oid).map(String::as_str) == Some(clord) {
@@ -1826,14 +2432,12 @@ impl CcpState {
         }
     }
 
-    /// Drop pending schedule pairs past their deadline, emitting partial details.
-    /// Fail contract-details requests whose deadline has passed (ibx#227):
-    /// both plain/by-symbol secdef lookups the gateway never answered and
-    /// by-symbol fan-outs missing one or more per-exchange replies. On
-    /// expiry the caller gets error 200 plus contract_details_end, so a
-    /// blocked wait unblocks with no API change. Internal sentinel req_ids
-    /// (>= 0xF000_0000: cache auto-fetch, scanner enrichment) are dropped
-    /// silently — no user is waiting on them.
+    /// Drop the internal lookups of ibx (ids from 0xF000_0000: cache
+    /// fill, scanner enrichment) past their deadline, silently: no caller
+    /// waits on them. A caller's contract details request, and its
+    /// per-exchange fan-out, has no deadline, as in the reference: it waits
+    /// for its answer (ibx#485; ibx#227 gave it error 200 with a text of
+    /// ibx's own).
     pub(crate) fn sweep_contract_details(
         &mut self,
         shared: &SharedState,
@@ -1845,50 +2449,31 @@ impl CcpState {
             return;
         }
         let now = Instant::now();
-        let mut expired: Vec<u32> = Vec::new();
         self.pending_secdef.retain(|(req_id, _, deadline)| {
-            if now >= *deadline {
-                if *req_id < 0xF000_0000 {
-                    expired.push(*req_id);
-                } else {
-                    log::warn!("Internal secdef timeout: req_id={:#x}", req_id);
-                }
-                false
-            } else {
-                true
+            let expired = internal_lookup(*req_id) && now >= *deadline;
+            if expired {
+                log::warn!("Internal secdef timeout: req_id={:#x}", req_id);
             }
+            !expired
         });
         let mut late: Vec<PendingFanout> = Vec::new();
         let mut i = 0;
         while i < self.pending_fanout.len() {
-            if now >= self.pending_fanout[i].deadline {
+            if internal_lookup(self.pending_fanout[i].api_req_id) && now >= self.pending_fanout[i].deadline {
                 late.push(self.pending_fanout.swap_remove(i));
             } else {
                 i += 1;
             }
         }
-        self.pending_lookups.retain(|l| !expired.contains(&l.req_id));
         for fanout in late {
             log::warn!(
-                "Contract-details fan-out timeout: api_req_id={} answered {} of {}",
+                "Internal fan-out timeout: api_req_id={:#x} answered {} of {}",
                 fanout.api_req_id, fanout.total - fanout.outstanding.len(), fanout.total,
             );
-            if fanout.records.is_empty() {
-                expired.push(fanout.api_req_id);
-            } else {
-                // The rows go out with the market rules known so far.
+            if !fanout.records.is_empty() {
+                // The rows go to the cache with the market rules known so far.
                 self.deliver_contract_rows(fanout.api_req_id, fanout.records, shared, event_tx, ccp_conn, hb);
             }
-        }
-        for req_id in expired {
-            log::warn!("Contract-details timeout: req_id={} — no gateway reply within {:?}",
-                req_id, SECDEF_TIMEOUT);
-            shared.reference.push_historical_error(
-                req_id, 200,
-                "contract details request timed out — no reply from the gateway".to_string(),
-            );
-            shared.reference.push_contract_details_end(req_id);
-            emit(event_tx, Event::ContractDetailsEnd(req_id));
         }
     }
 
@@ -1906,7 +2491,7 @@ impl CcpState {
             .into_iter()
             .partition(|p| now >= p.deadline);
         self.pending_schedule_pair = waiting;
-        let mut req_ids: Vec<u32> = Vec::new();
+        let mut req_ids: Vec<ReqId> = Vec::new();
         for mut p in expired {
             log::warn!("Schedule pair timeout: api_req_id={} join_key={}", p.api_req_id, p.join_key);
             p.def.trading_hours = None;
@@ -1944,20 +2529,12 @@ impl CcpState {
             .partition(|p| p.join_key == join_key);
         self.pending_schedule_pair = waiting;
         let sched = crate::control::contracts::parse_schedule_response(msg);
-        let mut req_ids: Vec<u32> = Vec::new();
+        let mut req_ids: Vec<ReqId> = Vec::new();
         for mut pair in ready {
             if let Some(sched) = &sched {
-                pair.def.time_zone_id = if sched.timezone.is_empty() {
-                    None
-                } else {
-                    Some(sched.timezone.clone())
-                };
-                pair.def.trading_hours = Some(
-                    crate::control::contracts::format_sessions_string(&sched.trading_hours)
-                );
-                pair.def.liquid_hours = Some(
-                    crate::control::contracts::format_sessions_string(&sched.liquid_hours)
-                );
+                // In the zone of the schedule, from its current day on, as
+                // the reference (ibx#436).
+                crate::control::contracts::apply_schedule(&mut pair.def, sched, jiff::Timestamp::now());
             }
             if !req_ids.contains(&pair.api_req_id) {
                 req_ids.push(pair.api_req_id);
@@ -1993,7 +2570,9 @@ impl CcpState {
 
     /// Account summary subscription (ibx#479), as the reference writes it:
     /// `6040=55|6036=1|6529={sr_id}|6374={tags}|6160={group}` to subscribe,
-    /// `6036=0` with the same id to cancel (`subscribe` is `None`).
+    /// `6036=0` with the same id and the group to cancel (`subscribe` is
+    /// `None`; ibx#486, account_summary of 26/09/2026:
+    /// `35=U|6040=55|6036=0|6529=SR.Socket.39|6160=All`).
     pub(crate) fn send_account_summary(
         &mut self,
         sr_id: &str,
@@ -2013,69 +2592,18 @@ impl CcpState {
         if let Some((tags, group)) = subscribe {
             fields.push((6374, tags));
             fields.push((6160, group));
+            self.summary_groups.insert(sr_id.to_string(), group.to_string());
+        }
+        let group = if subscribe.is_none() { self.summary_groups.remove(sr_id) } else { None };
+        if let Some(group) = &group {
+            fields.push((6160, group));
         }
         let _ = conn.send_fix(&fields);
         hb.last_ccp_sent = Instant::now();
         log::info!("Sent account summary {}: {}", if subscribe.is_some() { "subscribe" } else { "cancel" }, sr_id);
     }
 
-    pub(crate) fn send_news_subscribe(
-        &mut self,
-        con_id: i64,
-        instrument: InstrumentId,
-        providers: &str,
-        req_id: u32,
-        ccp_conn: &mut Option<Connection>,
-        hb: &mut HeartbeatState,
-    ) {
-        self.news_subscriptions.push((instrument, req_id));
-        if let Some(conn) = ccp_conn.as_mut() {
-            let req_id_str = req_id.to_string();
-            let con_id_str = (con_id as u32).to_string();
-            let ts = chrono_free_timestamp();
-            let _ = conn.send_fix(&[
-                (fix::TAG_MSG_TYPE, fix::MSG_MARKET_DATA_REQ),
-                (fix::TAG_SENDING_TIME, &ts),
-                (263, "1"),
-                (146, "1"),
-                (262, &req_id_str),
-                (6008, &con_id_str),
-                (207, "NEWS"),
-                (167, "CS"),
-                (264, "292"),
-                (6472, providers),
-            ]);
-            hb.last_ccp_sent = Instant::now();
-            log::info!("Sent news subscribe: con_id={} req_id={} providers={}", con_id, req_id, providers);
-        }
-    }
-
-    pub(crate) fn send_news_unsubscribe(
-        &mut self,
-        instrument: InstrumentId,
-        ccp_conn: &mut Option<Connection>,
-        hb: &mut HeartbeatState,
-    ) {
-        let req_id = match self.news_subscriptions.iter().position(|(id, _)| *id == instrument) {
-            Some(pos) => {
-                let (_, rid) = self.news_subscriptions.remove(pos);
-                rid
-            }
-            None => return,
-        };
-        if let Some(conn) = ccp_conn.as_mut() {
-            let req_id_str = req_id.to_string();
-            let _ = conn.send_fix(&[
-                (fix::TAG_MSG_TYPE, fix::MSG_MARKET_DATA_REQ),
-                (262, &req_id_str),
-                (263, "2"),
-            ]);
-            hb.last_ccp_sent = Instant::now();
-            log::info!("Sent news unsubscribe: instrument={:?} req_id={}", instrument, req_id);
-        }
-    }
-
-    pub(crate) fn send_secdef_request(&mut self, req_id: u32, con_id: i64, ccp_conn: &mut Option<Connection>, hb: &mut HeartbeatState) {
+    pub(crate) fn send_secdef_request(&mut self, req_id: ReqId, con_id: i64, ccp_conn: &mut Option<Connection>, hb: &mut HeartbeatState) {
         if let Some(conn) = ccp_conn.as_mut() {
             let con_id_str = con_id.to_string();
             let req_id_str = req_id.to_string();
@@ -2091,22 +2619,78 @@ impl CcpState {
             log::info!("Sent secdef request: req_id={} con_id={}", req_id, con_id);
             hb.last_ccp_sent = Instant::now();
         } else {
-            // No CCP socket: the entry still gets a deadline, so the caller
-            // receives error 200 + end via the sweep instead of silence (ibx#227).
+            // No CCP socket: the entry waits, as a sent one does (ibx#485).
             log::warn!("secdef request req_id={} queued with no CCP socket", req_id);
         }
         // Known-conId lookup: single record, no paginated terminator.
         self.pending_secdef.push((req_id, true, Instant::now() + SECDEF_TIMEOUT));
     }
 
-    pub(crate) fn send_secdef_request_by_symbol(&mut self, req_id: u32, symbol: &str, sec_type: &str, exchange: &str, currency: &str, filters: &crate::types::SecDefFilters, ccp_conn: &mut Option<Connection>, hb: &mut HeartbeatState) {
-        let strike = if filters.strike > 0.0 { format!("{}", filters.strike) } else { String::new() };
+    /// The API lookup by conId (ibx#438), in the reference's by-conId
+    /// forms: with an exchange (`SMART` written `BEST`)
+    /// `320=socket-reqContractDetailsReqByConid{id}|321=2|6088=Socket|6320=1|146=1|6008={conId}|6004={exchange}`,
+    /// without one the preferred contract of the conId
+    /// `320=PreferredReqByConid{id}|321=2|146=1|6008={conId}|6004=ANYEXCH`
+    /// (captured 02/10/2026). The reference answers from its contract cache
+    /// when it can; ibx always asks.
+    pub(crate) fn send_contract_details_by_con_id(
+        &mut self,
+        req_id: ReqId,
+        con_id: i64,
+        exchange: &str,
+        ccp_conn: &mut Option<Connection>,
+        hb: &mut HeartbeatState,
+    ) {
+        use crate::control::contracts::{SECDEF_BY_CONID_NAME, SECDEF_PREFERRED_NAME};
+        let con_id_str = con_id.to_string();
+        let ts = chrono_free_timestamp();
+        let mut fields: Vec<(u32, String)> = vec![
+            (fix::TAG_MSG_TYPE, "c".into()),
+            (fix::TAG_SENDING_TIME, ts.to_string()),
+        ];
+        if exchange.is_empty() {
+            fields.push((320, format!("{}{}", SECDEF_PREFERRED_NAME, req_id)));
+            fields.push((321, "2".into()));
+        } else {
+            fields.push((320, format!("{}{}", SECDEF_BY_CONID_NAME, req_id)));
+            fields.push((321, "2".into()));
+            fields.push((crate::control::contracts::TAG_IB_SOURCE, "Socket".into()));
+            fields.push((6320, "1".into()));
+        }
+        fields.push((146, "1".into()));
+        fields.push((6008, con_id_str));
+        let exchange = match exchange {
+            "" => "ANYEXCH",
+            "SMART" => "BEST",
+            other => other,
+        };
+        fields.push((6004, exchange.to_string()));
+        if let Some(conn) = ccp_conn.as_mut().filter(|_| !self.disconnected) {
+            let refs: Vec<(u32, &str)> = fields.iter().map(|(t, v)| (*t, v.as_str())).collect();
+            let _ = conn.send_fix(&refs);
+            log::info!("Sent secdef request by conId: req_id={} con_id={} exchange={}", req_id, con_id, exchange);
+            hb.last_ccp_sent = Instant::now();
+        } else {
+            log::warn!("secdef request req_id={} queued with no CCP socket", req_id);
+        }
+        self.pending_secdef.push((req_id, true, Instant::now() + SECDEF_TIMEOUT));
+    }
+
+    pub(crate) fn send_secdef_request_by_symbol(&mut self, req_id: ReqId, symbol: &str, sec_type: &str, exchange: &str, currency: &str, filters: &crate::types::SecDefFilters, ccp_conn: &mut Option<Connection>, hb: &mut HeartbeatState) {
+        let strike = filters.strike_text();
+        let (sec_type, continuous, with_futures) = lookup_sec_type(sec_type, filters);
+        if continuous {
+            log::info!("Requested continuous futures contract details: req_id={}", req_id);
+            self.pending_continuous.retain(|c| c.req_id != req_id);
+            self.pending_continuous.push(ContinuousLookup { req_id, with_futures, kept: None });
+        }
         let lookup = SymbolLookup {
             symbol: symbol.to_string(),
             sec_type: sec_type.to_string(),
             exchange: exchange.to_string(),
             currency: currency.to_string(),
             filters: filters.clone(),
+            continuous,
         };
         // A lookup with a strike that finds nothing is asked once more with
         // the strike divided by 100, as the reference (ibx#410).
@@ -2117,7 +2701,7 @@ impl CcpState {
     }
 
     /// Send one by-symbol lookup with the strike text given (empty: none).
-    fn send_symbol_lookup(&mut self, req_id: u32, lookup: &SymbolLookup, strike: &str, ccp_conn: &mut Option<Connection>, hb: &mut HeartbeatState) {
+    fn send_symbol_lookup(&mut self, req_id: ReqId, lookup: &SymbolLookup, strike: &str, ccp_conn: &mut Option<Connection>, hb: &mut HeartbeatState) {
         if let Some(conn) = ccp_conn.as_mut() {
             send_symbol_lookup_on(conn, req_id, lookup, strike);
             log::info!("Sent secdef lookup: req_id={} symbol={} sec_type={} identifier={}",
@@ -2135,7 +2719,7 @@ impl CcpState {
 
     /// The strike retry of a lookup that found nothing (ibx#410): sent once,
     /// in place of the error. False when the lookup has no retry left.
-    fn retry_with_divided_strike(&mut self, req_id: u32, ccp_conn: &mut Option<Connection>, hb: &mut HeartbeatState) -> bool {
+    fn retry_with_divided_strike(&mut self, req_id: ReqId, ccp_conn: &mut Option<Connection>, hb: &mut HeartbeatState) -> bool {
         let Some(entry) = self.pending_lookups.iter_mut().find(|l| l.req_id == req_id) else { return false };
         let Some(strike) = entry.retry_strike.take() else { return false };
         let lookup = entry.lookup.clone();
@@ -2149,7 +2733,7 @@ impl CcpState {
     /// (ibx#400, ibx#410). Internal lookups end silently.
     fn no_security_definition(
         &mut self,
-        req_id: u32,
+        req_id: ReqId,
         shared: &SharedState,
         ccp_conn: &mut Option<Connection>,
         hb: &mut HeartbeatState,
@@ -2162,7 +2746,7 @@ impl CcpState {
     }
 
     /// The pending by-symbol lookup of `req_id`, removed.
-    fn take_lookup(&mut self, req_id: u32) -> Option<SymbolLookup> {
+    fn take_lookup(&mut self, req_id: ReqId) -> Option<SymbolLookup> {
         let pos = self.pending_lookups.iter().position(|l| l.req_id == req_id)?;
         Some(self.pending_lookups.swap_remove(pos).lookup)
     }
@@ -2183,19 +2767,51 @@ impl CcpState {
         let response_req_id = contracts::secdef_response_req_id(msg);
         // Asked for an order's outside RTH (ibx#465): not a user reply.
         if let Some(rid) = response_req_id.as_deref() {
+            // Asked to build a combo (ibx#470): not a user reply.
+            if let Some(progress) = context.combos.secdef_reply(rid, msg, &chrono_free_timestamp()) {
+                super::order_builder::combo_progress(context, ccp_conn, hb, progress);
+                return;
+            }
             if super::order_builder::rth_definition_reply(context, rid, msg) { return; }
+            // Asked for the contract of an order given without a conId
+            // (ibx#486): its definition is cached, not a user reply.
+            if super::order_builder::order_contract_reply(context, shared, rid, msg) {
+                for def in crate::control::contracts::parse_secdef_records(msg).unwrap_or_default().iter().take(1) {
+                    self.cache_definition(def, shared);
+                }
+                return;
+            }
             // Asked for a round lot (ibx#287): not a user reply.
             if super::farm::round_lot_reply(context, rid, msg) { return; }
+            // Asked for a SmartDepth component (#452): not a user reply.
+            if super::farm::depth_component_reply(context, rid, msg) { return; }
             // Asked for the conId of a market data request (ibx#278).
             if super::farm::md_contract_reply(context, shared, rid, msg) { return; }
             // Asked for the conId of a historical-data request (ibx#427).
             if self.contract_resolve_reply(rid, msg, shared) { return; }
+            // Asked for the option of an option calculation (ibx#442).
+            if self.optcalc.secdef_reply(rid, msg, ccp_conn, hb, shared) { return; }
         }
         let rules = contracts::parse_market_rules(msg);
         if !rules.is_empty() {
             shared.reference.push_market_rules(rules);
         }
         let records = contracts::parse_secdef_records(msg).unwrap_or_default();
+        // The company lookup of an underlying (ibx#436): its industry is
+        // kept for the later rows of its derivatives; not a user reply.
+        if let Some(i) = response_req_id.as_deref().and_then(|rid| self.pending_company.iter().position(|(id, _)| id == rid)) {
+            let (_, under) = self.pending_company.swap_remove(i);
+            let company = records.iter().find(|d| d.con_id == under)
+                .map(|d| (d.industry.clone(), d.category.clone(), d.subcategory.clone()))
+                .unwrap_or_default();
+            self.company_by_underlying.insert(under, company);
+            for (i, def) in records.iter().enumerate() {
+                if !records[..i].iter().any(|d| d.con_id == def.con_id) {
+                    self.cache_definition(def, shared);
+                }
+            }
+            return;
+        }
         // A reply can list one conId once per exchange: the contract cache
         // keeps the first record of each conId, the one on the lookup's own
         // exchange, not the last listed exchange.
@@ -2205,6 +2821,9 @@ impl CcpState {
             }
         }
         let Some(rid) = response_req_id else { return };
+        // The lookup of an option chain leg (ibx#440): not a user reply.
+        let connected = !self.disconnected;
+        if self.optparams.leg_reply(&rid, ccp_conn, connected, hb, shared) { return; }
 
         let fanout_idx = self.pending_fanout.iter()
             .position(|p| p.outstanding.iter().any(|(id, _, _)| *id == rid));
@@ -2231,22 +2850,63 @@ impl CcpState {
         let Some(req_id) = contracts::secdef_request_number(&rid) else { return };
         let Some(idx) = self.pending_secdef.iter().position(|(pid, _, _)| *pid == req_id) else { return };
         let (_, single_shot, _) = self.pending_secdef.remove(idx);
-        if records.is_empty() {
+        let mut records = records;
+        // A CONTFUT request (ibx#438): the continuous future records are
+        // kept; with FUT+CONTFUT the futures lookup follows and its rows
+        // come after them.
+        let mut continuous: Vec<crate::control::contracts::ContractDefinition> = Vec::new();
+        if let Some(i) = self.pending_continuous.iter().position(|c| c.req_id == req_id) {
+            match self.pending_continuous[i].kept.take() {
+                None => {
+                    for def in &mut records {
+                        def.continuous = true;
+                    }
+                    if self.pending_continuous[i].with_futures {
+                        self.pending_continuous[i].kept = Some(records);
+                        let lookup = self.pending_lookups.iter().find(|l| l.req_id == req_id).map(|l| l.lookup.clone());
+                        if let Some(lookup) = lookup {
+                            let futures = SymbolLookup { continuous: false, ..lookup };
+                            if let Some(l) = self.pending_lookups.iter_mut().find(|l| l.req_id == req_id) {
+                                l.lookup = futures.clone();
+                            }
+                            self.send_symbol_lookup(req_id, &futures, "", ccp_conn, hb);
+                        }
+                        return;
+                    }
+                    self.pending_continuous.swap_remove(i);
+                }
+                Some(kept) => {
+                    self.pending_continuous.swap_remove(i);
+                    continuous = kept;
+                }
+            }
+        }
+        if records.is_empty() && continuous.is_empty() {
             // No record: never a conId 0 row (ibx#400).
             self.no_security_definition(req_id, shared, ccp_conn, hb);
             return;
         }
-        let multiplier = self.take_lookup(req_id)
-            .and_then(|l| l.filters.multiplier.parse::<f64>().ok());
-        let mut records = records;
+        let lookup = self.take_lookup(req_id);
+        let multiplier = lookup.as_ref().and_then(|l| l.filters.multiplier.parse::<f64>().ok());
+        // The request symbol is the CUSIP of a bond row when it reads as
+        // one (`jextend.dz.b(dy, lh.D)`, ibx#436).
+        if let Some(cusip) = lookup.as_ref().map(|l| l.symbol.as_str()).filter(|s| crate::control::contracts::reads_as_cusip(s)) {
+            for def in records.iter_mut() {
+                def.lookup_cusip = cusip.to_string();
+            }
+        }
         // With several records, a requested multiplier keeps only the
         // records that have it, as the reference.
         if let (true, Some(m)) = (records.len() > 1, multiplier) {
             records.retain(|d| d.multiplier == m);
-            if records.is_empty() {
+            if records.is_empty() && continuous.is_empty() {
                 push_not_found(req_id, shared);
                 return;
             }
+        }
+        if !continuous.is_empty() {
+            continuous.append(&mut records);
+            records = continuous;
         }
         for def in records.iter().filter(|d| d.con_id != 0) {
             if let Some(rule) = def.market_rule_id {
@@ -2263,17 +2923,31 @@ impl CcpState {
             // A lookup by conId asks for one contract, but its reply lists
             // that contract once per exchange: only the first record is a
             // row. The others still gave their market rules above.
-            let mut seen: Vec<u32> = Vec::with_capacity(1);
+            let mut seen: Vec<i64> = Vec::with_capacity(1);
             records.retain(|d| {
                 let first = !seen.contains(&d.con_id);
                 seen.push(d.con_id);
                 first
             });
         }
+        // A derivative without an industry takes the one of its
+        // underlying's company when known; else the company is looked up
+        // and only the later rows get it, as the reference (ibx#436).
+        for def in records.iter_mut().filter(|d| d.under_con_id > 0 && d.industry.is_empty()) {
+            match self.company_by_underlying.get(&def.under_con_id) {
+                Some(company) => crate::control::contracts::apply_company(def, company),
+                None => {
+                    let under = def.under_con_id;
+                    if !self.pending_company.iter().any(|(_, u)| *u == under) {
+                        self.send_company_lookup(under, ccp_conn, hb);
+                    }
+                }
+            }
+        }
         // By-symbol lookup: each record asks for its unknown per-exchange
         // market rules before it becomes a row.
         let by_symbol = !single_shot && !contracts::secdef_response_is_last(msg);
-        let mut outstanding: Vec<(String, u32, String)> = Vec::new();
+        let mut outstanding: Vec<(String, i64, String)> = Vec::new();
         if by_symbol {
             for def in records.iter().filter(|d| d.con_id != 0) {
                 for exch in &def.valid_exchanges {
@@ -2283,9 +2957,9 @@ impl CcpState {
                     {
                         continue;
                     }
-                    let fid = format!("ibxfan-{}-{}", req_id, self.next_fanout_id);
+                    let fid = format!("{}{}", contracts::SECDEF_EXCHANGE_RULE_NAME, self.next_fanout_id);
                     self.next_fanout_id = self.next_fanout_id.wrapping_add(1);
-                    self.send_fanout_secdef_request(&fid, def.con_id as i64, exch, ccp_conn, hb);
+                    self.send_fanout_secdef_request(&fid, def.con_id, exch, ccp_conn, hb);
                     outstanding.push((fid, def.con_id, exch.clone()));
                 }
             }
@@ -2312,7 +2986,7 @@ impl CcpState {
     /// request waits for the answer.
     pub(crate) fn start_contract_resolve(
         &mut self,
-        req_id: u32,
+        req_id: ReqId,
         lookup: crate::types::ContractLookup,
         request: crate::types::ControlCommand,
         ccp_conn: &mut Option<Connection>,
@@ -2330,26 +3004,20 @@ impl CcpState {
             exchange: lookup.exchange,
             currency: lookup.currency,
             filters: lookup.filters,
+            continuous: false,
         };
-        let strike = if symbol_lookup.filters.strike > 0.0 {
-            format!("{}", symbol_lookup.filters.strike)
-        } else {
-            String::new()
-        };
+        let strike = symbol_lookup.filters.strike_text();
         if let Some(conn) = ccp_conn.as_mut().filter(|_| !self.disconnected) {
-            send_symbol_lookup_on(conn, lookup_id, &symbol_lookup, &strike);
+            send_symbol_lookup_on(conn, ReqId::from(lookup_id), &symbol_lookup, &strike);
             hb.last_ccp_sent = Instant::now();
             log::info!("Contract lookup {} for historical req_id={}: symbol={} sec_type={}",
                 lookup_id, req_id, symbol_lookup.symbol, symbol_lookup.sec_type);
         } else {
             log::warn!("Contract lookup {} for req_id={} queued with no auth connection", lookup_id, req_id);
         }
-        self.pending_resolves.push(PendingResolve {
-            lookup_id,
-            req_id,
-            request,
-            deadline: Instant::now() + SECDEF_TIMEOUT,
-        });
+        // No deadline: the request waits for the lookup's answer, as in
+        // the reference (ibx#485).
+        self.pending_resolves.push(PendingResolve { lookup_id, req_id, request });
     }
 
     /// The answer to a contract lookup of a historical-data request
@@ -2359,10 +3027,10 @@ impl CcpState {
     fn contract_resolve_reply(&mut self, lookup_id: &str, msg: &[u8], shared: &SharedState) -> bool {
         // The reply names the lookup as it was asked; its number is the key.
         let Some(number) = crate::control::contracts::secdef_request_number(lookup_id) else { return false };
-        let Some(idx) = self.pending_resolves.iter().position(|p| p.lookup_id == number) else { return false };
+        let Some(idx) = self.pending_resolves.iter().position(|p| ReqId::from(p.lookup_id) == number) else { return false };
         let pending = self.pending_resolves.swap_remove(idx);
         let records = crate::control::contracts::parse_secdef_records(msg).unwrap_or_default();
-        let mut con_ids: Vec<u32> = Vec::new();
+        let mut con_ids: Vec<i64> = Vec::new();
         for def in &records {
             if def.con_id != 0 && !con_ids.contains(&def.con_id) {
                 con_ids.push(def.con_id);
@@ -2378,40 +3046,15 @@ impl CcpState {
         true
     }
 
-    /// Contract lookups of historical-data requests with no answer in time
-    /// (ibx#427): the request gets error 200 and no query.
-    pub(crate) fn sweep_contract_resolves(&mut self, shared: &SharedState) {
-        if self.pending_resolves.is_empty() {
-            return;
-        }
-        let now = Instant::now();
-        let mut expired: Vec<u32> = Vec::new();
-        self.pending_resolves.retain(|p| {
-            if now >= p.deadline {
-                log::warn!("Contract lookup {} timeout: req_id={}", p.lookup_id, p.req_id);
-                expired.push(p.req_id);
-                false
-            } else {
-                true
-            }
-        });
-        for req_id in expired {
-            shared.reference.push_historical_error(
-                req_id, 200,
-                "contract details request timed out — no reply from the gateway".to_string(),
-            );
-        }
-    }
-
     /// Contract cache entry of a definition, for every reply (rows or not).
     fn cache_definition(&mut self, def: &crate::control::contracts::ContractDefinition, shared: &SharedState) {
         if def.con_id == 0 {
             return;
         }
-        shared.reference.cache_contract(def.con_id as i64, api::Contract {
-            con_id: def.con_id as i64,
+        shared.reference.cache_contract(def.con_id, api::Contract {
+            con_id: def.con_id,
             symbol: def.symbol.clone(),
-            sec_type: def.sec_type.to_api_str().to_string(),
+            sec_type: def.api_type_name(),
             exchange: def.exchange.clone(),
             currency: def.currency.clone(),
             local_symbol: def.local_symbol.clone(),
@@ -2419,8 +3062,10 @@ impl CcpState {
             trading_class: def.trading_class.clone(),
             ..Default::default()
         });
-        shared.reference.cache_market_name(def.con_id as i64, &def.market_name);
-        self.try_release_scanner_enrichments(def.con_id as i64, shared);
+        // The suffix of the primary exchange, which the 399 text names
+        // (ibx#486).
+        shared.reference.cache_market_name(def.con_id, &def.primary_suffix);
+        self.try_release_scanner_enrichments(def.con_id, shared);
     }
 
     /// The rows of a lookup, in record order (ibx#435): each record gets its
@@ -2428,7 +3073,7 @@ impl CcpState {
     /// join key (one schedule request per key). The end follows the last row.
     fn deliver_contract_rows(
         &mut self,
-        req_id: u32,
+        req_id: ReqId,
         records: Vec<crate::control::contracts::ContractDefinition>,
         shared: &SharedState,
         event_tx: &Option<Sender<Event>>,
@@ -2437,8 +3082,11 @@ impl CcpState {
     ) {
         let deadline = Instant::now() + std::time::Duration::from_secs(3);
         let mut subscribed: Vec<String> = Vec::new();
+        let (bond_api, ev_api) = shared.reference.contract_details_features();
         for mut def in records {
             def.market_rule_ids = self.market_rule_ids(&def);
+            def.bond_api = bond_api;
+            def.ev_api = ev_api;
             if def.join_key.is_empty() {
                 push_contract_row(shared, event_tx, req_id, def);
             } else {
@@ -2458,7 +3106,7 @@ impl CcpState {
     }
 
     /// contract_details_end once no row of the lookup waits for its schedule.
-    fn end_if_complete(&self, req_id: u32, shared: &SharedState, event_tx: &Option<Sender<Event>>) {
+    fn end_if_complete(&self, req_id: ReqId, shared: &SharedState, event_tx: &Option<Sender<Event>>) {
         if !self.pending_schedule_pair.iter().any(|p| p.api_req_id == req_id) {
             shared.reference.push_contract_details_end(req_id);
             emit(event_tx, Event::ContractDetailsEnd(req_id));
@@ -2468,16 +3116,31 @@ impl CcpState {
     /// Market rule id of each valid exchange of a record whose rule is
     /// known, comma-joined (ibx#435).
     fn market_rule_ids(&self, def: &crate::control::contracts::ContractDefinition) -> String {
-        let mut ids = String::new();
-        for exch in &def.valid_exchanges {
-            if let Some(id) = self.market_rule_by_exchange.get(&(def.con_id, exch.clone())) {
-                if !ids.is_empty() {
-                    ids.push(',');
-                }
-                ids.push_str(&id.to_string());
-            }
+        crate::control::contracts::market_rule_ids(def, &self.market_rule_by_exchange)
+    }
+
+    /// The company lookup of an underlying (ibx#436), as the reference
+    /// sends it after a derivative record without an industry:
+    /// `35=c|320=UnderlyingECNoDupsNDReqByConid{N}|321=2|146=1|6008={conId}|6004=ANYEXCH`
+    /// (captured 28/09/2026).
+    fn send_company_lookup(&mut self, under_con_id: i64, ccp_conn: &mut Option<Connection>, hb: &mut HeartbeatState) {
+        let rid = format!("{}{}", crate::control::contracts::SECDEF_UNDERLYING_NAME, self.next_fanout_id);
+        self.next_fanout_id = self.next_fanout_id.wrapping_add(1);
+        if let Some(conn) = ccp_conn.as_mut().filter(|_| !self.disconnected) {
+            let con_id_str = under_con_id.to_string();
+            let ts = chrono_free_timestamp();
+            let _ = conn.send_fix(&[
+                (fix::TAG_MSG_TYPE, "c"),
+                (fix::TAG_SENDING_TIME, &ts),
+                (crate::control::contracts::TAG_SECURITY_REQ_ID, &rid),
+                (crate::control::contracts::TAG_SECURITY_REQ_TYPE, "2"),
+                (146, "1"),
+                (crate::control::contracts::TAG_IB_CON_ID, &con_id_str),
+                (6004, "ANYEXCH"),
+            ]);
+            hb.last_ccp_sent = Instant::now();
+            self.pending_company.push((rid, under_con_id));
         }
-        ids
     }
 
     /// Send a per-exchange fan-out request after a by-symbol master reply.
@@ -2506,80 +3169,141 @@ impl CcpState {
         }
     }
 
-    pub(crate) fn send_matching_symbols_request(&mut self, req_id: u32, pattern: &str, ccp_conn: &mut Option<Connection>, hb: &mut HeartbeatState) {
-        if let Some(conn) = ccp_conn.as_mut() {
-            let req_id_str = req_id.to_string();
-            let ts = chrono_free_timestamp();
-            let _ = conn.send_fix(&[
-                (fix::TAG_MSG_TYPE, "U"),
-                (fix::TAG_SENDING_TIME, &ts),
-                (6040, "185"),
-                (320, &req_id_str),
-                (58, pattern),
-            ]);
-            hb.last_ccp_sent = Instant::now();
-            log::info!("Sent matching symbols request: req_id={} pattern='{}'", req_id, pattern);
+    /// A matching-symbols request (ibx#369): it waits for the pacing of
+    /// the reference, which keeps only the latest waiting request (the one
+    /// it replaces gets nothing), then goes out with an own request id.
+    pub(crate) fn send_matching_symbols_request(
+        &mut self,
+        req_id: ReqId,
+        pattern: &str,
+        ccp_conn: &mut Option<Connection>,
+        hb: &mut HeartbeatState,
+        shared: &SharedState,
+    ) {
+        if let Some((replaced, _)) = self.matching_waiting.replace((req_id, pattern.to_string())) {
+            log::info!("Matching symbols request {} replaced by {} before it was sent", replaced, req_id);
         }
-        self.pending_matching_symbols.push(req_id);
+        self.pump_matching_symbols(Instant::now(), ccp_conn, hb, shared);
     }
 
-    pub(crate) fn send_mkt_depth_exchanges_request(&mut self, _ccp_conn: &mut Option<Connection>, _hb: &mut HeartbeatState, shared: &SharedState) {
-        // Depth exchanges are derived from the 6040=102 exchange list received during init.
-        // No separate server request needed — just signal the shared state to deliver cached data.
-        shared.reference.notify_depth_exchanges();
-    }
-
-    /// Parse 6040=102 exchange directory from CCP init into DepthMktDataDescription entries.
-    fn handle_exchange_list(&self, msg: &[u8], shared: &SharedState) {
-        use crate::types::DepthMktDataDescription;
-        let raw = String::from_utf8_lossy(msg);
-        let fields: Vec<&str> = raw.split('\x01').collect();
-
-        // The message has repeating 100=EXCHANGE|6813=NAME pairs grouped by sections.
-        // Sections: 6523=category|6811=category_name for stock categories,
-        //           8128=N and 8129=N separate stock/derivative sections.
-        // We parse all 100/6813 pairs into DepthMktDataDescription entries.
-        let mut descs: Vec<DepthMktDataDescription> = Vec::new();
-        let mut current_sec_type = "STK".to_string();
-        let mut current_agg_group: i32 = 0;
-
-        let mut i = 0;
-        while i < fields.len() {
-            let f = fields[i];
-            if let Some(val) = f.strip_prefix("8128=") {
-                // Section separator — exchanges above are stocks, below are derivatives
-                current_sec_type = "STK".to_string();
-                current_agg_group = val.parse().unwrap_or(0);
-            } else if let Some(val) = f.strip_prefix("8129=") {
-                current_sec_type = "FUT".to_string();
-                current_agg_group = val.parse().unwrap_or(0);
-            } else if let Some(exch) = f.strip_prefix("100=") {
-                // Next field should be 6813=name
-                let name = if i + 1 < fields.len() {
-                    fields[i + 1].strip_prefix("6813=").unwrap_or("")
-                } else {
-                    ""
-                };
-                descs.push(DepthMktDataDescription {
-                    exchange: exch.to_string(),
-                    sec_type: current_sec_type.clone(),
-                    listing_exch: name.to_string(),
-                    service_data_type: if current_sec_type == "STK" { "L1".to_string() } else { "L1".to_string() },
-                    agg_group: current_agg_group,
-                });
-                i += 1; // skip the 6813= field
+    /// Send the waiting matching-symbols request when the pacing allows it
+    /// (ibx#369): a send permit (one request in flight until its pending
+    /// mark or its answer) and 1 s after the last send. A request that
+    /// cannot be sent gets 10159 at once and is not kept; no pause follows.
+    pub(crate) fn pump_matching_symbols(
+        &mut self,
+        now: Instant,
+        ccp_conn: &mut Option<Connection>,
+        hb: &mut HeartbeatState,
+        shared: &SharedState,
+    ) {
+        while self.matching_waiting.is_some()
+            && self.matching_permits > 0
+            && self.matching_next_send.is_none_or(|at| now >= at)
+        {
+            let Some((req_id, pattern)) = self.matching_waiting.take() else { return };
+            let wire_id = self.next_matching_symbols_id;
+            self.next_matching_symbols_id = self.next_matching_symbols_id.wrapping_add(1).max(1);
+            let sent = match ccp_conn.as_mut().filter(|_| !self.disconnected) {
+                None => false,
+                Some(conn) => {
+                    let wire_id_str = wire_id.to_string();
+                    let ts = chrono_free_timestamp();
+                    let result = conn.send_fix(&[
+                        (fix::TAG_MSG_TYPE, "U"),
+                        (fix::TAG_SENDING_TIME, &ts),
+                        (6040, "185"),
+                        (320, &wire_id_str),
+                        (58, &pattern),
+                    ]);
+                    hb.last_ccp_sent = Instant::now();
+                    result.is_ok()
+                }
+            };
+            if sent {
+                log::info!("Sent matching symbols request: req_id={} id={} pattern='{}'", req_id, wire_id, pattern);
+                self.pending_matching_symbols.push((wire_id, req_id));
+                self.matching_permits -= 1;
+                self.matching_next_send = Some(now + MATCHING_SYMBOLS_SEND_GAP);
+            } else {
+                log::warn!("Matching symbols request {} not sent: auth connection down", req_id);
+                shared.reference.push_historical_error(req_id, 10159, MATCHING_SYMBOLS_SEND_FAILED.to_string());
             }
-            i += 1;
         }
-        log::info!("Parsed {} exchanges from 6040=102", descs.len());
-        shared.reference.push_depth_exchanges(descs);
+    }
+
+    /// A matching-symbols reply (ibx#369), matched by the own request id
+    /// it echoes only: an unknown id is dropped. A pending mark gives the
+    /// send permit back; an answer with an error text is error 10159 with
+    /// that text, else the rows; the permit comes back with the answer
+    /// unless the pending mark already gave it.
+    fn handle_matching_symbols_reply(
+        &mut self,
+        msg: &[u8],
+        parsed: &std::collections::HashMap<u32, String>,
+        shared: &SharedState,
+    ) {
+        let echoed = parsed.get(&320).and_then(|v| v.trim().parse::<u32>().ok());
+        let Some(pos) = echoed.and_then(|rid| self.pending_matching_symbols.iter().position(|p| p.0 == rid)) else {
+            log::warn!(
+                "matching-symbols reply dropped: Unknown request ID {:?} (pending {:?})",
+                echoed, self.pending_matching_symbols,
+            );
+            return;
+        };
+        let wire_id = self.pending_matching_symbols[pos].0;
+        let pending_mark = parsed.get(&8164).and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0) != 0;
+        if pending_mark {
+            log::debug!("matching-symbols request {} pending: send permit given back", wire_id);
+            if !self.matching_acked.contains(&wire_id) {
+                self.matching_acked.push(wire_id);
+            }
+            self.matching_permits += 1;
+            return;
+        }
+        let (_, req_id) = self.pending_matching_symbols.remove(pos);
+        match parsed.get(&58) {
+            Some(text) => shared.reference.push_historical_error(req_id, 10159, format!("{}{}", MATCHING_SYMBOLS_FAILED, text)),
+            // An empty result is a legitimate answer ("no such symbol") and
+            // is delivered (ibx#228).
+            None => shared.reference.push_matching_symbols(
+                req_id,
+                crate::control::contracts::parse_matching_symbols_response(msg).unwrap_or_default(),
+            ),
+        }
+        match self.matching_acked.iter().position(|id| *id == wire_id) {
+            Some(i) => { self.matching_acked.swap_remove(i); }
+            None => self.matching_permits += 1,
+        }
     }
 
     pub(crate) fn handle_disconnect(&mut self, context: &mut Context, _event_tx: &Option<Sender<Event>>) {
         self.disconnected = true;
+        // The derivative answers go with the link, as in the reference
+        // (ibx#440).
+        self.optparams.connection_lost();
+        // Matching-symbols requests end without an answer and are not sent
+        // again, as in the reference (ibx#369); its send permit is given
+        // back, and the waiting request stays.
+        self.pending_matching_symbols.clear();
+        self.matching_acked.clear();
+        self.matching_permits += 1;
         self.awaiting_status_replay = false;
+        self.awaiting_login_replay = false;
+        self.fill_up_pending = None;
         self.status_replay_end_at = None;
-        context.mark_orders_uncertain();
+        // A company lookup lost with the link is made again by the next
+        // derivative row (ibx#436).
+        self.pending_company.clear();
+        // A combo set-up in flight starts again after the new logon
+        // (ibx#470): its orders are handled again.
+        if context.combos.connection_lost() {
+            super::order_builder::combo_progress(context, &mut None, &mut super::HeartbeatState::new(),
+                crate::engine::combo::Progress { send: Vec::new(), release: true });
+        }
+        // The orders keep their status, as in the reference: the clients get
+        // the lost-link message only, and the replay after the new logon
+        // corrects each order (ibx#251).
         // Don't emit Event::Disconnected — auto-reconnect handles CCP drops transparently.
         // Python is only notified if reconnect exhausts retries.
     }
@@ -2593,9 +3317,7 @@ impl CcpState {
     ) {
         *ccp_conn = Some(conn);
         self.disconnected = false;
-        hb.last_ccp_sent = Instant::now();
-        hb.last_ccp_recv = Instant::now();
-        hb.pending_ccp_test = None;
+        hb.ccp_connected(Instant::now());
 
         if let Some(conn) = ccp_conn.as_mut() {
             let ts = chrono_free_timestamp();
@@ -2608,6 +3330,7 @@ impl CcpState {
             // The fills of the gap come only in the answer to this request
             // (ibx#399); they take the normal report path.
             let fill_up = self.fill_up_request(account_id, &ts);
+            self.fill_up_pending = fill_up.iter().find(|(t, _)| *t == 6556).map(|(_, v)| v.clone());
             let fill_up: Vec<(u32, &str)> = fill_up.iter().map(|(t, v)| (*t, v.as_str())).collect();
             let _ = conn.send_fix(&fill_up);
             let _ = conn.send_fix(&[
@@ -2668,9 +3391,41 @@ impl CcpState {
     }
 }
 
+/// The contract of an execution report: the cached one when its conId is
+/// known, else the report's own fields.
+fn report_contract(parsed: &std::collections::HashMap<u32, String>, shared: &SharedState) -> api::Contract {
+    let con_id: i64 = parsed.get(&6008).and_then(|s| s.parse().ok()).unwrap_or(0);
+    if con_id != 0 && let Some(cached) = shared.reference.get_contract(con_id) {
+        return cached;
+    }
+    let text = |tag: u32| parsed.get(&tag).cloned().unwrap_or_default();
+    let sec_type = match parsed.get(&167).map(String::as_str) {
+        Some("CS") | Some("COMMON") => "STK".to_string(),
+        _ => text(167),
+    };
+    api::Contract {
+        con_id, symbol: text(55), sec_type, exchange: text(207), currency: text(15),
+        local_symbol: text(6035), ..Default::default()
+    }
+}
+
 /// The status request for one order, after the server refused its cancel
 /// or modify (ibx#252): the order's ClOrdID, any symbol and side, and the
 /// account, as the reference writes it.
+/// The API status of a what-if reply, from its order status (ibx#462):
+/// 39=A is PreSubmitted (captured 02/10/2026), New and Replaced follow the
+/// routing rule of an order's reports, a reject is Inactive.
+fn what_if_status(parsed: &std::collections::HashMap<u32, String>) -> &'static str {
+    let routed = parsed.get(&100).is_some_and(|s| !s.is_empty())
+        || parsed.get(&198).is_some_and(|s| s != "NONE" && !s.is_empty());
+    match parsed.get(&39).map(String::as_str) {
+        Some("0" | "5") if routed => "Submitted",
+        Some("8") => "Inactive",
+        Some("4" | "C") => "Cancelled",
+        _ => "PreSubmitted",
+    }
+}
+
 pub(crate) fn order_status_request<'a>(clord: &'a str, account_id: &'a str, now: &'a str) -> [(u32, &'a str); 7] {
     [(fix::TAG_MSG_TYPE, "H"), (fix::TAG_SENDING_TIME, now), (11, clord), (55, "*"), (54, "*"), (6471, "1"), (1, account_id)]
 }
@@ -2689,14 +3444,22 @@ pub(crate) fn handle_account_update(msg: &[u8], context: &mut Context, shared: &
     // Rows of an account summary subscription go to that request only, not
     // to the account state (ibx#479).
     if let Some(sr_id) = summary_id(text) {
-        let (rows, _) = parse_account_rows(text);
+        let ledger = text.split(SOH_CHAR).any(|p| p == "35=RL");
+        // A ledger frame's rows as numbers: the client builds the
+        // reference's rows from them (ibx#486).
+        let (rows, ledgers) = if ledger {
+            (Vec::new(), parse_ledger_rows(text))
+        } else {
+            (parse_account_rows(text).0, Vec::new())
+        };
         shared.portfolio.push_account_summary_event(crate::bridge::AccountSummaryEvent {
             sr_id: sr_id.to_string(),
             rows: rows.into_iter()
                 .map(|(key, currency, value)| crate::bridge::AccountRow { key, value, currency, ledger: false })
                 .collect(),
-            ledger: text.split(SOH_CHAR).any(|p| p == "35=RL"),
+            ledger,
             end: false,
+            ledgers,
         });
         return;
     }
@@ -2769,7 +3532,7 @@ fn handle_account_end(msg: &[u8], shared: &SharedState) {
     // The end of an account summary batch (ibx#479).
     if let Some(sr_id) = summary_id(text) {
         shared.portfolio.push_account_summary_event(crate::bridge::AccountSummaryEvent {
-            sr_id: sr_id.to_string(), rows: Vec::new(), ledger: false, end: true,
+            sr_id: sr_id.to_string(), rows: Vec::new(), ledger: false, end: true, ledgers: Vec::new(),
         });
         return;
     }
@@ -2876,6 +3639,43 @@ pub(crate) fn parse_account_rows(text: &str) -> (Vec<(String, String, String)>, 
     }
     flush(key, currency, value, &mut ledger_values, &mut rows, &mut seen_account_type);
     (rows, time)
+}
+
+/// The rows of a ledger frame (`35=RL`) of an account summary, as the
+/// reference reads them (`jfix.aL.<init>(String)`, ibx#486): the account
+/// of the frame (`8001=AccountCode` then 8004), and per `LedgerList` row its
+/// currency (8002), tag 15, and its numeric tags. A value Java does not
+/// read as a number (`nan`) stays unset.
+pub(crate) fn parse_ledger_rows(text: &str) -> Vec<crate::bridge::LedgerRow> {
+    let mut rows: Vec<crate::bridge::LedgerRow> = Vec::new();
+    let mut account = String::new();
+    let mut key = "";
+    let mut in_row = false;
+    for part in text.split(SOH_CHAR) {
+        let Some((tag, val)) = part.split_once('=') else { continue };
+        match tag {
+            "8001" => {
+                key = val;
+                in_row = val == "LedgerList";
+                if in_row {
+                    rows.push(crate::bridge::LedgerRow { account: account.clone(), ..Default::default() });
+                }
+            }
+            "8004" if key == "AccountCode" => account = val.to_string(),
+            "8002" if in_row => { if let Some(r) = rows.last_mut() { r.currency = val.to_string(); } }
+            "15" if in_row => { if let Some(r) = rows.last_mut() { r.real_currency = val.to_string(); } }
+            _ if in_row => {
+                if let (Ok(t), Ok(v)) = (tag.parse::<u32>(), val.parse::<f64>())
+                    && v.is_finite()
+                    && let Some(r) = rows.last_mut()
+                {
+                    r.values.push((t, v));
+                }
+            }
+            _ => {}
+        }
+    }
+    rows
 }
 
 /// Handle 6040=143 P&L midnight seed response.
@@ -2996,7 +3796,7 @@ impl CcpState {
         let req_id = self.next_internal_secdef_id;
         self.next_internal_secdef_id = self.next_internal_secdef_id.wrapping_add(1);
         self.auto_fetched_conids.insert(con_id);
-        self.send_secdef_request(req_id, con_id, ccp_conn, hb);
+        self.send_secdef_request(ReqId::from(req_id), con_id, ccp_conn, hb);
     }
 
     /// Park a scanner result and dispatch concurrent secdef requests for every cache-miss
@@ -3005,7 +3805,7 @@ impl CcpState {
     /// does internally for binary-API scanner clients.
     pub(crate) fn start_scanner_enrichment(
         &mut self,
-        api_req_id: u32,
+        api_req_id: ReqId,
         result: crate::control::scanner::ScannerResult,
         ccp_conn: &mut Option<Connection>,
         shared: &SharedState,
@@ -3013,7 +3813,7 @@ impl CcpState {
     ) {
         let mut awaiting: HashSet<i64> = HashSet::new();
         for entry in &result.entries {
-            let con_id = entry.con_id as i64;
+            let con_id = entry.con_id;
             if con_id == 0 { continue; }
             if shared.reference.get_contract(con_id).is_some() { continue; }
             awaiting.insert(con_id);
@@ -3031,7 +3831,7 @@ impl CcpState {
                 let req_id = self.next_internal_secdef_id;
                 self.next_internal_secdef_id = self.next_internal_secdef_id.wrapping_add(1);
                 self.auto_fetched_conids.insert(con_id);
-                self.send_secdef_request(req_id, con_id, ccp_conn, hb);
+                self.send_secdef_request(ReqId::from(req_id), con_id, ccp_conn, hb);
             }
         }
         self.pending_scanner_enrichment.push(PendingScannerEnrichment {
@@ -3361,7 +4161,7 @@ mod tests {
     ];
 
     /// The ClOrdID the preview of order 42 was sent under (ibx#462).
-    const WHAT_IF_CLORD: &str = "42.1000000";
+    const WHAT_IF_CLORD: &str = "2147483648.0";
 
     /// A preview of order 42 in flight, and a working order 42 the preview
     /// must not touch (ibx#462).
@@ -3382,6 +4182,82 @@ mod tests {
             stop_price: 0,
         });
         (CcpState::new(), context, SharedState::new())
+    }
+
+    // ibx#462, captured 02/10/2026 (b1_462_whatif, a what-if of 10,000,000
+    // shares): the data reply keeps every value as sent, its status from
+    // 39=A, its reason for the 201 after the open order; no commission.
+    #[test]
+    fn what_if_reply_values_status_and_reason() {
+        let (mut ccp, mut context, shared) = what_if_test_state();
+        let frame = what_if_frame(&[
+            (39, "A"), (58, "YOUR ORDER IS NOT ACCEPTED."), (6094, "823189.11"), (6092, "1093819889.17"),
+            (6093, "994381596.62"), (6828, "954395.81"), (6826, "4943.27"), (6827, "4125.25"),
+            (8130, "USD"), (6552, "8600"),
+        ]);
+        ccp.handle_exec_report(&frame, &mut context, &shared, &None, "");
+        let responses = shared.orders.drain_what_if_responses();
+        assert_eq!(responses.len(), 1);
+        let s = &responses[0].state;
+        assert!(responses[0].final_reply);
+        assert_eq!(s.status, "PreSubmitted");
+        assert_eq!((s.init_margin_before, s.init_margin_after), (Some(4943.27), Some(1093819889.17)));
+        assert_eq!((s.commission, s.margin_currency.as_str(), s.suggested_size.as_str()), (None, "USD", "8600"));
+        assert_eq!(s.reject_reason, "YOUR ORDER IS NOT ACCEPTED.");
+        assert!(context.what_ifs.is_empty());
+    }
+
+    // ibx#462 (`trader.order.bQ.a(gi, e3, fq)@263-321`): a reply with an
+    // order message gives an open order with that warning text, and the
+    // preview waits for its data reply.
+    #[test]
+    fn what_if_order_message_reply_keeps_the_preview() {
+        let (mut ccp, mut context, shared) = what_if_test_state();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let event_tx = Some(event_tx);
+        let text = "Warning: your order will not be placed at the exchange until 2026-10-02 09:30:00 US/Eastern";
+        ccp.handle_exec_report(&what_if_frame(&[(39, "A"), (6360, "TIME"), (6361, text), (6378, "0")]),
+            &mut context, &shared, &event_tx, "");
+        assert!(event_rx.try_recv().is_err(), "the order-message reply is not the preview's answer");
+        let responses = shared.orders.drain_what_if_responses();
+        assert_eq!(responses.len(), 1);
+        assert!(!responses[0].final_reply);
+        assert_eq!((responses[0].state.warning_text.as_str(), responses[0].state.init_margin_after), (text, None));
+        assert!(context.what_ifs.contains_key(WHAT_IF_CLORD), "the preview still waits");
+        ccp.handle_exec_report(&what_if_frame(&ZERO_CLOSE_FIELDS), &mut context, &shared, &event_tx, "");
+        let responses = shared.orders.drain_what_if_responses();
+        assert!(responses[0].final_reply && responses[0].state.warning_text.is_empty());
+        match event_rx.try_recv() {
+            Ok(Event::WhatIf(answer)) => assert_eq!(answer.state.equity_with_loan_after, Some(945923.47)),
+            other => panic!("the data reply is the answer: {other:?}"),
+        }
+        assert!(context.what_ifs.is_empty());
+    }
+
+    // ibx#462, from the reference's code: a reject report of a preview
+    // (150=8 or 39=8, not a status report) gives error 201 alone; a status
+    // report (20=3) with 39=8 is the preview's reply: the open order with
+    // the Inactive status, then error 201 with its reason.
+    #[test]
+    fn what_if_reject_report_and_rejected_status_report() {
+        let (mut ccp, mut context, shared) = what_if_test_state();
+        let reason = "YOUR ORDER IS NOT ACCEPTED";
+        ccp.handle_exec_report(&what_if_frame(&[(20, "0"), (150, "8"), (39, "8"), (58, reason)]),
+            &mut context, &shared, &None, "");
+        assert!(shared.orders.drain_what_if_responses().is_empty(), "no open order");
+        assert_eq!(shared.orders.drain_order_errors(),
+            vec![(42, 201, format!("Order rejected - reason:{reason}"))]);
+        assert!(context.what_ifs.is_empty());
+
+        let (mut ccp, mut context, shared) = what_if_test_state();
+        ccp.handle_exec_report(&what_if_frame(&[(20, "3"), (150, "A"), (39, "8"), (58, reason)]),
+            &mut context, &shared, &None, "");
+        assert!(shared.orders.drain_order_errors().is_empty());
+        let responses = shared.orders.drain_what_if_responses();
+        assert_eq!(responses.len(), 1);
+        assert!(responses[0].final_reply);
+        assert_eq!((responses[0].state.status.as_str(), responses[0].state.reject_reason.as_str()), ("Inactive", reason));
+        assert!(context.what_ifs.is_empty());
     }
 
     // ibx#205: a margin-reducing preview (close, cash-account sell) resolves to a
@@ -3645,6 +4521,17 @@ mod tests {
         assert_eq!(info.order.lmt_price, 101.5);
     }
 
+    // ibx#263: the reference reads the cash quantity the server echoes in
+    // 152 into the order (`jexec.fq.<init>(dk, boolean)@2005-2120`), which
+    // openOrder shows.
+    #[test]
+    fn the_reported_cash_quantity_is_read_from_152() {
+        let (mut ccp, mut context, shared) = ord_status_test_state();
+        let routed = exec_report_frame(&[(39, "0"), (150, "0"), (100, "ARCA"), (152, "1000.00")]);
+        ccp.handle_exec_report(&routed, &mut context, &shared, &None, "");
+        assert_eq!(shared.orders.get_order_info(42).expect("cached").order.cash_qty, 1000.0);
+    }
+
     #[test]
     fn ord_status_replace_of_a_routed_order_stays_submitted() {
         let (mut ccp, mut context, shared) = ord_status_test_state();
@@ -3705,9 +4592,9 @@ mod tests {
         }
         assert!(context.order(42).is_none(), "a cancelled order leaves the engine");
         // Its state stays known for a later cancel (ibx#464).
-        assert_eq!(context.finished_status(42), Some(OrderStatus::Cancelled));
+        assert_eq!(context.finished_status(42), Some(crate::types::OrderStatus::Cancelled));
         let last = shared.orders.drain_order_updates().last().map(|u| u.status);
-        assert_eq!(last, Some(OrderStatus::Cancelled));
+        assert_eq!(last, Some(crate::types::OrderStatus::Cancelled));
     }
 
     // ibx#464: a cancel now carries the order's next ClOrdID version, not a
@@ -3747,6 +4634,55 @@ mod tests {
         text.replace('|', "\x01").into_bytes()
     }
 
+    // ibx#466: an order of this session is held under its API order id and
+    // goes out under a server id of the order id generator. Its reports
+    // come under the server id: they reach the order, with that id as the
+    // permId; a refused cancel lowers the order's version and asks the
+    // status under the server id.
+    #[test]
+    fn reports_under_the_server_id_reach_the_order_of_its_api_id() {
+        use crate::types::OrderStatus;
+        let (mut ccp, mut context, shared) = ord_status_test_state();
+        context.bind_server_id(42, 1_000_000_007);
+        let working = exec_report_frame(&[(11, "1000000007.0"), (39, "0"), (150, "0"), (100, "ARCA"), (6121, "42"), (6119, "0")]);
+        ccp.handle_exec_report(&working, &mut context, &shared, &None, "");
+        assert_eq!(context.order(42).unwrap().status, OrderStatus::Submitted);
+        assert!(context.order(1_000_000_007).is_none());
+        let updates = shared.orders.drain_order_updates();
+        assert_eq!((updates[0].order_id, updates[0].perm_id), (42, 1_000_000_007));
+        assert_eq!(context.last_clord.get(&42).map(String::as_str), Some("1000000007.0"));
+
+        context.modify_versions.insert(42, 1);
+        context.cancel_clord.insert(42, "1000000007.1".to_string());
+        let mut reject = std::collections::HashMap::new();
+        for (t, v) in [(35u32, "9"), (11, "1000000007.1"), (41, "1000000007.0"), (434, "1"), (102, "0")] {
+            reject.insert(t, v.to_string());
+        }
+        ccp.handle_cancel_reject(&reject, &mut None, &mut context, &shared, &None, &mut HeartbeatState::new(), "DU1");
+        assert_eq!(context.modify_versions.get(&42), Some(&0));
+        assert!(!context.cancel_clord.contains_key(&42));
+        assert!(context.status_queries.contains(&42));
+    }
+
+    // ibx#466: the API order id of each report counts for its client's
+    // next valid id (`jextend.H.c(int)`): the highest positive id per
+    // client id (6119, 0 when absent); none for a report without 6121.
+    #[test]
+    fn reports_note_the_highest_api_order_id_of_their_client() {
+        let (mut ccp, mut context, shared) = ord_status_test_state();
+        for (id, client) in [("68", Some("198")), ("57", Some("198")), ("12", None), ("-3", Some("7")), ("2147483647", Some("7"))] {
+            let mut report = exec_report_frame(&[(11, "1500000000.0"), (39, "4"), (150, "4"), (6121, id)]);
+            if let Some(c) = client { report.insert(6119, c.to_string()); }
+            ccp.handle_exec_report(&report, &mut context, &shared, &None, "");
+        }
+        let no_id = exec_report_frame(&[(11, "1500000001.0"), (39, "4"), (150, "4"), (6119, "5")]);
+        ccp.handle_exec_report(&no_id, &mut context, &shared, &None, "");
+        assert_eq!(shared.orders.reported_order_id(198), 68);
+        assert_eq!(shared.orders.reported_order_id(0), 12);
+        assert_eq!(shared.orders.reported_order_id(7), 0, "negative ids and the unset value do not count");
+        assert_eq!(shared.orders.reported_order_id(5), 0);
+    }
+
     // ibx#252, captured (ib-agent#192 C2b): the cancel of a child the
     // server had already cancelled with its parent is refused, then the
     // answer to the status request the refusal triggers comes in the
@@ -3763,7 +4699,7 @@ mod tests {
             1626578655, instrument, Side::Sell, 1, 50962 * PRICE_SCALE / 100, b'2', b'0', 0,
         ));
         let (client, mut server) = socket_pair();
-        let mut conn = Some(Connection::new_raw(client).unwrap());
+        let mut conn = Some(Connection::new_mem(client));
         let mut hb = HeartbeatState::new();
         // The cancel ibx sent: version 1.
         context.modify_versions.insert(1626578655, 1);
@@ -3772,7 +4708,7 @@ mod tests {
 
         let cancelled = pipe_frame("8=FIX.4.1|9=000518|35=8|34=000769|43=N|52=20260923-10:09:51|11=1626578655.0|17=140781.1790158191.3|150=4|20=3|378=5|39=4|167=CS|55=AAPL|6210=BEST|38=1|44=509.62|32=0|31=0.00|14=0|151=0|6=0|54=2|37=00cf16ed.000225ed.6ab35319.0001|1=DU1|60=20260923-10:09:51|6571=20260923-10:09:51|6596=20261231-21:00:00|583=1626578654|6209=ReduceOnFillNonBlock|40=2|6119=192|6121=118|59=1|6008=265598|15=USD|6004=BEST|6122=c|6107=1626578654.0|6531=11/1/-7625079|6205=1|6236=CHILD|198=NONE|6115=0|6088=Socket|6035=AAPL|6817=20260923-10:09:46|10=052|");
         ccp.process_ccp_message(&cancelled, &mut conn, &mut context, &shared, &None, &mut hb, "DU1");
-        assert_eq!(context.finished_status(1626578655), Some(OrderStatus::Cancelled));
+        assert_eq!(context.finished_status(1626578655), Some(crate::types::OrderStatus::Cancelled));
         shared.orders.drain_order_updates();
         shared.orders.drain_order_errors();
 
@@ -3787,7 +4723,7 @@ mod tests {
         ccp.process_ccp_message(&answer, &mut conn, &mut context, &shared, &None, &mut hb, "DU1");
         assert!(shared.orders.drain_order_errors().is_empty(), "no 201 and no 202");
         assert!(shared.orders.drain_order_updates().iter().all(|u| u.status != OrderStatus::Rejected));
-        assert_eq!(context.finished_status(1626578655), Some(OrderStatus::Cancelled));
+        assert_eq!(context.finished_status(1626578655), Some(crate::types::OrderStatus::Cancelled));
         let info = shared.orders.get_order_info(1626578655).unwrap();
         assert_eq!(info.order_state.status, "Cancelled");
     }
@@ -3800,7 +4736,7 @@ mod tests {
         use crate::types::OrderStatus;
         let (mut ccp, mut context, shared) = ord_status_test_state();
         let (client, mut server) = socket_pair();
-        let mut conn = Some(Connection::new_raw(client).unwrap());
+        let mut conn = Some(Connection::new_mem(client));
         let mut hb = HeartbeatState::new();
         let routed = exec_report_frame(&[(11, "42.0"), (39, "0"), (150, "0"), (20, "0"), (100, "ARCA")]);
         ccp.handle_exec_report(&routed, &mut context, &shared, &None, "DU1");
@@ -3838,7 +4774,7 @@ mod tests {
         use crate::types::OrderStatus;
         let (mut ccp, mut context, shared) = ord_status_test_state();
         let (client, mut server) = socket_pair();
-        let mut conn = Some(Connection::new_raw(client).unwrap());
+        let mut conn = Some(Connection::new_mem(client));
         let mut hb = HeartbeatState::new();
         context.modify_versions.insert(42, 2);
         context.last_clord.insert(42, "42.2".to_string());
@@ -3868,7 +4804,7 @@ mod tests {
         let frame = exec_report_frame(&[(11, "42.0"), (20, "0"), (39, "8"), (150, "8"), (58, "no")]);
         ccp.handle_exec_report(&frame, &mut context, &shared, &None, "DU1");
         assert_eq!(context.finished_status(42), Some(OrderStatus::Rejected));
-        assert_eq!(shared.orders.drain_order_errors()[0].1, 201);
+        assert_eq!(shared.orders.drain_order_notices()[0].1, 201);
     }
 
     // ibx#472: the reference handles 39=E and 39=I as invalid statuses: no
@@ -3978,24 +4914,24 @@ mod tests {
         assert_eq!(decode_tif(b'7'), "???");
     }
 
-    // ── ibx#227: contract-details deadline sweep ──
+    // ── ibx#485: a caller's contract details request has no deadline ──
 
+    // As in the reference (`jclient.mE`: only an order's lookup gives up),
+    // a caller's request waits for its answer: no error 200 of ibx's own,
+    // no end. A negative request id is a caller's (ibx#285).
     #[test]
-    fn sweep_times_out_pending_secdef_with_error_and_end() {
+    fn sweep_keeps_a_callers_request_past_any_deadline() {
         let mut ccp = CcpState::new();
         let shared = SharedState::new();
-        let past = Instant::now() - std::time::Duration::from_secs(1);
+        let past = Instant::now() - std::time::Duration::from_secs(3600);
         ccp.pending_secdef.push((7, true, past));
+        ccp.pending_secdef.push((-7, true, past));
 
         ccp.sweep_contract_details(&shared, &None, &mut None, &mut HeartbeatState::new());
 
-        assert!(ccp.pending_secdef.is_empty(), "expired entry must be reclaimed");
-        let errors = shared.reference.drain_historical_errors();
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].0, 7);
-        assert_eq!(errors[0].1, 200);
-        assert_eq!(shared.reference.drain_contract_details_end(), vec![7],
-            "end must fire so a blocked wait unblocks");
+        assert_eq!(ccp.pending_secdef.len(), 2, "both still wait");
+        assert!(shared.reference.drain_historical_errors().is_empty());
+        assert!(shared.reference.drain_contract_details_end().is_empty());
     }
 
     #[test]
@@ -4013,26 +4949,28 @@ mod tests {
         assert!(shared.reference.drain_contract_details_end().is_empty());
     }
 
+    // ibx#485: a caller's fan-out waits for every per-exchange reply, as
+    // the reference's contract details end does; an internal one is
+    // dropped at its deadline.
     #[test]
-    fn sweep_times_out_incomplete_fanout() {
+    fn sweep_keeps_a_callers_fanout_and_drops_an_internal_one() {
         let mut ccp = CcpState::new();
         let shared = SharedState::new();
-        ccp.pending_fanout.push(PendingFanout {
-            api_req_id: 9,
+        let fanout = |api_req_id| PendingFanout {
+            api_req_id,
             outstanding: vec![("ibxfan-9-26".to_string(), 1, "IEX".to_string())],
-            total: 27, // one reply lost — previously hung forever
+            total: 27,
             records: Vec::new(),
             deadline: Instant::now() - std::time::Duration::from_secs(1),
-        });
+        };
+        ccp.pending_fanout.push(fanout(9));
+        ccp.pending_fanout.push(fanout(0xF000_0003));
 
         ccp.sweep_contract_details(&shared, &None, &mut None, &mut HeartbeatState::new());
 
-        assert!(ccp.pending_fanout.is_empty());
-        let errors = shared.reference.drain_historical_errors();
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].0, 9);
-        assert_eq!(errors[0].1, 200);
-        assert_eq!(shared.reference.drain_contract_details_end(), vec![9]);
+        assert_eq!(ccp.pending_fanout.iter().map(|f| f.api_req_id).collect::<Vec<_>>(), vec![9]);
+        assert!(shared.reference.drain_historical_errors().is_empty());
+        assert!(shared.reference.drain_contract_details_end().is_empty());
     }
 
     // ── ibx#400: empty reply and session reject ──
@@ -4097,12 +5035,12 @@ mod tests {
     fn symbol_lookup(symbol: &str, sec_type: &str, exchange: &str, filters: crate::types::SecDefFilters) -> SymbolLookup {
         SymbolLookup {
             symbol: symbol.into(), sec_type: sec_type.into(), exchange: exchange.into(),
-            currency: "USD".into(), filters,
+            currency: "USD".into(), filters, continuous: false,
         }
     }
 
     fn lookup_frame(lookup: &SymbolLookup) -> String {
-        let strike = if lookup.filters.strike > 0.0 { format!("{}", lookup.filters.strike) } else { String::new() };
+        let strike = lookup.filters.strike_text();
         frame_text(&secdef_by_symbol_fields(7, lookup, &strike))
     }
 
@@ -4218,7 +5156,7 @@ mod tests {
         assert_eq!(secdef_request_number("FixSecDefReqBySymbol42"), Some(42));
         assert_eq!(secdef_request_number("FixSecDefReqByIdTypeValue7"), Some(7));
         assert_eq!(secdef_request_number("100"), Some(100));
-        assert_eq!(secdef_request_number("ibxfan-1-2"), None);
+        assert_eq!(secdef_request_number("getECsForConidExchangePairsReqByConid2"), None);
         assert_eq!(secdef_request_number("FixSecDefReqBySymbol"), None);
     }
 
@@ -4233,16 +5171,14 @@ mod tests {
         assert_eq!(strike_divided_by_100("1234.25"), "12.3425");
     }
 
-    fn socket_pair() -> (std::net::TcpStream, std::net::TcpStream) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (server, _) = listener.accept().unwrap();
+    fn socket_pair() -> (crate::protocol::connection::MemTransport, crate::protocol::connection::MemTransport) {
+        let (client, server) = crate::protocol::connection::mem_pair();
         (client, server)
     }
 
     /// Every message written to `server`, without the framing, sequence
     /// and time fields.
-    fn ccp_messages_sent(server: &mut std::net::TcpStream) -> Vec<String> {
+    fn ccp_messages_sent(server: &mut crate::protocol::connection::MemTransport) -> Vec<String> {
         use std::io::Read;
         server.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
         let mut buf = Vec::new();
@@ -4264,7 +5200,7 @@ mod tests {
     fn empty_reply_to_a_strike_lookup_retries_once_then_gives_error_200() {
         let (mut ccp, mut context, shared) = u186_test_state();
         let (client, mut server) = socket_pair();
-        let mut conn = Some(Connection::new_raw(client).unwrap());
+        let mut conn = Some(Connection::new_mem(client));
         let mut hb = HeartbeatState::new();
         let mut f = option_filters("", "", "");
         f.strike = 342.8;
@@ -4316,7 +5252,7 @@ mod tests {
         let rows = shared.reference.drain_contract_details();
         assert_eq!(rows.len(), 5, "one row per record");
         assert!(rows.iter().all(|(rid, _)| *rid == 21));
-        let ids: Vec<u32> = rows.iter().map(|(_, d)| d.con_id).collect();
+        let ids: Vec<i64> = rows.iter().map(|(_, d)| d.con_id).collect();
         assert_eq!(ids, [815824267, 840227399, 866514785, 893091676, 925800444]);
         // The record's own exchange rule is known: no fan-out.
         assert!(ccp.pending_fanout.is_empty());
@@ -4325,11 +5261,101 @@ mod tests {
         assert!(ccp.pending_secdef.is_empty() && ccp.pending_lookups.is_empty());
     }
 
+    // ibx#436: a derivative record without an industry looks up the
+    // company of its underlying; its row goes out without the industry,
+    // the later rows get it (captured 28/09/2026: the first AAPL option row
+    // has no industry, the next ones have Technology).
+    // ibx#435, ibx#436: a lookup reply asks, for each record and each of
+    // its valid exchanges but BEST, the market rule it does not know yet:
+    // one request per (conId, exchange), named as the reference names it
+    // (captured 28/09/2026: 20 requests for one AAPL option, AMEX to MX2;
+    // 02/10/2026: one, QBALGO, for an ES future whose CME rule came with
+    // the reply). The rows wait for every answer; a second lookup of the
+    // same contracts asks nothing.
+    #[test]
+    fn fan_out_asks_each_unknown_exchange_rule_of_each_record() {
+        let (mut ccp, mut context, shared) = u186_test_state();
+        let (client, mut server) = socket_pair();
+        let mut conn = Some(Connection::new_mem(client));
+        let mut hb = HeartbeatState::new();
+        let reply = |rid: &str| pipe_msg(&format!(
+            "35=d|320={rid}|323=4|55=AAPL|167=OPT|207=BEST|6008=1|6031=32|55=AAPL|167=OPT|207=BEST|6008=2|6031=32|\
+             146=0|6344=2|6008=1|6046=BEST,AMEX,CBOE,|6008=2|6046=BEST,AMEX,CBOE,"));
+        ccp.send_secdef_request_by_symbol(41, "AAPL", "OPT", "SMART", "USD", &Default::default(), &mut conn, &mut hb);
+        let _ = ccp_messages_sent(&mut server);
+        ccp.process_ccp_message(&reply("41"), &mut conn, &mut context, &shared, &None, &mut hb, "DU1");
+        let sent = ccp_messages_sent(&mut server);
+        let asked: Vec<(String, String, String)> = sent.iter().map(|m| {
+            let field = |tag: &str| m.split('|').find_map(|f| f.strip_prefix(tag)).unwrap_or("").to_string();
+            (field("320="), field("6008="), field("6004="))
+        }).collect();
+        assert_eq!(asked.len(), 4, "{sent:?}");
+        assert!(asked.iter().all(|(rid, _, _)| rid.starts_with("getECsForConidExchangePairsReqByConid")), "{asked:?}");
+        let pairs: Vec<(&str, &str)> = asked.iter().map(|(_, c, e)| (c.as_str(), e.as_str())).collect();
+        assert_eq!(pairs, [("1", "AMEX"), ("1", "CBOE"), ("2", "AMEX"), ("2", "CBOE")]);
+        assert!(sent.iter().all(|m| m.contains("|321=2|146=1|")), "{sent:?}");
+        assert!(shared.reference.drain_contract_details().is_empty(), "the rows wait for the answers");
+        for (i, (rid, con_id, exch)) in asked.iter().enumerate() {
+            let answer = pipe_msg(&format!(
+                "35=d|320={rid}|323=4|55=AAPL|167=OPT|207={exch}|6008={con_id}|6031={}|146=0|6344=0", 100 + i));
+            ccp.process_ccp_message(&answer, &mut conn, &mut context, &shared, &None, &mut hb, "DU1");
+        }
+        let rows = shared.reference.drain_contract_details();
+        let ids: Vec<(i64, String)> = rows.iter().map(|(_, d)| (d.con_id, d.market_rule_ids.clone())).collect();
+        assert_eq!(ids, [(1, "32,100,101".to_string()), (2, "32,102,103".to_string())]);
+        assert_eq!(shared.reference.drain_contract_details_end(), vec![41]);
+        // The same contracts again: every rule is known, no request.
+        ccp.send_secdef_request_by_symbol(42, "AAPL", "OPT", "SMART", "USD", &Default::default(), &mut conn, &mut hb);
+        let _ = ccp_messages_sent(&mut server);
+        ccp.process_ccp_message(&reply("42"), &mut conn, &mut context, &shared, &None, &mut hb, "DU1");
+        assert!(ccp_messages_sent(&mut server).is_empty());
+        assert_eq!(shared.reference.drain_contract_details().len(), 2);
+    }
+
+    #[test]
+    fn a_derivative_row_gets_the_industry_of_its_looked_up_company() {
+        let (mut ccp, mut context, shared) = u186_test_state();
+        let (client, mut server) = socket_pair();
+        let mut conn = Some(Connection::new_mem(client));
+        let mut hb = HeartbeatState::new();
+        let option = |rid: &str| pipe_msg(&format!(
+            "35=d|320={rid}|323=4|55=AAPL|167=OPT|207=BEST|6008=926735346|6031=32|146=0|6344=1|6008=926735346|6346=265598|306=APPLE INC"));
+
+        ccp.send_secdef_request_by_symbol(31, "AAPL", "OPT", "SMART", "USD", &Default::default(), &mut conn, &mut hb);
+        let _ = ccp_messages_sent(&mut server);
+        ccp.process_ccp_message(&option("31"), &mut conn, &mut context, &shared, &None, &mut hb, "DU1");
+        let rows = shared.reference.drain_contract_details();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.industry, "", "the first row has no industry");
+        let sent = ccp_messages_sent(&mut server);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].contains("|146=1|6008=265598|6004=ANYEXCH"), "{}", sent[0]);
+        let rid = sent[0].split('|').find_map(|f| f.strip_prefix("320=")).unwrap().to_string();
+        assert!(rid.starts_with("UnderlyingECNoDupsNDReqByConid"), "{rid}");
+
+        // The company reply is not a row.
+        let mut company = pipe_msg(&format!(
+            "35=d|320={rid}|323=4|55=AAPL|167=STK|207=BEST|6008=265598|146=0|6344=1|6008=265598|6623=0|6622=1|6623=0|6624=Technology"));
+        let at = company.windows(15).position(|w| w == b"6624=Technology").unwrap() + 15;
+        company.splice(at..at, b"|Computers|Computers".iter().copied());
+        ccp.process_ccp_message(&company, &mut conn, &mut context, &shared, &None, &mut hb, "DU1");
+        assert!(shared.reference.drain_contract_details().is_empty());
+        assert_eq!(shared.reference.drain_contract_details_end(), vec![31]);
+
+        ccp.send_secdef_request_by_symbol(32, "AAPL", "OPT", "SMART", "USD", &Default::default(), &mut conn, &mut hb);
+        let _ = ccp_messages_sent(&mut server);
+        ccp.process_ccp_message(&option("32"), &mut conn, &mut context, &shared, &None, &mut hb, "DU1");
+        let rows = shared.reference.drain_contract_details();
+        let d = &rows[0].1;
+        assert_eq!((d.industry.as_str(), d.category.as_str(), d.subcategory.as_str()), ("Technology", "Computers", "Computers"));
+        assert!(ccp_messages_sent(&mut server).is_empty(), "no second company lookup");
+    }
+
     #[test]
     fn records_sharing_a_join_key_ask_their_schedule_once() {
         let (mut ccp, mut context, shared) = u186_test_state();
         let (client, mut server) = socket_pair();
-        let mut conn = Some(Connection::new_raw(client).unwrap());
+        let mut conn = Some(Connection::new_mem(client));
         let mut hb = HeartbeatState::new();
         ccp.send_secdef_request_by_symbol(22, "MNQ", "FUT", "CME", "USD", &Default::default(), &mut conn, &mut hb);
         let _ = ccp_messages_sent(&mut server);
@@ -4337,8 +5363,13 @@ mod tests {
         ccp.process_ccp_message(&five_future_records("22", "CME/FUT"), &mut conn, &mut context, &shared, &None,
             &mut hb, "DU1");
         let sent = ccp_messages_sent(&mut server);
-        assert_eq!(sent.len(), 1, "one schedule request for the shared key: {sent:?}");
-        assert!(sent[0].contains("6256=CME/FUT"), "{}", sent[0]);
+        let schedules: Vec<&String> = sent.iter().filter(|m| m.contains("6040=106")).collect();
+        assert_eq!(schedules.len(), 1, "one schedule request for the shared key: {sent:?}");
+        assert!(schedules[0].contains("6256=CME/FUT"), "{}", schedules[0]);
+        // And one company lookup of the underlying (ibx#436).
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert!(sent.iter().any(|m| m.contains("320=UnderlyingECNoDupsNDReqByConid") && m.contains("6008=362687422")
+            && m.contains("6004=ANYEXCH")), "{sent:?}");
         assert!(shared.reference.drain_contract_details().is_empty(), "rows wait for the schedule");
         assert!(shared.reference.drain_contract_details_end().is_empty());
 
@@ -4372,7 +5403,7 @@ mod tests {
 
         reply(&mut ccp, &mut context, &shared, &stock_reply("31"));
         assert_eq!(ccp.pending_fanout.len(), 1);
-        let asked: Vec<(u32, String)> = ccp.pending_fanout[0].outstanding.iter()
+        let asked: Vec<(i64, String)> = ccp.pending_fanout[0].outstanding.iter()
             .map(|(_, c, e)| (*c, e.clone())).collect();
         assert_eq!(asked, [(265598, "AMEX".to_string()), (265598, "NYSE".to_string())],
             "only the exchanges with no known rule");
@@ -4418,7 +5449,7 @@ mod tests {
     fn concurrent_lookups_sharing_a_schedule_key_keep_their_own_rows() {
         let (mut ccp, mut context, shared) = u186_test_state();
         let (client, mut server) = socket_pair();
-        let mut conn = Some(Connection::new_raw(client).unwrap());
+        let mut conn = Some(Connection::new_mem(client));
         let mut hb = HeartbeatState::new();
         let key = "1/STK/NASDAQ#LITE";
         ccp.send_secdef_request(100, 756733, &mut conn, &mut hb);
@@ -4456,7 +5487,7 @@ mod tests {
         let schedule = pipe_msg(&format!("35=U|6040=107|6256={key}"));
         ccp.process_ccp_message(&schedule, &mut conn, &mut context, &shared, &None, &mut hb, "DU1");
 
-        let rows: Vec<(u32, u32, String, String)> = shared.reference.drain_contract_details().into_iter()
+        let rows: Vec<(ReqId, i64, String, String)> = shared.reference.drain_contract_details().into_iter()
             .map(|(rid, d)| (rid, d.con_id, d.symbol, d.market_rule_ids)).collect();
         assert_eq!(rows, [
             (100, 756733, "SPY".to_string(), "4563,109,110".to_string()),
@@ -4490,8 +5521,10 @@ mod tests {
         assert_eq!(shared.reference.drain_contract_details_end(), vec![41]);
     }
 
+    // ibx#485: a caller's lookup waits for its per-exchange replies with
+    // no deadline: nothing goes out before them.
     #[test]
-    fn a_fanout_timeout_sends_the_waiting_rows_then_end() {
+    fn a_callers_fanout_waits_for_every_reply() {
         let (mut ccp, mut context, shared) = u186_test_state();
         ccp.send_secdef_request_by_symbol(51, "AAPL", "STK", "SMART", "USD", &Default::default(), &mut None,
             &mut HeartbeatState::new());
@@ -4501,11 +5534,134 @@ mod tests {
 
         ccp.sweep_contract_details(&shared, &None, &mut None, &mut HeartbeatState::new());
 
+        assert_eq!(ccp.pending_fanout.len(), 1, "still waiting");
+        assert!(shared.reference.drain_contract_details().is_empty());
+        assert!(shared.reference.drain_contract_details_end().is_empty());
+        assert!(shared.reference.drain_historical_errors().is_empty());
+    }
+
+    // ── ibx#438: CONTFUT, by conId with an exchange, bond issuer ──
+
+    /// A future record of a definition reply, without a schedule key.
+    fn future_listing(con_id: &str, local: &str, month: &str) -> String {
+        format!("55=ES|167=FUT|207=CME|6008={con_id}|6031=67|15=USD|58=ES|6035={local}|6058=ES|200={month}|231=50|")
+    }
+
+    fn future_reply(req: &str, listings: &[String]) -> Vec<u8> {
+        let mut text = format!("35=d|43=N|320={req}|322=*|323=4|");
+        for l in listings {
+            text.push_str(l);
+        }
+        text.push_str("146=1|6038=Y|6019=1|6031=67|6026=1|6023=0|6027=0.25|6030=1|6344=1|");
+        pipe_msg(&text)
+    }
+
+    // Captured 02/10/2026 (b1_438_lookups): CONTFUT ES CME goes out as the
+    // continuous future lookup, without the source; the one row is the
+    // front month with secType CONTFUT.
+    #[test]
+    fn contfut_lookup_as_the_reference() {
+        let (mut ccp, mut context, shared) = u186_test_state();
+        let (client, mut server) = socket_pair();
+        let mut conn = Some(Connection::new_mem(client));
+        let mut hb = HeartbeatState::new();
+        ccp.market_rule_by_exchange.insert((515416632, "CME".into()), 67);
+        ccp.send_secdef_request_by_symbol(9480, "ES", "CONTFUT", "CME", "USD", &Default::default(), &mut conn, &mut hb);
+        assert_eq!(ccp_messages_sent(&mut server), ["35=c|320=FixSecDefReqBySymbol9480|321=2|55=ES|167=FUT|6857=2|100=CME|15=USD"]);
+        let reply = future_reply("FixSecDefReqBySymbol9480", &[future_listing("515416632", "ESZ6", "202612")]);
+        ccp.process_ccp_message(&reply, &mut conn, &mut context, &shared, &None, &mut hb, "DU1");
         let rows = shared.reference.drain_contract_details();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].1.market_rule_ids, "4563", "the rules known so far");
-        assert_eq!(shared.reference.drain_contract_details_end(), vec![51]);
-        assert!(shared.reference.drain_historical_errors().is_empty());
+        assert_eq!((rows[0].0, rows[0].1.con_id, rows[0].1.continuous), (9480, 515416632, true));
+        assert_eq!(crate::api::types::ContractDetails::from_definition(&rows[0].1).contract.sec_type, "CONTFUT");
+        assert_eq!(shared.reference.drain_contract_details_end(), [9480]);
+        assert!(ccp.pending_continuous.is_empty() && ccp.pending_secdef.is_empty());
+    }
+
+    // Captured 02/10/2026: FUT+CONTFUT sends the continuous lookup, then,
+    // once it is answered, the futures lookup; the CONTFUT row comes first,
+    // then every future (the front month again, as FUT).
+    #[test]
+    fn fut_and_contfut_lookup_as_the_reference() {
+        let (mut ccp, mut context, shared) = u186_test_state();
+        let (client, mut server) = socket_pair();
+        let mut conn = Some(Connection::new_mem(client));
+        let mut hb = HeartbeatState::new();
+        for con_id in [515416632, 586139767] {
+            ccp.market_rule_by_exchange.insert((con_id, "CME".into()), 67);
+        }
+        ccp.send_secdef_request_by_symbol(9481, "ES", "FUT+CONTFUT", "CME", "USD", &Default::default(), &mut conn, &mut hb);
+        assert_eq!(ccp_messages_sent(&mut server), ["35=c|320=FixSecDefReqBySymbol9481|321=2|55=ES|167=FUT|6857=2|100=CME|15=USD"]);
+        let front = future_listing("515416632", "ESZ6", "202612");
+        ccp.process_ccp_message(&future_reply("FixSecDefReqBySymbol9481", std::slice::from_ref(&front)), &mut conn, &mut context, &shared, &None, &mut hb, "DU1");
+        assert!(shared.reference.drain_contract_details().is_empty(), "the rows wait for the futures lookup");
+        assert_eq!(ccp_messages_sent(&mut server), ["35=c|320=FixSecDefReqBySymbol9481|321=2|6088=Socket|55=ES|167=FUT|100=CME|15=USD"]);
+        let futures = future_reply("FixSecDefReqBySymbol9481", &[front, future_listing("586139767", "ESZ7", "202712")]);
+        ccp.process_ccp_message(&futures, &mut conn, &mut context, &shared, &None, &mut hb, "DU1");
+        let rows: Vec<(i64, String)> = shared.reference.drain_contract_details().iter()
+            .map(|(_, d)| (d.con_id, crate::api::types::ContractDetails::from_definition(d).contract.sec_type)).collect();
+        assert_eq!(rows, [(515416632, "CONTFUT".to_string()), (515416632, "FUT".to_string()), (586139767, "FUT".to_string())]);
+        assert_eq!(shared.reference.drain_contract_details_end(), [9481]);
+        assert!(ccp.pending_continuous.is_empty());
+    }
+
+    // The reference's decoding of the security type: CONTFUT+FUT too; the
+    // text is matched exactly.
+    #[test]
+    fn contfut_decoding() {
+        let f = crate::types::SecDefFilters::default();
+        assert_eq!(lookup_sec_type("CONTFUT", &f), ("FUT", true, false));
+        assert_eq!(lookup_sec_type("FUT+CONTFUT", &f), ("FUT", true, true));
+        assert_eq!(lookup_sec_type("CONTFUT+FUT", &f), ("FUT", true, true));
+        assert_eq!(lookup_sec_type("contfut", &f), ("contfut", false, false));
+        let bond = crate::types::SecDefFilters { issuer_id: "e1400789".into(), ..Default::default() };
+        assert_eq!(lookup_sec_type("BOND", &bond), ("FIXED", false, false));
+        assert_eq!(lookup_sec_type("CONTFUT", &bond), ("FIXED", false, false));
+    }
+
+    // Captured 02/10/2026: a bond issuer lookup is a fixed income lookup
+    // with the issuer last; no symbol, no empty currency.
+    #[test]
+    fn bond_issuer_lookup_as_the_reference() {
+        let (mut ccp, _context, _shared) = u186_test_state();
+        let (client, mut server) = socket_pair();
+        let mut conn = Some(Connection::new_mem(client));
+        let mut hb = HeartbeatState::new();
+        let f = crate::types::SecDefFilters { issuer_id: "e1400789".into(), ..Default::default() };
+        ccp.send_secdef_request_by_symbol(9488, "", "BOND", "", "USD", &f, &mut conn, &mut hb);
+        ccp.send_secdef_request_by_symbol(9489, "", "", "", "", &f, &mut conn, &mut hb);
+        assert_eq!(ccp_messages_sent(&mut server), [
+            "35=c|320=FixSecDefReqBySymbol9488|321=2|6088=Socket|167=FIXED|15=USD|6454=e1400789",
+            "35=c|320=FixSecDefReqBySymbol9489|321=2|6088=Socket|167=FIXED|6454=e1400789",
+        ]);
+    }
+
+    // Captured 02/10/2026: a conId with an exchange is asked by conId on
+    // that exchange; without an exchange, the preferred contract of the
+    // conId; the reply gives the row and the end.
+    #[test]
+    fn lookup_by_con_id_as_the_reference() {
+        let (mut ccp, mut context, shared) = u186_test_state();
+        let (client, mut server) = socket_pair();
+        let mut conn = Some(Connection::new_mem(client));
+        let mut hb = HeartbeatState::new();
+        ccp.send_contract_details_by_con_id(9483, 265598, "ISLAND", &mut conn, &mut hb);
+        ccp.send_contract_details_by_con_id(9484, 265598, "", &mut conn, &mut hb);
+        ccp.send_contract_details_by_con_id(9485, 265598, "SMART", &mut conn, &mut hb);
+        assert_eq!(ccp_messages_sent(&mut server), [
+            "35=c|320=socket-reqContractDetailsReqByConid9483|321=2|6088=Socket|6320=1|146=1|6008=265598|6004=ISLAND",
+            "35=c|320=PreferredReqByConid9484|321=2|146=1|6008=265598|6004=ANYEXCH",
+            "35=c|320=socket-reqContractDetailsReqByConid9485|321=2|6088=Socket|6320=1|146=1|6008=265598|6004=BEST",
+        ]);
+        let reply = pipe_msg(
+            "35=d|43=N|320=socket-reqContractDetailsReqByConid9483|322=*|323=4|\
+             55=AAPL|167=STK|207=NASDAQ|6008=265598|6031=4563|15=USD|58=NMS|6035=AAPL|6058=NMS|\
+             146=1|6038=Y|6019=1|6031=4563|6026=1|6023=0|6027=0.01|6030=1|6344=1|");
+        ccp.process_ccp_message(&reply, &mut conn, &mut context, &shared, &None, &mut hb, "DU1");
+        let rows = shared.reference.drain_contract_details();
+        assert_eq!(rows.iter().map(|(r, d)| (*r, d.con_id, d.exchange.clone())).collect::<Vec<_>>(),
+            [(9483, 265598, "NASDAQ".to_string())]);
+        assert_eq!(shared.reference.drain_contract_details_end(), [9483]);
     }
 
     // ── ibx#228: matching-symbols attribution ──
@@ -4527,13 +5683,14 @@ mod tests {
         crate::protocol::fix::fix_build(&fields, 1)
     }
 
-    /// A 186 frame with no match-count tag: the not-ready ack that precedes
-    /// the data frame.
+    /// The pending mark that precedes the data frame (captured
+    /// 02/10/2026: `35=U|6040=186|320=41|8164=1`).
     fn matching_symbols_ack(req_id: &str) -> Vec<u8> {
         crate::protocol::fix::fix_build(&[
             (crate::protocol::fix::TAG_MSG_TYPE, "U"),
             (6040, "186"),
             (320, req_id),
+            (8164, "1"),
         ], 1)
     }
 
@@ -4551,7 +5708,6 @@ mod tests {
             lookup_id: HIST_LOOKUP_FIRST_ID,
             req_id: 77,
             request: crate::types::ControlCommand::Shutdown,
-            deadline: Instant::now() + SECDEF_TIMEOUT,
         });
         let key = "1/STK/ARCA#LITE";
         ccp.send_secdef_request(1001, 756733, &mut None, &mut hb);
@@ -4593,8 +5749,8 @@ mod tests {
     #[test]
     fn matching_symbols_matched_by_echoed_req_id_not_fifo() {
         let (mut ccp, mut context, shared) = u186_test_state();
-        ccp.pending_matching_symbols.push(1);
-        ccp.pending_matching_symbols.push(2);
+        ccp.pending_matching_symbols.push((1, 11));
+        ccp.pending_matching_symbols.push((2, 12));
 
         // Request 2's reply arrives FIRST (out of order).
         let msg = matching_symbols_msg("2", &[("AAPL", "265598")]);
@@ -4602,16 +5758,16 @@ mod tests {
 
         let delivered = shared.reference.drain_matching_symbols();
         assert_eq!(delivered.len(), 1);
-        assert_eq!(delivered[0].0, 2, "reply must land on the echoed req_id, not the queue head");
+        assert_eq!(delivered[0].0, 12, "reply must land on the echoed id, not the queue head");
         assert_eq!(delivered[0].1.len(), 1);
-        assert_eq!(ccp.pending_matching_symbols, vec![1]);
+        assert_eq!(ccp.pending_matching_symbols, vec![(1, 11)]);
     }
 
     #[test]
     fn matching_symbols_empty_result_pops_and_delivers() {
         let (mut ccp, mut context, shared) = u186_test_state();
-        ccp.pending_matching_symbols.push(1);
-        ccp.pending_matching_symbols.push(2);
+        ccp.pending_matching_symbols.push((1, 11));
+        ccp.pending_matching_symbols.push((2, 12));
 
         // Unknown pattern: zero matches. Must still pop req 1 and deliver
         // the empty answer — previously this poisoned the queue head and
@@ -4621,23 +5777,23 @@ mod tests {
 
         let delivered = shared.reference.drain_matching_symbols();
         assert_eq!(delivered.len(), 1);
-        assert_eq!(delivered[0].0, 1);
+        assert_eq!(delivered[0].0, 11);
         assert!(delivered[0].1.is_empty(), "empty result is a legitimate answer");
-        assert_eq!(ccp.pending_matching_symbols, vec![2],
+        assert_eq!(ccp.pending_matching_symbols, vec![(2, 12)],
             "queue must not be poisoned by an empty result");
 
         // The next reply attributes correctly.
         let msg = matching_symbols_msg("2", &[("MSFT", "272093")]);
         ccp.process_ccp_message(&msg, &mut None, &mut context, &shared, &None, &mut HeartbeatState::new(), "DU1");
         let delivered = shared.reference.drain_matching_symbols();
-        assert_eq!(delivered[0].0, 2);
+        assert_eq!(delivered[0].0, 12);
         assert!(ccp.pending_matching_symbols.is_empty());
     }
 
     #[test]
     fn matching_symbols_ack_frame_does_not_consume_the_request() {
         let (mut ccp, mut context, shared) = u186_test_state();
-        ccp.pending_matching_symbols.push(1);
+        ccp.pending_matching_symbols.push((1, 11));
 
         // The not-ready ack (no tag 146) arrives first — it must not pop the
         // request; delivering it as an empty answer orphans the data frame
@@ -4645,14 +5801,14 @@ mod tests {
         let msg = matching_symbols_ack("1");
         ccp.process_ccp_message(&msg, &mut None, &mut context, &shared, &None, &mut HeartbeatState::new(), "DU1");
         assert!(shared.reference.drain_matching_symbols().is_empty());
-        assert_eq!(ccp.pending_matching_symbols, vec![1]);
+        assert_eq!(ccp.pending_matching_symbols, vec![(1, 11)]);
 
         // The data frame then delivers.
         let msg = matching_symbols_msg("1", &[("AAPL", "265598")]);
         ccp.process_ccp_message(&msg, &mut None, &mut context, &shared, &None, &mut HeartbeatState::new(), "DU1");
         let delivered = shared.reference.drain_matching_symbols();
         assert_eq!(delivered.len(), 1);
-        assert_eq!(delivered[0].0, 1);
+        assert_eq!(delivered[0].0, 11);
         assert_eq!(delivered[0].1.len(), 1);
         assert!(ccp.pending_matching_symbols.is_empty());
     }
@@ -4660,8 +5816,8 @@ mod tests {
     #[test]
     fn matching_symbols_unattributable_reply_is_dropped_not_misattributed() {
         let (mut ccp, mut context, shared) = u186_test_state();
-        ccp.pending_matching_symbols.push(1);
-        ccp.pending_matching_symbols.push(2);
+        ccp.pending_matching_symbols.push((1, 11));
+        ccp.pending_matching_symbols.push((2, 12));
 
         // Echoed id matches nothing pending: with two in flight, guessing
         // would cross-attribute — drop with a warn instead.
@@ -4669,7 +5825,214 @@ mod tests {
         ccp.process_ccp_message(&msg, &mut None, &mut context, &shared, &None, &mut HeartbeatState::new(), "DU1");
 
         assert!(shared.reference.drain_matching_symbols().is_empty());
-        assert_eq!(ccp.pending_matching_symbols, vec![1, 2]);
+        assert_eq!(ccp.pending_matching_symbols, vec![(1, 11), (2, 12)]);
+    }
+
+    fn matching_symbols_without_id(symbols: &[(&str, &str)]) -> Vec<u8> {
+        let count = symbols.len().to_string();
+        let mut fields: Vec<(u32, &str)> = vec![
+            (crate::protocol::fix::TAG_MSG_TYPE, "U"),
+            (6040, "186"),
+            (146, &count),
+        ];
+        for (sym, con_id) in symbols {
+            fields.push((55, sym));
+            fields.push((6008, con_id));
+        }
+        crate::protocol::fix::fix_build(&fields, 1)
+    }
+
+    // ibx#369: a reply without an id is dropped, even with one request in
+    // flight: never matched by position.
+    #[test]
+    fn matching_symbols_reply_without_id_is_dropped() {
+        let (mut ccp, mut context, shared) = u186_test_state();
+        ccp.pending_matching_symbols.push((1, 11));
+        let msg = matching_symbols_without_id(&[("AAPL", "265598")]);
+        ccp.process_ccp_message(&msg, &mut None, &mut context, &shared, &None, &mut HeartbeatState::new(), "DU1");
+        assert!(shared.reference.drain_matching_symbols().is_empty());
+        assert_eq!(ccp.pending_matching_symbols, vec![(1, 11)]);
+    }
+
+    fn sent_frames(server: &mut crate::protocol::connection::MemTransport) -> String {
+        use std::io::Read;
+        server.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 4096];
+        while let Ok(n) = server.read(&mut buf) {
+            if n == 0 { break; }
+            out.extend_from_slice(&buf[..n]);
+        }
+        String::from_utf8_lossy(&out).replace('\x01', "|")
+    }
+
+    // ibx#369: requests carry the engine's own ids, not the API reqId; the
+    // reply is delivered under the API reqId.
+    #[test]
+    fn matching_symbols_requests_carry_own_ids() {
+        let (mut ccp, mut context, shared) = u186_test_state();
+        let (client, mut server) = crate::protocol::connection::mem_pair();
+        let mut conn = Some(Connection::new_mem(client));
+        let mut hb = HeartbeatState::new();
+        ccp.send_matching_symbols_request(500, "AAPL", &mut conn, &mut hb, &shared);
+        // The second one waits for the answer of the first and the pause.
+        ccp.send_matching_symbols_request(501, "MSFT", &mut conn, &mut hb, &shared);
+        let msg = matching_symbols_msg("1", &[("AAPL", "265598")]);
+        ccp.process_ccp_message(&msg, &mut None, &mut context, &shared, &None, &mut hb, "DU1");
+        ccp.pump_matching_symbols(Instant::now() + MATCHING_SYMBOLS_SEND_GAP, &mut conn, &mut hb, &shared);
+        let wire = sent_frames(&mut server);
+        assert!(wire.contains("|320=1|58=AAPL|") && wire.contains("|320=2|58=MSFT|"), "{}", wire);
+        assert!(!wire.contains("320=500"));
+        assert_eq!(ccp.pending_matching_symbols, vec![(2, 501)]);
+        assert_eq!(shared.reference.drain_matching_symbols().iter().map(|d| d.0).collect::<Vec<_>>(), vec![500]);
+        assert!(shared.reference.drain_historical_errors().is_empty());
+
+        let msg = matching_symbols_msg("2", &[("MSFT", "272093")]);
+        ccp.process_ccp_message(&msg, &mut None, &mut context, &shared, &None, &mut hb, "DU1");
+        let delivered = shared.reference.drain_matching_symbols();
+        assert_eq!(delivered.iter().map(|d| d.0).collect::<Vec<_>>(), vec![501]);
+    }
+
+    /// A connected auth link for the pacing tests, with its server end.
+    fn paced_link() -> (Option<Connection>, crate::protocol::connection::MemTransport) {
+        let (client, server) = crate::protocol::connection::mem_pair();
+        (Some(Connection::new_mem(client)), server)
+    }
+
+    fn sent_patterns(server: &mut crate::protocol::connection::MemTransport) -> Vec<String> {
+        sent_frames(server).split('|').filter_map(|f| f.strip_prefix("58=").map(String::from)).collect()
+    }
+
+    // ibx#369, captured 02/10/2026 (b1_369_matching_pacing): AA, AAP, MSF
+    // and IB back to back, NVD 1.5 s later. The reference sent AA at once,
+    // IB 1 s later (AAP and MSF were replaced and got nothing), NVD 1 s
+    // after IB.
+    #[test]
+    fn matching_symbols_pacing_as_captured() {
+        let (mut ccp, mut context, shared) = u186_test_state();
+        let (mut conn, mut server) = paced_link();
+        let mut hb = HeartbeatState::new();
+        let t0 = Instant::now();
+        for (req, pattern) in [(9550, "AA"), (9551, "AAP"), (9552, "MSF"), (9553, "IB")] {
+            ccp.send_matching_symbols_request(req, pattern, &mut conn, &mut hb, &shared);
+        }
+        assert_eq!(sent_patterns(&mut server), ["AA"]);
+        assert_eq!(ccp.matching_waiting.as_ref().map(|w| w.0), Some(9553), "only the latest waits");
+        // The pending mark gives the permit back; the pause still holds IB.
+        ccp.process_ccp_message(&matching_symbols_ack("1"), &mut None, &mut context, &shared, &None, &mut hb, "DU1");
+        ccp.pump_matching_symbols(t0 + std::time::Duration::from_millis(500), &mut conn, &mut hb, &shared);
+        assert!(sent_patterns(&mut server).is_empty());
+        ccp.process_ccp_message(&matching_symbols_msg("1", &[("AA", "251962528")]), &mut None, &mut context, &shared, &None, &mut hb, "DU1");
+        let t1 = t0 + MATCHING_SYMBOLS_SEND_GAP + std::time::Duration::from_millis(5);
+        ccp.pump_matching_symbols(t1, &mut conn, &mut hb, &shared);
+        assert_eq!(sent_patterns(&mut server), ["IB"]);
+        ccp.send_matching_symbols_request(9554, "NVD", &mut conn, &mut hb, &shared);
+        ccp.process_ccp_message(&matching_symbols_ack("2"), &mut None, &mut context, &shared, &None, &mut hb, "DU1");
+        ccp.process_ccp_message(&matching_symbols_msg("2", &[("IBM", "8314")]), &mut None, &mut context, &shared, &None, &mut hb, "DU1");
+        ccp.pump_matching_symbols(t1 + std::time::Duration::from_millis(999), &mut conn, &mut hb, &shared);
+        assert!(sent_patterns(&mut server).is_empty(), "1 s after the last send");
+        ccp.pump_matching_symbols(t1 + MATCHING_SYMBOLS_SEND_GAP, &mut conn, &mut hb, &shared);
+        assert_eq!(sent_patterns(&mut server), ["NVD"]);
+        ccp.process_ccp_message(&matching_symbols_msg("3", &[("NVDA", "4815747")]), &mut None, &mut context, &shared, &None, &mut hb, "DU1");
+        let answered: Vec<ReqId> = shared.reference.drain_matching_symbols().iter().map(|d| d.0).collect();
+        assert_eq!(answered, vec![9550, 9553, 9554]);
+        assert!(shared.reference.drain_historical_errors().is_empty(), "the replaced requests get no error");
+    }
+
+    // ibx#369: without a pending mark the permit comes back with the
+    // answer only; the next request waits for it even after the pause.
+    #[test]
+    fn matching_symbols_wait_for_the_answer_without_pending_mark() {
+        let (mut ccp, mut context, shared) = u186_test_state();
+        let (mut conn, mut server) = paced_link();
+        let mut hb = HeartbeatState::new();
+        let later = Instant::now() + std::time::Duration::from_secs(5);
+        ccp.send_matching_symbols_request(1, "AA", &mut conn, &mut hb, &shared);
+        ccp.send_matching_symbols_request(2, "IB", &mut conn, &mut hb, &shared);
+        ccp.pump_matching_symbols(later, &mut conn, &mut hb, &shared);
+        assert_eq!(sent_patterns(&mut server), ["AA"]);
+        ccp.process_ccp_message(&matching_symbols_msg("1", &[]), &mut None, &mut context, &shared, &None, &mut hb, "DU1");
+        ccp.pump_matching_symbols(later, &mut conn, &mut hb, &shared);
+        assert_eq!(sent_patterns(&mut server), ["IB"]);
+    }
+
+    // ibx#369: an answer with an error text is error 10159 with that text,
+    // and gives the permit back.
+    #[test]
+    fn matching_symbols_reply_with_error_text() {
+        let (mut ccp, mut context, shared) = u186_test_state();
+        let mut hb = HeartbeatState::new();
+        ccp.pending_matching_symbols.push((4, 40));
+        ccp.matching_permits = 0;
+        let msg = crate::protocol::fix::fix_build(&[
+            (crate::protocol::fix::TAG_MSG_TYPE, "U"), (6040, "186"), (320, "4"), (58, "Too many requests"),
+        ], 1);
+        ccp.process_ccp_message(&msg, &mut None, &mut context, &shared, &None, &mut hb, "DU1");
+        assert_eq!(shared.reference.drain_historical_errors(),
+            vec![(40, 10159, "Failed to request matching symbols:Too many requests".to_string())]);
+        assert!(shared.reference.drain_matching_symbols().is_empty());
+        assert!(ccp.pending_matching_symbols.is_empty());
+        assert_eq!(ccp.matching_permits, 1);
+    }
+
+    // ibx#369: the loss of the auth link gives the permit back; the
+    // waiting request stays and goes out when it can.
+    #[test]
+    fn matching_symbols_link_loss_keeps_the_waiting_request() {
+        let (mut ccp, mut context, shared) = u186_test_state();
+        let (mut conn, mut server) = paced_link();
+        let mut hb = HeartbeatState::new();
+        let later = Instant::now() + MATCHING_SYMBOLS_SEND_GAP + std::time::Duration::from_millis(5);
+        ccp.send_matching_symbols_request(1, "AA", &mut conn, &mut hb, &shared);
+        ccp.send_matching_symbols_request(2, "IB", &mut conn, &mut hb, &shared);
+        assert_eq!(ccp.matching_permits, 0);
+        ccp.handle_disconnect(&mut context, &None);
+        assert_eq!(ccp.matching_permits, 1);
+        ccp.disconnected = false;
+        ccp.pump_matching_symbols(later, &mut conn, &mut hb, &shared);
+        assert_eq!(sent_patterns(&mut server), ["AA", "IB"]);
+        assert_eq!(ccp.pending_matching_symbols.iter().map(|p| p.1).collect::<Vec<_>>(), vec![2]);
+    }
+
+    // ibx#369: with the auth link down, or when the send fails, 10159 at
+    // once and nothing kept.
+    #[test]
+    fn matching_symbols_not_sent_gives_10159_at_once() {
+        let (mut ccp, _context, shared) = u186_test_state();
+        let mut hb = HeartbeatState::new();
+        ccp.send_matching_symbols_request(7, "AAPL", &mut None, &mut hb, &shared);
+
+        let (client, _server) = crate::protocol::connection::mem_pair();
+        let mut conn = Some(Connection::new_mem(client));
+        ccp.disconnected = true;
+        ccp.send_matching_symbols_request(8, "AAPL", &mut conn, &mut hb, &shared);
+        ccp.disconnected = false;
+        conn.as_mut().unwrap().shutdown();
+        ccp.send_matching_symbols_request(9, "AAPL", &mut conn, &mut hb, &shared);
+
+        let errors = shared.reference.drain_historical_errors();
+        assert_eq!(errors, vec![
+            (7, 10159, MATCHING_SYMBOLS_SEND_FAILED.to_string()),
+            (8, 10159, MATCHING_SYMBOLS_SEND_FAILED.to_string()),
+            (9, 10159, MATCHING_SYMBOLS_SEND_FAILED.to_string()),
+        ]);
+        assert!(ccp.pending_matching_symbols.is_empty());
+    }
+
+    // ibx#369: when the auth link drops, waiting requests end with no
+    // answer and no error, and are not sent again.
+    #[test]
+    fn matching_symbols_cleared_silently_on_link_loss() {
+        let (mut ccp, mut context, shared) = u186_test_state();
+        ccp.pending_matching_symbols.push((1, 11));
+        ccp.handle_disconnect(&mut context, &None);
+        assert!(ccp.pending_matching_symbols.is_empty());
+        assert!(shared.reference.drain_historical_errors().is_empty());
+        assert!(shared.reference.drain_matching_symbols().is_empty());
+        // A late reply for it is dropped.
+        let msg = matching_symbols_msg("1", &[("AAPL", "265598")]);
+        ccp.process_ccp_message(&msg, &mut None, &mut context, &shared, &None, &mut HeartbeatState::new(), "DU1");
+        assert!(shared.reference.drain_matching_symbols().is_empty());
     }
 
     #[test]
@@ -4696,12 +6059,87 @@ mod tests {
 
     // A session-start recovery entry (150=0/39=0) for an order this session
     // does not know.
-    fn recovery_frame(order_id: u64, con_id: i64) -> std::collections::HashMap<u32, String> {
+    fn recovery_frame(order_id: OrderId, con_id: i64) -> std::collections::HashMap<u32, String> {
         [
             (11u32, format!("{}.0", order_id)), (150, "0".into()), (39, "0".into()),
             (6008, con_id.to_string()), (55, "TEST".into()), (54, "1".into()),
             (38, "1".into()), (44, "1".into()), (40, "2".into()), (59, "1".into()),
         ].into_iter().collect()
+    }
+
+    // ibx#492: openOrder reads the price management flag the server
+    // echoes, 0 without it, as the reference (ORDER-PRICEMGMT.md 5);
+    // ibx#248: a reported bracket key is kept and moves the group counter.
+    #[test]
+    fn reports_give_the_price_management_flag_and_the_bracket_key() {
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        let mut entry = recovery_frame(900_010, 1_005);
+        entry.insert(8339, "1".into());
+        entry.insert(6531, "7/0/-6183061".into());
+        ccp.handle_exec_report(&entry, &mut context, &shared, &None, "");
+        let info = shared.orders.get_order_info(900_010).expect("order info");
+        assert_eq!(info.order.use_price_mgmt_algo, 1);
+        assert_eq!(context.bracket_keys.get(&900_010).map(|k| k.to_string()).as_deref(), Some("7/0/-6183061"));
+        assert_eq!(context.bracket_groups, 7);
+
+        let entry = recovery_frame(900_011, 1_005);
+        ccp.handle_exec_report(&entry, &mut context, &shared, &None, "");
+        assert_eq!(shared.orders.get_order_info(900_011).expect("order info").order.use_price_mgmt_algo, 0);
+    }
+
+    // ibx#466: an order of an earlier session is looked up by the server's
+    // order id in every report; the API order id it carries only names it.
+    #[test]
+    fn recovered_orders_are_found_by_the_server_order_id() {
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        let mut entry = recovery_frame(900_001, 1_005);
+        entry.insert(6121, "15".into());
+        entry.insert(6119, "7".into());
+        ccp.handle_exec_report(&entry, &mut context, &shared, &None, "");
+        assert!(context.order(15).is_some(), "kept under its API order id");
+        assert!(context.order(900_001).is_none());
+
+        // A later report of the server's id reaches the same order.
+        let mut cancelled = recovery_frame(900_001, 1_005);
+        cancelled.insert(150, "4".into());
+        cancelled.insert(39, "4".into());
+        cancelled.insert(11, "900001.0".into());
+        ccp.handle_exec_report(&cancelled, &mut context, &shared, &None, "");
+        assert_eq!(context.finished_status(15), Some(crate::types::OrderStatus::Cancelled));
+        assert!(context.order(900_001).is_none(), "no second order");
+
+        // An API order id an order of this session has is not taken.
+        context.insert_order(crate::types::Order::new(16, 0, Side::Buy, 1, 0, b'2', b'0', 0));
+        let mut other = recovery_frame(900_002, 1_005);
+        other.insert(6121, "16".into());
+        ccp.handle_exec_report(&other, &mut context, &shared, &None, "");
+        assert!(context.order(900_002).is_some(), "kept under the server's id");
+    }
+
+    // ibx#285: order ids are signed; an earlier session's order with a
+    // negative API order id (an auto-bound order) is kept under that id and
+    // its later reports reach it, as with a positive one.
+    #[test]
+    fn a_negative_api_order_id_names_a_recovered_order() {
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        let mut entry = recovery_frame(900_003, 1_005);
+        entry.insert(6121, "-2".into());
+        ccp.handle_exec_report(&entry, &mut context, &shared, &None, "");
+        assert!(context.order(-2).is_some(), "kept under its API order id");
+        assert!(context.order(900_003).is_none());
+
+        let mut cancelled = recovery_frame(900_003, 1_005);
+        cancelled.insert(150, "4".into());
+        cancelled.insert(39, "4".into());
+        ccp.handle_exec_report(&cancelled, &mut context, &shared, &None, "");
+        assert_eq!(context.finished_status(-2), Some(crate::types::OrderStatus::Cancelled));
+        assert!(shared.orders.drain_order_updates().iter().any(|u| u.order_id == -2));
     }
 
     // ibx#257: a recovered order on a new contract, with the instrument table
@@ -4985,7 +6423,9 @@ mod tests {
         ccp.handle_exec_report(&frame("91", "A"), &mut context, &shared, &None, "");
         assert!(shared.orders.drain_order_errors().is_empty(), "no error on the acknowledgement");
         ccp.handle_exec_report(&frame("91", "8"), &mut context, &shared, &None, "");
-        assert_eq!(shared.orders.drain_order_errors(), vec![
+        // A notice given after the report's status (ibx#486).
+        assert!(shared.orders.drain_order_errors().is_empty());
+        assert_eq!(shared.orders.drain_order_notices(), vec![
             (91, 201, "Order rejected - reason:Display size should be a multiple of lot size".to_string()),
         ]);
 
@@ -4993,11 +6433,12 @@ mod tests {
         ccp.handle_exec_report(&frame("91", "8"), &mut context, &shared, &None, "");
         ccp.handle_exec_report(&frame("92", "8"), &mut context, &shared, &None, "");
         assert!(shared.orders.drain_order_errors().is_empty());
+        assert!(shared.orders.drain_order_notices().is_empty());
     }
 
-    // req_global_cancel sends a cancel-all for each id below the shared
-    // instrument count. A recovered order on a new contract took a slot
-    // without raising that count, so the global cancel never reached it.
+    // A recovered order on a new contract took a slot without raising the
+    // shared instrument count, so a cancel-all walking the ids below it
+    // never reached the order.
     #[test]
     fn recovered_order_is_inside_the_global_cancel_range() {
         let mut ccp = CcpState::new();
@@ -5016,6 +6457,112 @@ mod tests {
         }
         assert!(context.pending_orders.drain().any(|r| matches!(r,
             crate::types::OrderRequest::CancelAll { instrument } if instrument == order.instrument)));
+    }
+
+    /// A report in pipe form, as `handle_exec_report` reads it.
+    fn report_of(text: &str) -> std::collections::HashMap<u32, String> {
+        text.split('|').filter_map(|kv| kv.split_once('='))
+            .filter_map(|(t, v)| Some((t.parse::<u32>().ok()?, v.to_string())))
+            .collect()
+    }
+
+    /// An order of an earlier session in the logon replay, not routed yet
+    /// (captured 01/10/2026, fix-agent-gw.20261001-171159 seq 1124, account
+    /// masked): 150=A 20=3 39=A, no API order id or client id.
+    const REPLAY_NOT_ROUTED: &str = "35=8|11=1790862363895062.0|17=140781.1790867253.0|150=A|20=3|39=A|167=CS|55=SPY|6210=BEST|38=1|44=0.00|32=0|31=0.00|14=0|151=1|6=0|54=1|37=00cf16ed.000225ed.6abde767.0001|1=DUXXXXXXX|60=20261001-15:07:33|6571=20261001-13:46:05|40=5|59=0|6008=756733|15=USD|6004=BEST|6122=c|6205=1|198=NONE|6115=0|6088=Socket|6035=SPY|6419=IB";
+
+    // The logon replay gives an order of an earlier session that is not
+    // routed yet as 39=A: it is in the book, PreSubmitted, of client 0
+    // (no 6119, read as 0 by the reference), at the server's version.
+    // Paper 04/10/2026: such orders were listed and then not found by a
+    // cancel (10147), and a global cancel sent nothing.
+    #[test]
+    fn a_replayed_order_not_routed_yet_is_in_the_book() {
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        ccp.handle_exec_report(&report_of(REPLAY_NOT_ROUTED), &mut context, &shared, &None, "");
+        let order = context.order(1790862363895062).copied().expect("in the book");
+        assert_eq!(order.status, crate::types::OrderStatus::PreSubmitted);
+        assert_eq!(context.book.get(&1790862363895062).and_then(|e| e.owner), Some(0));
+        assert_eq!(context.modify_versions.get(&1790862363895062), Some(&0));
+        assert_eq!(context.last_clord.get(&1790862363895062).map(String::as_str), Some("1790862363895062.0"));
+        let updates = shared.orders.drain_order_updates();
+        assert_eq!(updates.len(), 1, "its status, as for every report of a held order");
+        assert_eq!(updates[0].status, crate::types::OrderStatus::PreSubmitted);
+    }
+
+    // An order of another client, with its API ids: kept under its API
+    // order id, of its client (6119), at the version the server gives; its
+    // parent and OCA group as reported. A finished report of an unknown
+    // order puts nothing in the book.
+    #[test]
+    fn a_replayed_order_keeps_its_client_version_and_links() {
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        let parent = "35=8|11=57311390.0|17=e.1|150=0|20=3|39=0|55=AAPL|100=NASDAQ|38=1|44=238.44|14=0|151=1|54=1|37=x|40=2|6119=198|6121=35|59=0|6008=265598";
+        let child = "35=8|11=57311391.2|17=e.2|150=5|20=3|39=5|55=AAPL|38=1|44=250|14=0|151=1|54=2|37=y|40=2|6119=198|6121=36|59=1|6008=265598|583=57311390|6107=57311390.0";
+        ccp.handle_exec_report(&report_of(parent), &mut context, &shared, &None, "");
+        ccp.handle_exec_report(&report_of(child), &mut context, &shared, &None, "");
+        assert_eq!(context.order(35).map(|o| o.status), Some(crate::types::OrderStatus::Submitted));
+        assert_eq!(context.order(36).map(|o| o.status), Some(crate::types::OrderStatus::PreSubmitted));
+        assert_eq!((context.server_id(35), context.server_id(36)), (57311390, 57311391));
+        assert_eq!(context.modify_versions.get(&36), Some(&2));
+        let entry = context.book.get(&36).cloned().unwrap();
+        assert_eq!((entry.owner, entry.parent, entry.oca_group.as_str()), (Some(198), 35, "57311390"));
+
+        let filled = "35=8|11=57311399.0|17=e.3|150=2|20=0|39=2|55=AAPL|38=1|32=1|31=1|14=1|151=0|54=1|37=z|40=2|59=0|6008=265598";
+        ccp.handle_exec_report(&report_of(filled), &mut context, &shared, &None, "");
+        assert!(context.order(57311399).is_none());
+    }
+
+    // The reports of an order go to its client, else to client 0
+    // (`jextend.ba.d(dK)`); its notices only to its client (`pe.gY()`).
+    // Captured 01/10/2026: client 193 got nothing of client 0's orders.
+    #[test]
+    fn reports_of_another_clients_order_reach_only_its_client_or_client_0() {
+        let cancelled = "35=8|11=57311390.1|41=57311390.0|17=e.9|150=4|20=0|39=4|55=AAPL|38=1|44=238.44|14=0|151=0|54=1|37=x|40=2|6119=198|6121=35|59=0|6008=265598";
+        let fill = "35=8|11=57311390.0|17=e.8|150=1|20=0|39=1|55=AAPL|38=2|44=238.44|32=1|31=238.4|14=1|151=1|6=238.4|54=1|37=x|40=2|6119=198|6121=35|59=0|6008=265598";
+        let parent = "35=8|11=57311390.0|17=e.1|150=0|20=3|39=0|55=AAPL|100=NASDAQ|38=2|44=238.44|14=0|151=2|54=1|37=x|40=2|6119=198|6121=35|59=0|6008=265598";
+        for (me, delivered) in [(193, false), (0, true), (198, true)] {
+            let mut ccp = CcpState::new();
+            let mut context = Context::new();
+            let shared = SharedState::new();
+            shared.reference.set_api_client_id(me);
+            ccp.handle_exec_report(&report_of(parent), &mut context, &shared, &None, "");
+            ccp.handle_exec_report(&report_of(fill), &mut context, &shared, &None, "");
+            ccp.handle_exec_report(&report_of(cancelled), &mut context, &shared, &None, "");
+            let updates = shared.orders.drain_order_updates();
+            assert_eq!(!updates.is_empty(), delivered, "client {me}: statuses");
+            assert_eq!(shared.orders.drain_fills_with_exec().len(), usize::from(delivered), "client {me}: live fill");
+            let untracked = shared.orders.drain_untracked_executions();
+            assert_eq!(untracked.len(), usize::from(!delivered), "client {me}: fill kept with no callback");
+            assert!(untracked.iter().all(|(_, e, fe)| fe.other_client && e.order_id == 35));
+            // 202 only to the order's own client.
+            assert_eq!(!shared.orders.drain_order_notices().is_empty(), me == 198, "client {me}: 202");
+            // The order is in the book whoever gets its reports: listed,
+            // and in a global cancel.
+            assert!(shared.orders.get_order_info(35).is_some());
+        }
+    }
+
+    // The permId is the id part of the ClOrdID, as the reference
+    // (captured 01/10/2026: permId 1790865742870063 for
+    // 11=1790865742870063.0); an order of another session with no 6121 is
+    // shown with order id 0.
+    #[test]
+    fn perm_id_is_the_clordid_id_and_no_6121_shows_order_id_0() {
+        let mut ccp = CcpState::new();
+        let mut context = Context::new();
+        let shared = SharedState::new();
+        ccp.handle_exec_report(&report_of(REPLAY_NOT_ROUTED), &mut context, &shared, &None, "");
+        let updates = shared.orders.drain_order_updates();
+        assert_eq!(updates[0].perm_id, 1790862363895062);
+        assert_eq!(shared.orders.api_order_id(1790862363895062), 0);
+        let info = shared.orders.get_order_info(1790862363895062).unwrap();
+        assert_eq!((info.order.perm_id, info.order.client_id), (1790862363895062, 0));
+        assert_eq!(shared.orders.book_place(1790862363895062), (Some(0), 1));
     }
 
     // ibx#475: account frames captured on paper 25/09/2026 (account masked,
@@ -5113,7 +6660,19 @@ mod tests {
         assert!(events.iter().all(|e| e.sr_id == "SR.Socket.7"));
         assert_eq!(events[0].rows.len(), 4);
         assert!(!events[0].ledger && events[1].ledger && events[2].end);
-        assert!(events[1].rows.iter().any(|r| r.key == "CashBalance" && r.currency == "USD"));
+        // The ledger rows as numbers, by currency (ibx#486).
+        let usd = events[1].ledgers.iter().find(|r| r.currency == "USD").expect("the USD row");
+        assert_eq!((usd.real_currency.as_str(), usd.value(9806), usd.value(9820)), ("USD", Some(899133.4993), Some(1.0)));
+        assert_eq!(events[1].ledgers.iter().map(|r| r.currency.as_str()).collect::<Vec<_>>(), ["BASE", "USD"]);
+    }
+
+    // ibx#486: a ledger frame of a summary keeps the frame's account and
+    // leaves a value Java does not read as a number unset.
+    #[test]
+    fn ledger_rows_of_a_summary_frame() {
+        let rows = parse_ledger_rows(&soh("8=O|35=RL|6529=SR.Socket.39|8001=AccountCode|8004=DU1|8001=LedgerList|8002=BASE|15=BASE|9806=933115.0500|8174=nan|"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].account.as_str(), rows[0].value(9806), rows[0].value(8174)), ("DU1", Some(933115.05), None));
     }
 
     // ibx#478: the realized P&L of a fill of this session (6099 of its
@@ -5155,12 +6714,27 @@ mod tests {
         ccp.handle_exec_report(&routed, &mut context, &shared, &None, "");
         let done = exec_report_frame(&[(39, "4"), (150, "4")]);
         ccp.handle_exec_report(&done, &mut context, &shared, &None, "");
-        assert_eq!(shared.orders.drain_order_errors(), [(42, 202, "Order Canceled - reason:".to_string())]);
+        assert_eq!(shared.orders.drain_order_notices(), [(42, 202, "Order Canceled - reason:".to_string())]);
 
         let (mut ccp, mut context, shared) = ord_status_test_state();
         let done = exec_report_frame(&[(39, "4"), (150, "4"), (58, "Order expired")]);
         ccp.handle_exec_report(&done, &mut context, &shared, &None, "");
-        assert_eq!(shared.orders.drain_order_errors(), [(42, 202, "Order Canceled - reason:Order expired".to_string())]);
+        assert_eq!(shared.orders.drain_order_notices(), [(42, 202, "Order Canceled - reason:Order expired".to_string())]);
+    }
+
+    // ibx#487: the order message of a combo names the combo's symbol and
+    // "Combo" (captured 26/09/2026, i105_combo_stock_smart: "BUY 1 QQQ,SPY
+    // Combo"), not the report's 55=IECombo and exchange.
+    #[test]
+    fn a_combo_order_message_names_the_combo() {
+        let (_, context, shared) = ord_status_test_state();
+        let text = "Warning: your order will not be placed at the exchange until 2026-09-28 04:00:00 US/Eastern";
+        let report = exec_report_frame(&[(54, "1"), (38, "1"), (55, "IECombo"), (167, "BAG"), (6008, "28812380"), (207, "BEST")]);
+        let combo = api::Contract { con_id: 28812380, symbol: "QQQ,SPY".into(), sec_type: "BAG".into(), exchange: "SMART".into(), ..Default::default() };
+        assert_eq!(order_message_399(&report, text, &context, 42, &shared, Some(&combo)),
+            format!("Order Message:
+BUY 1 QQQ,SPY Combo
+{}", text));
     }
 
     // ibx#465: the captured order message of an OPG order before the open.
@@ -5177,7 +6751,7 @@ mod tests {
         ccp.handle_exec_report(&ack, &mut context, &shared, &None, "");
         ccp.handle_exec_report(&ack, &mut context, &shared, &None, "");
         assert_eq!(shared.orders.drain_order_errors(),
-            [(42, 399, format!("Order Message: BUY 1 AAPL NASDAQ.NMS {}", text))], "once");
+            [(42, 399, format!("Order Message:\nBUY 1 AAPL NASDAQ.NMS\n{}", text))], "once");
         assert_eq!(context.order(42).unwrap().status, crate::types::OrderStatus::PreSubmitted, "the order keeps working");
 
         // Another message type did not reach the API in the capture.
@@ -5354,8 +6928,10 @@ mod reconnect_tests {
         ccp.handle_exec_report(&trades_end, &mut context, &shared, &None, "DU1");
         assert!(ccp.status_replay_end_at.is_none(), "not the status replay end");
 
+        shared.orders.set_open_orders_held(true);
         let status_end = frame(&[(11, "*"), (55, "*"), (37, "*"), (20, "3"), (150, "0"), (39, "0"), (6008, "265598"), (38, "1")]);
         ccp.handle_exec_report(&status_end, &mut context, &shared, &None, "DU1");
+        assert!(!shared.orders.open_orders_held(), "open-order requests are answered from here (ibx#251)");
 
         assert!(context.order(0).is_none());
         assert_eq!(context.market.count(), 0, "no instrument registered for a marker");
@@ -5365,14 +6941,189 @@ mod reconnect_tests {
         assert!(ccp.status_replay_end_at.is_some(), "the status replay end is seen");
     }
 
+    // ibx#251: the end frame of the logon's order status replay lets the
+    // open-order requests through, with no restored-link report (frame of
+    // the cold start of 28/09/2026, captures/192/d1/replay.txt).
+    #[test]
+    fn login_replay_end_releases_the_open_order_requests() {
+        let mut context = Context::new();
+        let mut ccp = CcpState::new();
+        let shared = SharedState::new();
+        ccp.awaiting_login_replay = true;
+        shared.orders.set_open_orders_held(true);
+        let end = frame(&[(34, "000141"), (43, "N"), (52, "20260928-15:20:15"), (11, "*"), (17, "140781.1790608815.2"),
+            (150, "0"), (20, "3"), (39, "0"), (55, "*"), (38, "0"), (32, "0"), (31, "0.00"), (14, "0"), (151, "0"),
+            (6, "0"), (54, "1"), (37, "*"), (60, "20260928-15:20:15"), (40, "2"), (59, "0")]);
+        ccp.handle_exec_report(&end, &mut context, &shared, &None, "DU1");
+        assert!(!shared.orders.open_orders_held(), "answered from the end of the logon replay");
+        assert!(!ccp.awaiting_login_replay);
+        assert!(ccp.status_replay_end_at.is_none(), "no restored-link report at the logon");
+        assert!(shared.orders.drain_order_updates().is_empty());
+    }
+
+    // ibx#251: a link lost before the logon replay ended leaves the
+    // requests to the replay of the new logon.
+    #[test]
+    fn link_loss_before_the_login_replay_leaves_it_to_the_reconnect() {
+        let mut context = Context::new();
+        let mut ccp = CcpState::new();
+        ccp.awaiting_login_replay = true;
+        ccp.handle_disconnect(&mut context, &None);
+        assert!(!ccp.awaiting_login_replay);
+    }
+
+    // The fill of an order at the bid made while the link was lost, as the
+    // trades reply after the reconnect gave it (captures/192/netcut2,
+    // i192_c4_cut60 frame 200, account masked); the order is this
+    // session's order 46.
+    fn outage_fill_frame(order: &str, leaves: &str) -> std::collections::HashMap<u32, String> {
+        frame(&[(34, "000004"), (43, "N"), (97, "Y"), (52, "20260930-19:04:10"), (11, order),
+            (17, "0000e0d5.6abd4f9d.01.01"), (6010, "fourleg"), (150, "2"), (20, "0"), (39, "2"), (167, "CS"),
+            (55, "AAPL"), (100, "NASDAQ"), (207, "NASDAQ"), (38, "1"), (44, "336.58"), (32, "1"), (30, "NASDAQ"),
+            (31, "336.58"), (14, "1"), (151, leaves), (851, "1"), (6, "336.58"), (54, "1"),
+            (37, "00cf16ed.000225ed.6abc8fb0.0001"), (1, "DUXXXXXXX"), (60, "20260930-19:04:10"),
+            (6571, "20260930-19:03:59"), (40, "2"), (6119, "198"), (6121, "46"), (59, "0"), (6008, "265598"),
+            (15, "USD"), (6122, "c"), (6088, "Socket"), (6035, "AAPL"), (6419, "IB")])
+    }
+
+    // ibx#251: a fill made while the link was lost comes in the trades
+    // reply after the reconnect. As the reference (ib-agent#192 C4): the
+    // execution is booked and the position moves, but there is no fill
+    // event and no status; the filled order is dropped and not kept as
+    // finished, so a later cancel of its id gets 10147.
+    #[test]
+    fn outage_fill_is_booked_without_callbacks() {
+        let mut context = Context::new();
+        let mut ccp = CcpState::new();
+        let shared = SharedState::new();
+        let instrument = context.market.try_register(265598).unwrap();
+        context.insert_order(crate::types::Order::new(46, instrument, Side::Buy, 1, 33658 * PRICE_SCALE / 100, b'2', b'0', 0));
+        context.set_order_status_forced(46, crate::types::OrderStatus::Submitted);
+        ccp.fill_up_pending = Some("todayfillup88".into());
+
+        ccp.handle_exec_report(&outage_fill_frame("46.0", "0"), &mut context, &shared, &None, "DUXXXXXXX");
+        assert!(shared.orders.drain_fills_with_exec().is_empty(), "no execDetails");
+        assert!(shared.orders.drain_order_updates().is_empty(), "no orderStatus");
+        let stored = shared.orders.drain_untracked_executions();
+        assert_eq!(stored.len(), 1, "kept for reqExecutions and its commission report");
+        assert_eq!(stored[0].1.exec_id, "0000e0d5.6abd4f9d.01.01");
+        assert_eq!(stored[0].1.order_id, 46);
+        assert_eq!(stored[0].0.symbol, "AAPL");
+        assert_eq!(context.position_fixed(instrument), QTY_SCALE, "the position moves");
+        assert!(context.order(46).is_none());
+        assert_eq!(context.finished_status(46), None, "unknown, not finished: a cancel gets 10147");
+        assert_eq!(shared.orders.drain_forgotten_orders(), vec![46]);
+        assert_eq!(ccp.last_exec.as_ref().map(|(id, _)| id.as_str()), Some("0000e0d5.6abd4f9d.01.01"));
+
+        // The same execution again is not booked twice.
+        context.insert_order(crate::types::Order::new(46, instrument, Side::Buy, 1, 33658 * PRICE_SCALE / 100, b'2', b'0', 0));
+        ccp.handle_exec_report(&outage_fill_frame("46.0", "0"), &mut context, &shared, &None, "DUXXXXXXX");
+        assert!(shared.orders.drain_untracked_executions().is_empty());
+
+        // The end frame of the trades reply ends the window.
+        let end = frame(&[(34, "000006"), (43, "N"), (52, "20260930-19:05:27"), (6556, "todayfillup88"),
+            (17, "140781.1790795127.0"), (32, "*")]);
+        ccp.handle_exec_report(&end, &mut context, &shared, &None, "DUXXXXXXX");
+        assert_eq!(ccp.fill_up_pending, None);
+    }
+
+    // ibx#251: a part of an order filled during the outage is booked the
+    // same way; the order keeps working, the status replay sets it.
+    #[test]
+    fn outage_partial_fill_keeps_the_order() {
+        let mut context = Context::new();
+        let mut ccp = CcpState::new();
+        let shared = SharedState::new();
+        let instrument = context.market.try_register(265598).unwrap();
+        context.insert_order(crate::types::Order::new(46, instrument, Side::Buy, 2, 33658 * PRICE_SCALE / 100, b'2', b'0', 0));
+        context.set_order_status_forced(46, crate::types::OrderStatus::Submitted);
+        ccp.fill_up_pending = Some("todayfillup88".into());
+        let mut partial = outage_fill_frame("46.0", "1");
+        partial.insert(150, "1".into());
+        partial.insert(39, "1".into());
+        ccp.handle_exec_report(&partial, &mut context, &shared, &None, "DUXXXXXXX");
+        assert!(shared.orders.drain_fills_with_exec().is_empty());
+        assert!(shared.orders.drain_order_updates().is_empty());
+        assert_eq!(shared.orders.drain_untracked_executions().len(), 1);
+        assert_eq!(context.order(46).unwrap().status, crate::types::OrderStatus::Submitted);
+        assert!(shared.orders.drain_forgotten_orders().is_empty());
+    }
+
+    // Outside the trades reply of a reconnect a fill is a live fill.
+    #[test]
+    fn a_fill_outside_the_fill_up_reply_is_live() {
+        let mut context = Context::new();
+        let mut ccp = CcpState::new();
+        let shared = SharedState::new();
+        let instrument = context.market.try_register(265598).unwrap();
+        context.insert_order(crate::types::Order::new(46, instrument, Side::Buy, 1, 33658 * PRICE_SCALE / 100, b'2', b'0', 0));
+        context.set_order_status_forced(46, crate::types::OrderStatus::Submitted);
+        ccp.handle_exec_report(&outage_fill_frame("46.0", "0"), &mut context, &shared, &None, "DUXXXXXXX");
+        assert_eq!(shared.orders.drain_fills_with_exec().len(), 1);
+        assert!(shared.orders.drain_forgotten_orders().is_empty());
+        assert_eq!(context.finished_status(46), Some(crate::types::OrderStatus::Filled));
+    }
+
     // Outside a reconnect the status replay end marks nothing.
     #[test]
     fn status_replay_end_outside_a_reconnect_marks_nothing() {
         let mut context = Context::new();
         let mut ccp = CcpState::new();
         let shared = SharedState::new();
+        shared.orders.set_open_orders_held(true);
         ccp.handle_exec_report(&frame(&[(11, "*"), (55, "*")]), &mut context, &shared, &None, "DU1");
         assert!(ccp.status_replay_end_at.is_none());
+        assert!(shared.orders.open_orders_held());
+    }
+
+    // ibx#251: a lost auth link leaves every order with its status, and
+    // nothing is reported for the orders.
+    #[test]
+    fn link_loss_keeps_the_order_status() {
+        use crate::types::OrderStatus;
+        let (mut ccp, mut context, shared) = (CcpState::new(), Context::new(), SharedState::new());
+        let instrument = context.market.try_register(1005).unwrap();
+        for (id, status) in [(90, OrderStatus::Submitted), (91, OrderStatus::PendingCancel), (92, OrderStatus::PreSubmitted)] {
+            context.insert_order(crate::types::Order::new(id, instrument, Side::Buy, 1, 15 * PRICE_SCALE, b'2', b'0', 0));
+            context.set_order_status_forced(id, status);
+        }
+        ccp.handle_disconnect(&mut context, &None);
+        assert_eq!(context.order(90).unwrap().status, OrderStatus::Submitted);
+        assert_eq!(context.order(91).unwrap().status, OrderStatus::PendingCancel);
+        assert_eq!(context.order(92).unwrap().status, OrderStatus::PreSubmitted);
+        assert!(shared.orders.drain_order_updates().is_empty(), "no status at the drop");
+    }
+
+    // ibx#251: each replayed report of a known order gives its status, set
+    // as the server reports it, back to working too.
+    #[test]
+    fn replay_reports_set_the_status_as_reported() {
+        use crate::types::OrderStatus;
+        let (mut ccp, mut context, shared) = (CcpState::new(), Context::new(), SharedState::new());
+        let instrument = context.market.try_register(1005).unwrap();
+        for id in [90, 91] {
+            context.insert_order(crate::types::Order::new(id, instrument, Side::Buy, 1, 15 * PRICE_SCALE, b'2', b'0', 0));
+        }
+        context.set_order_status_forced(90, OrderStatus::Submitted);
+        context.set_order_status_forced(91, OrderStatus::PendingCancel);
+        ccp.handle_disconnect(&mut context, &None);
+        ccp.awaiting_status_replay = true;
+
+        let working = |id: &str| frame(&[(11, id), (20, "3"), (150, "0"), (39, "0"), (37, "57311390"),
+            (100, "NASDAQ"), (14, "0"), (151, "1"), (6008, "1005"), (38, "1")]);
+        ccp.handle_exec_report(&working("90.0"), &mut context, &shared, &None, "DU1");
+        ccp.handle_exec_report(&working("91.0"), &mut context, &shared, &None, "DU1");
+        ccp.handle_exec_report(&frame(&[(11, "*"), (55, "*")]), &mut context, &shared, &None, "DU1");
+
+        assert_eq!(context.order(91).unwrap().status, OrderStatus::Submitted, "the server's status wins");
+        let updates = shared.orders.drain_order_updates();
+        assert_eq!(updates.iter().map(|u| (u.order_id, u.status)).collect::<Vec<_>>(),
+            vec![(90, OrderStatus::Submitted), (91, OrderStatus::Submitted)], "one status per replayed order");
+
+        // After the replay the status guard applies again.
+        context.set_order_status_forced(91, OrderStatus::PendingCancel);
+        ccp.handle_exec_report(&working("91.0"), &mut context, &shared, &None, "DU1");
+        assert_eq!(context.order(91).unwrap().status, OrderStatus::PendingCancel);
     }
 
     // ── ibx#427: a historical request without conId looks the contract up ──
@@ -5381,11 +7132,11 @@ mod reconnect_tests {
         use crate::control::contracts::tests::pipe_msg;
         use crate::types::{ContractLookup, ControlCommand};
 
-        fn bars(req_id: u32) -> ControlCommand {
+        fn bars(req_id: ReqId) -> ControlCommand {
             ControlCommand::FetchHistorical {
                 req_id, con_id: 0, symbol: "AAPL".into(), sec_type: "STK".into(), exchange: "SMART".into(),
                 end_date_time: String::new(), duration: "1 D".into(), bar_size: "1 hour".into(),
-                what_to_show: "TRADES".into(), use_rth: true, keep_up_to_date: false, include_expired: true,
+                what_to_show: "TRADES".into(), use_rth: true, keep_up_to_date: false, include_expired: true, format_date: 1,
             }
         }
 
@@ -5443,23 +7194,23 @@ mod reconnect_tests {
             assert!(HIST_LOOKUP_FIRST_ID + HIST_LOOKUP_IDS <= crate::engine::hot_loop::farm::MD_LOOKUP_FIRST_ID);
         }
 
+        // ibx#485: no deadline, as the reference: the request waits for the
+        // lookup's answer (ibx#427 gave error 200 with a text of ibx's own).
         #[test]
-        fn a_lookup_with_no_answer_gives_200() {
+        fn a_lookup_with_no_answer_keeps_waiting() {
             let (mut ccp, shared) = (CcpState::new(), SharedState::new());
             ccp.start_contract_resolve(8, lookup(), bars(8), &mut None, &mut HeartbeatState::new());
-            ccp.pending_resolves[0].deadline = Instant::now() - std::time::Duration::from_secs(1);
-            ccp.sweep_contract_resolves(&shared);
-            assert!(ccp.pending_resolves.is_empty());
-            let errors = shared.reference.drain_historical_errors();
-            assert_eq!((errors[0].0, errors[0].1), (8, 200));
+            ccp.sweep_contract_details(&shared, &None, &mut None, &mut HeartbeatState::new());
+            assert_eq!(ccp.pending_resolves.len(), 1);
+            assert!(shared.reference.drain_historical_errors().is_empty());
         }
 
         #[test]
         fn every_historical_request_kind_gets_the_con_id() {
             let kinds = vec![
-                ControlCommand::FetchHeadTimestamp { req_id: 1, con_id: 0, sec_type: String::new(), exchange: String::new(), what_to_show: "TRADES".into(), use_rth: true },
+                ControlCommand::FetchHeadTimestamp { req_id: 1, con_id: 0, sec_type: String::new(), exchange: String::new(), what_to_show: "TRADES".into(), use_rth: true, format_date: 1 },
                 ControlCommand::FetchHistogramData { req_id: 2, con_id: 0, sec_type: String::new(), exchange: String::new(), use_rth: true, period: "1 week".into() },
-                ControlCommand::FetchHistoricalTicks { req_id: 3, con_id: 0, sec_type: String::new(), exchange: String::new(), start_date_time: String::new(), end_date_time: String::new(), number_of_ticks: 10, what_to_show: "TRADES".into(), use_rth: true },
+                ControlCommand::FetchHistoricalTicks { req_id: 3, con_id: 0, symbol: String::new(), sec_type: String::new(), exchange: String::new(), start_date_time: String::new(), end_date_time: String::new(), number_of_ticks: 10, what_to_show: "TRADES".into(), use_rth: true, ignore_size: false },
                 ControlCommand::FetchHistoricalSchedule { req_id: 4, con_id: 0, sec_type: String::new(), exchange: String::new(), end_date_time: String::new(), duration: "1 M".into(), use_rth: true },
                 ControlCommand::FetchFundamentalData { req_id: 5, con_id: 0, report_type: "ReportSnapshot".into() },
             ];
@@ -5468,5 +7219,99 @@ mod reconnect_tests {
                 assert!(got.contains("con_id: 265598"), "{}", got);
             }
         }
+    }
+
+}
+
+#[cfg(test)]
+mod logon_update_tests {
+    use super::*;
+    use crate::engine::hot_loop::HeartbeatState;
+
+    fn ord_status_test_state() -> (CcpState, Context, SharedState) {
+        (CcpState::new(), Context::new(), SharedState::new())
+    }
+
+    fn pipe_frame(text: &str) -> Vec<u8> {
+        text.replace('|', "\x01").into_bytes()
+    }
+
+    // ibx#421: a logon update without a session epoch that turns DENYAPI
+    // on stops the API; with an epoch it is ignored.
+    #[test]
+    fn logon_update_with_denyapi_stops_the_api() {
+        let (mut ccp, mut context, shared) = ord_status_test_state();
+        let mut hb = HeartbeatState::new();
+        ccp.process_ccp_message(&pipe_frame("35=A|52=20261002-06:20:00|6059=1790914646|6542=DENYAPI|"),
+            &mut None, &mut context, &shared, &None, &mut hb, "DU1");
+        assert!(!shared.take_connection_lost(), "a solicited logon is ignored");
+        ccp.process_ccp_message(&pipe_frame("35=A|52=20261002-06:20:00|6542=APIELOG,SECDEFTA|"),
+            &mut None, &mut context, &shared, &None, &mut hb, "DU1");
+        assert!(!shared.take_connection_lost());
+        let (tx, rx) = crossbeam_channel::unbounded();
+        ccp.process_ccp_message(&pipe_frame("35=A|52=20261002-06:20:00|6542=APIELOG,DENYAPI|"),
+            &mut None, &mut context, &shared, &Some(tx.clone()), &mut hb, "DU1");
+        assert!(shared.take_connection_lost());
+        assert!(matches!(rx.try_recv(), Ok(Event::Disconnected)));
+        // The same list again is no change.
+        ccp.process_ccp_message(&pipe_frame("35=A|52=20261002-06:20:00|6542=DENYAPI|"),
+            &mut None, &mut context, &shared, &Some(tx), &mut hb, "DU1");
+        assert!(!shared.take_connection_lost());
+    }
+
+    // ibx#421: the data permission stamp of a logon update is kept when it
+    // changed.
+    #[test]
+    fn logon_update_data_permission_stamp() {
+        let (mut ccp, mut context, shared) = ord_status_test_state();
+        ccp.data_permissions = Some("1788356313".into());
+        ccp.process_ccp_message(&pipe_frame("35=A|6764=1788356313|"),
+            &mut None, &mut context, &shared, &None, &mut HeartbeatState::new(), "DU1");
+        assert_eq!(ccp.data_permissions.as_deref(), Some("1788356313"));
+        assert!(ccp.data_permissions_seen("1788999999"));
+        assert!(!ccp.data_permissions_seen("1788999999"));
+    }
+
+    // ibx#421: a logon update refreshes the pending accounts (8092, only
+    // when present), the private label misc URLs (6321, only when not
+    // empty) and gives its SSL farm list (8449, empty when absent) to the
+    // hot loop; a solicited logon does none of it.
+    #[test]
+    fn logon_update_refreshes_accounts_urls_and_ssl_farms() {
+        let (mut ccp, mut context, shared) = ord_status_test_state();
+        let mut hb = HeartbeatState::new();
+        ccp.process_ccp_message(&pipe_frame("35=A|6059=1790914646|8092=DUXXXXXX1|8449=allmd|"),
+            &mut None, &mut context, &shared, &None, &mut hb, "DU1");
+        assert!(!shared.reference.account_pending("DUXXXXXX1"));
+        assert_eq!(ccp.ssl_farms_update, None);
+        ccp.process_ccp_message(&pipe_frame("35=A|8092=DUXXXXXX1,DUXXXXXX2|6321=account_partitions=https://example/p|8449=allmd|"),
+            &mut None, &mut context, &shared, &None, &mut hb, "DU1");
+        assert!(shared.reference.account_pending("DUXXXXXX1") && shared.reference.account_pending("DUXXXXXX2"));
+        assert_eq!(shared.reference.misc_url("account_partitions").as_deref(), Some("https://example/p"));
+        assert_eq!(ccp.ssl_farms_update.take().as_deref(), Some("allmd"));
+        ccp.process_ccp_message(&pipe_frame("35=A|6321=|"), &mut None, &mut context, &shared, &None, &mut hb, "DU1");
+        assert!(shared.reference.account_pending("DUXXXXXX1"), "no 8092: kept");
+        assert_eq!(shared.reference.misc_url("account_partitions").as_deref(), Some("https://example/p"), "empty 6321: kept");
+        assert_eq!(ccp.ssl_farms_update.take().as_deref(), Some(""), "no 8449: empty list");
+        ccp.process_ccp_message(&pipe_frame("35=A|8092=|"), &mut None, &mut context, &shared, &None, &mut hb, "DU1");
+        assert!(!shared.reference.account_pending("DUXXXXXX1"));
+    }
+
+    // ibx#421: a test request refreshes the clock offset from its server
+    // time; a 35=U carrying an account does not.
+    #[test]
+    fn test_request_refreshes_the_clock_offset() {
+        let (mut ccp, mut context, shared) = ord_status_test_state();
+        let mut hb = HeartbeatState::new();
+        let mut ahead = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(3600);
+        ahead = ahead.round(jiff::Unit::Second).unwrap();
+        let t52 = ahead.strftime("%Y%m%d-%H:%M:%S").to_string();
+        ccp.process_ccp_message(&pipe_frame(&format!("35=U|52={t52}|6040=75|1=DU1|")),
+            &mut None, &mut context, &shared, &None, &mut hb, "DU1");
+        assert_eq!(shared.reference.clock().offset_ms(), 0);
+        ccp.process_ccp_message(&pipe_frame(&format!("35=1|52={t52}|112=x|")),
+            &mut None, &mut context, &shared, &None, &mut hb, "DU1");
+        let offset = shared.reference.clock().offset_ms();
+        assert!((offset - 3_600_000).abs() < 2_000, "{offset}");
     }
 }

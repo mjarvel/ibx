@@ -1,6 +1,5 @@
 //! Reference data: contract details, historical data, scanners, news, fundamentals.
 
-use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 use crate::types::*;
@@ -26,20 +25,22 @@ impl EClient {
         keep_up_to_date: bool,
         chart_options: Vec<Py<PyAny>>,
     ) -> PyResult<()> {
-        if let Some(r) = self.not_connected(req_id as i64) { return r; }
+        if let Some(r) = self.not_connected(req_id) { return r; }
+        if !crate::client_core::ClientCore::ids_fit("req_historical_data", &[req_id, contract.con_id]) { return Ok(()); }
         let tx = self.tx()?;
         let _ = chart_options;
         // A request the reference refuses locally gets its error (321 or
         // 10314) and no query (ibx#430).
-        if let Some((code, text)) = ClientCore::historical_refusal(end_date_time, duration_str, bar_size_setting, what_to_show, format_date) {
-            self.shared_state()?.reference.push_historical_error(req_id as u32, code, text);
+        let shared = self.shared_state()?;
+        if let Some((code, text)) = ClientCore::historical_refusal(end_date_time, duration_str, bar_size_setting,
+            what_to_show, format_date, keep_up_to_date, &contract.sec_type, &contract.exchange, shared.reference.backfill_years_limit(),
+            contract.include_expired) {
+            shared.reference.push_historical_error(req_id, code, text);
             return Ok(());
         }
-        ClientCore::validate_historical_args(bar_size_setting, what_to_show, keep_up_to_date)
-            .map_err(|e| PyRuntimeError::new_err(e))?;
         if what_to_show.eq_ignore_ascii_case("SCHEDULE") {
-            send_cmd(py, &tx, ClientCore::resolve_first(req_id as u32, &contract.to_api(), ControlCommand::FetchHistoricalSchedule {
-                req_id: req_id as u32,
+            send_cmd(py, &tx, ClientCore::resolve_first(req_id, &contract.to_api(), ControlCommand::FetchHistoricalSchedule {
+                req_id,
                 con_id: contract.con_id,
                 sec_type: contract.sec_type.clone(),
                 exchange: contract.exchange.clone(),
@@ -48,8 +49,8 @@ impl EClient {
                 use_rth: use_rth != 0,
             }))?;
         } else {
-            send_cmd(py, &tx, ClientCore::resolve_first(req_id as u32, &contract.to_api(), ControlCommand::FetchHistorical {
-                req_id: req_id as u32,
+            send_cmd(py, &tx, ClientCore::resolve_first(req_id, &contract.to_api(), ControlCommand::FetchHistorical {
+                req_id,
                 con_id: contract.con_id,
                 symbol: contract.symbol.clone(),
                 sec_type: contract.sec_type.clone(),
@@ -61,6 +62,7 @@ impl EClient {
                 use_rth: use_rth != 0,
                 keep_up_to_date,
                 include_expired: contract.include_expired,
+                format_date,
             }))?;
         }
         Ok(())
@@ -69,8 +71,9 @@ impl EClient {
     /// Cancel historical data.
     fn cancel_historical_data(&self, py: Python<'_>, req_id: i64) -> PyResult<()> {
         if let Some(r) = self.not_connected(-1) { return r; }
+        if !crate::client_core::ClientCore::ids_fit("cancel_historical_data", &[req_id]) { return Ok(()); }
         let tx = self.tx()?;
-        send_cmd(py, &tx, ControlCommand::CancelHistorical { req_id: req_id as u32 })?;
+        send_cmd(py, &tx, ControlCommand::CancelHistorical { req_id })?;
         Ok(())
     }
 
@@ -85,34 +88,45 @@ impl EClient {
         use_rth: i32,
         format_date: i32,
     ) -> PyResult<()> {
-        if let Some(r) = self.not_connected(req_id as i64) { return r; }
+        if let Some(r) = self.not_connected(req_id) { return r; }
+        if !crate::client_core::ClientCore::ids_fit("req_head_time_stamp", &[req_id, contract.con_id]) { return Ok(()); }
         let tx = self.tx()?;
-        send_cmd(py, &tx, ClientCore::resolve_first(req_id as u32, &contract.to_api(), ControlCommand::FetchHeadTimestamp {
-            req_id: req_id as u32,
+        if let Some((code, text)) = ClientCore::head_timestamp_refusal(&contract.exchange) {
+            self.shared_state()?.reference.push_historical_error(req_id, code, text);
+            return Ok(());
+        }
+        send_cmd(py, &tx, ClientCore::resolve_first(req_id, &contract.to_api(), ControlCommand::FetchHeadTimestamp {
+            req_id,
             con_id: contract.con_id,
             sec_type: contract.sec_type.clone(),
             exchange: contract.exchange.clone(),
             what_to_show: what_to_show.to_string(),
             use_rth: use_rth != 0,
+            format_date,
         }))?;
-        let _ = format_date;
         Ok(())
     }
 
     /// Cancel head timestamp request.
     fn cancel_head_time_stamp(&self, py: Python<'_>, req_id: i64) -> PyResult<()> {
         if let Some(r) = self.not_connected(-1) { return r; }
+        if !crate::client_core::ClientCore::ids_fit("cancel_head_time_stamp", &[req_id]) { return Ok(()); }
         let tx = self.tx()?;
-        send_cmd(py, &tx, ControlCommand::CancelHeadTimestamp { req_id: req_id as u32 })?;
+        send_cmd(py, &tx, ControlCommand::CancelHeadTimestamp { req_id })?;
         Ok(())
     }
 
     /// Request contract details.
     fn req_contract_details(&self, py: Python<'_>, req_id: i64, contract: &Contract) -> PyResult<()> {
         if let Some(r) = self.not_connected(-1) { return r; }
+        if !crate::client_core::ClientCore::ids_fit("req_contract_details", &[req_id, contract.con_id]) { return Ok(()); }
         let tx = self.tx()?;
+        if let Some((code, text)) = ClientCore::contract_details_refusal(&contract.to_api()) {
+            self.shared_state()?.reference.push_historical_error(req_id, code as i32, text);
+            return Ok(());
+        }
         send_cmd(py, &tx, ControlCommand::FetchContractDetails {
-            req_id: req_id as u32,
+            req_id,
             con_id: contract.con_id,
             symbol: contract.symbol.clone(),
             sec_type: contract.sec_type.clone(),
@@ -129,6 +143,7 @@ impl EClient {
                 sec_id: contract.sec_id.clone(),
                 sec_id_type: contract.sec_id_type.clone(),
                 include_expired: contract.include_expired,
+                issuer_id: contract.issuer_id.clone(),
             },
         })?;
         Ok(())
@@ -145,19 +160,52 @@ impl EClient {
     /// Search for matching symbols.
     fn req_matching_symbols(&self, py: Python<'_>, req_id: i64, pattern: &str) -> PyResult<()> {
         if let Some(r) = self.not_connected(-1) { return r; }
+        if !crate::client_core::ClientCore::ids_fit("req_matching_symbols", &[req_id]) { return Ok(()); }
         // An empty or invalid pattern gives 321 and nothing is sent; the
         // pattern is sent trimmed (ibx#439).
-        let pattern = match crate::client_core::matching_symbols_pattern(pattern) {
+        let allowed = self.shared_state()?.reference.matching_symbols_allowed();
+        let pattern = match crate::client_core::matching_symbols_pattern(pattern, allowed) {
             Ok(pattern) => pattern,
             Err((code, message)) => {
-                self.shared_state()?.orders.push_order_error(req_id as u64, code, message);
+                self.shared_state()?.orders.push_order_error(req_id, code, message);
                 return Ok(());
             }
         };
         let tx = self.tx()?;
         send_cmd(py, &tx, ControlCommand::FetchMatchingSymbols {
-            req_id: req_id as u32,
+            req_id,
             pattern,
+        })?;
+        Ok(())
+    }
+
+    /// Request option chain parameters (ibx#440). A request the reference
+    /// refuses locally gets 321; the rows come through
+    /// `security_definition_option_parameter`, then
+    /// `security_definition_option_parameter_end`.
+    #[pyo3(signature = (req_id, underlying_symbol, fut_fop_exchange="", underlying_sec_type="STK", underlying_con_id=0))]
+    fn req_sec_def_opt_params(
+        &self,
+        py: Python<'_>,
+        req_id: i64,
+        underlying_symbol: &str,
+        fut_fop_exchange: &str,
+        underlying_sec_type: &str,
+        underlying_con_id: i64,
+    ) -> PyResult<()> {
+        if let Some(r) = self.not_connected(req_id) { return r; }
+        if !ClientCore::ids_fit("req_sec_def_opt_params", &[req_id, underlying_con_id]) { return Ok(()); }
+        if let Some((code, text)) = crate::control::optparams::refusal(underlying_sec_type, fut_fop_exchange, underlying_con_id) {
+            self.shared_state()?.orders.push_order_error(req_id, code, text);
+            return Ok(());
+        }
+        let tx = self.tx()?;
+        send_cmd(py, &tx, ControlCommand::FetchSecDefOptParams {
+            req_id,
+            underlying_symbol: underlying_symbol.into(),
+            fut_fop_exchange: fut_fop_exchange.into(),
+            underlying_sec_type: crate::control::optparams::sec_type_name(underlying_sec_type).into(),
+            underlying_con_id,
         })?;
         Ok(())
     }
@@ -173,7 +221,8 @@ impl EClient {
         scanner_subscription_options: Vec<Py<PyAny>>,
         scanner_subscription_filter_options: Vec<Py<PyAny>>,
     ) -> PyResult<()> {
-        if let Some(r) = self.not_connected(req_id as i64) { return r; }
+        if let Some(r) = self.not_connected(req_id) { return r; }
+        if !crate::client_core::ClientCore::ids_fit("req_scanner_subscription", &[req_id]) { return Ok(()); }
         let tx = self.tx()?;
         Python::attach(|py| {
             let text = |name: &str, default: &str| subscription.getattr(py, name)
@@ -224,10 +273,10 @@ impl EClient {
             match ClientCore::scanner_request(&sub, &options, &filter_options) {
                 Ok(subscription) => {
                     let client_id = self.core.client_id.load(std::sync::atomic::Ordering::Relaxed);
-                    send_cmd(py, &tx, ControlCommand::SubscribeScanner { req_id: req_id as u32, client_id, subscription })
+                    send_cmd(py, &tx, ControlCommand::SubscribeScanner { req_id, client_id, subscription })
                 }
                 Err((code, text)) => {
-                    self.shared_state()?.orders.push_order_error(req_id as u64, code, text);
+                    self.shared_state()?.orders.push_order_error(req_id, code, text);
                     Ok(())
                 }
             }
@@ -237,8 +286,9 @@ impl EClient {
     /// Cancel scanner subscription.
     fn cancel_scanner_subscription(&self, py: Python<'_>, req_id: i64) -> PyResult<()> {
         if let Some(r) = self.not_connected(-1) { return r; }
+        if !crate::client_core::ClientCore::ids_fit("cancel_scanner_subscription", &[req_id]) { return Ok(()); }
         let tx = self.tx()?;
-        send_cmd(py, &tx, ControlCommand::CancelScanner { req_id: req_id as u32 })?;
+        send_cmd(py, &tx, ControlCommand::CancelScanner { req_id })?;
         Ok(())
     }
 
@@ -260,16 +310,17 @@ impl EClient {
         article_id: &str,
         news_article_options: Vec<Py<PyAny>>,
     ) -> PyResult<()> {
-        if let Some(r) = self.not_connected(req_id as i64) { return r; }
+        if let Some(r) = self.not_connected(req_id) { return r; }
+        if !crate::client_core::ClientCore::ids_fit("req_news_article", &[req_id]) { return Ok(()); }
         let _ = news_article_options;
         let tx = self.tx()?;
         let shared = self.shared_state()?;
         if let Some((code, text)) = ClientCore::news_article_refusal(provider_code, article_id, &shared.reference.news_sources()) {
-            shared.orders.push_order_error(req_id as u64, code, text);
+            shared.orders.push_order_error(req_id, code, text);
             return Ok(());
         }
         send_cmd(py, &tx, ControlCommand::FetchNewsArticle {
-            req_id: req_id as u32,
+            req_id,
             provider_code: provider_code.to_string(),
             article_id: article_id.to_string(),
         })?;
@@ -289,17 +340,18 @@ impl EClient {
         total_results: i32,
         historical_news_options: Vec<Py<PyAny>>,
     ) -> PyResult<()> {
-        if let Some(r) = self.not_connected(req_id as i64) { return r; }
+        if let Some(r) = self.not_connected(req_id) { return r; }
+        if !crate::client_core::ClientCore::ids_fit("req_historical_news", &[req_id, con_id]) { return Ok(()); }
         let _ = historical_news_options;
         let tx = self.tx()?;
         let shared = self.shared_state()?;
         if let Some((code, text)) = ClientCore::historical_news_refusal(provider_codes, total_results as i64, &shared.reference.news_sources()) {
-            shared.orders.push_order_error(req_id as u64, code, text);
+            shared.orders.push_order_error(req_id, code, text);
             return Ok(());
         }
         send_cmd(py, &tx, ControlCommand::FetchHistoricalNews {
-            req_id: req_id as u32,
-            con_id: con_id as u32,
+            req_id,
+            con_id,
             provider_codes: provider_codes.to_string(),
             start_time: start_date_time.to_string(),
             end_time: end_date_time.to_string(),
@@ -318,12 +370,17 @@ impl EClient {
         report_type: &str,
         fundamental_data_options: Vec<Py<PyAny>>,
     ) -> PyResult<()> {
-        if let Some(r) = self.not_connected(req_id as i64) { return r; }
+        if let Some(r) = self.not_connected(req_id) { return r; }
+        if !crate::client_core::ClientCore::ids_fit("req_fundamental_data", &[req_id, contract.con_id]) { return Ok(()); }
         let _ = fundamental_data_options;
+        if let Some((code, text)) = ClientCore::fundamental_refusal(&contract.sec_type) {
+            self.shared_state()?.reference.push_historical_error(req_id, code, text);
+            return Ok(());
+        }
         let tx = self.tx()?;
-        send_cmd(py, &tx, ClientCore::resolve_first(req_id as u32, &contract.to_api(), ControlCommand::FetchFundamentalData {
-            req_id: req_id as u32,
-            con_id: contract.con_id as u32,
+        send_cmd(py, &tx, ClientCore::resolve_first(req_id, &contract.to_api(), ControlCommand::FetchFundamentalData {
+            req_id,
+            con_id: contract.con_id,
             report_type: report_type.to_string(),
         }))?;
         Ok(())
@@ -331,9 +388,10 @@ impl EClient {
 
     /// Cancel fundamental data.
     fn cancel_fundamental_data(&self, py: Python<'_>, req_id: i64) -> PyResult<()> {
-        if let Some(r) = self.not_connected(req_id as i64) { return r; }
+        if let Some(r) = self.not_connected(req_id) { return r; }
+        if !crate::client_core::ClientCore::ids_fit("cancel_fundamental_data", &[req_id]) { return Ok(()); }
         let tx = self.tx()?;
-        send_cmd(py, &tx, ControlCommand::CancelFundamentalData { req_id: req_id as u32 })?;
+        send_cmd(py, &tx, ControlCommand::CancelFundamentalData { req_id })?;
         Ok(())
     }
 
@@ -352,19 +410,33 @@ impl EClient {
         ignore_size: bool,
         misc_options: Vec<Py<PyAny>>,
     ) -> PyResult<()> {
-        if let Some(r) = self.not_connected(req_id as i64) { return r; }
+        if let Some(r) = self.not_connected(req_id) { return r; }
+        if !crate::client_core::ClientCore::ids_fit("req_historical_ticks", &[req_id, contract.con_id]) { return Ok(()); }
         let tx = self.tx()?;
-        let _ = (ignore_size, misc_options);
-        send_cmd(py, &tx, ClientCore::resolve_first(req_id as u32, &contract.to_api(), ControlCommand::FetchHistoricalTicks {
-            req_id: req_id as u32,
+        let _ = misc_options;
+        // The reference's warnings and local refusals first (ibx#432).
+        let (answers, go_on) = ClientCore::historical_ticks_checks(start_date_time, end_date_time, number_of_ticks,
+            what_to_show, ignore_size, &contract.sec_type, &contract.exchange);
+        let shared = self.shared_state()?;
+        for (code, text) in answers {
+            shared.reference.push_historical_error(req_id, code, text);
+        }
+        if !go_on {
+            return Ok(());
+        }
+        let symbol = if contract.local_symbol.is_empty() { &contract.symbol } else { &contract.local_symbol };
+        send_cmd(py, &tx, ClientCore::resolve_first(req_id, &contract.to_api(), ControlCommand::FetchHistoricalTicks {
+            req_id,
             con_id: contract.con_id,
+            symbol: symbol.clone(),
             sec_type: contract.sec_type.clone(),
             exchange: contract.exchange.clone(),
             start_date_time: start_date_time.to_string(),
             end_date_time: end_date_time.to_string(),
-            number_of_ticks: number_of_ticks as u32,
+            number_of_ticks,
             what_to_show: what_to_show.to_string(),
             use_rth: use_rth != 0,
+            ignore_size,
         }))?;
         Ok(())
     }
@@ -393,11 +465,12 @@ impl EClient {
     /// Request histogram data.
     #[pyo3(signature = (req_id, contract, use_rth, time_period))]
     fn req_histogram_data(&self, py: Python<'_>, req_id: i64, contract: &Contract, use_rth: bool, time_period: &str) -> PyResult<()> {
-        if let Some(r) = self.not_connected(req_id as i64) { return r; }
+        if let Some(r) = self.not_connected(req_id) { return r; }
+        if !crate::client_core::ClientCore::ids_fit("req_histogram_data", &[req_id, contract.con_id]) { return Ok(()); }
         let tx = self.tx()?;
-        send_cmd(py, &tx, ClientCore::resolve_first(req_id as u32, &contract.to_api(), ControlCommand::FetchHistogramData {
-            req_id: req_id as u32,
-            con_id: contract.con_id as u32,
+        send_cmd(py, &tx, ClientCore::resolve_first(req_id, &contract.to_api(), ControlCommand::FetchHistogramData {
+            req_id,
+            con_id: contract.con_id,
             sec_type: contract.sec_type.clone(),
             exchange: contract.exchange.clone(),
             use_rth,
@@ -409,8 +482,9 @@ impl EClient {
     /// Cancel histogram data.
     fn cancel_histogram_data(&self, py: Python<'_>, req_id: i64) -> PyResult<()> {
         if let Some(r) = self.not_connected(-1) { return r; }
+        if !crate::client_core::ClientCore::ids_fit("cancel_histogram_data", &[req_id]) { return Ok(()); }
         let tx = self.tx()?;
-        send_cmd(py, &tx, ControlCommand::CancelHistogramData { req_id: req_id as u32 })?;
+        send_cmd(py, &tx, ControlCommand::CancelHistogramData { req_id })?;
         Ok(())
     }
 
@@ -420,10 +494,11 @@ impl EClient {
         &self, py: Python<'_>, req_id: i64, contract: &Contract,
         end_date_time: &str, duration_str: &str, use_rth: bool,
     ) -> PyResult<()> {
-        if let Some(r) = self.not_connected(req_id as i64) { return r; }
+        if let Some(r) = self.not_connected(req_id) { return r; }
+        if !crate::client_core::ClientCore::ids_fit("req_historical_schedule", &[req_id, contract.con_id]) { return Ok(()); }
         let tx = self.tx()?;
-        send_cmd(py, &tx, ClientCore::resolve_first(req_id as u32, &contract.to_api(), ControlCommand::FetchHistoricalSchedule {
-            req_id: req_id as u32,
+        send_cmd(py, &tx, ClientCore::resolve_first(req_id, &contract.to_api(), ControlCommand::FetchHistoricalSchedule {
+            req_id,
             con_id: contract.con_id,
             sec_type: contract.sec_type.clone(),
             exchange: contract.exchange.clone(),

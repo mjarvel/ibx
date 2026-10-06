@@ -85,12 +85,12 @@ pub fn map_req_instrument(&self, req_id: i64, instrument: InstrumentId)
 Pre-populate the order tracker (for testing the dispatcher path without going through the engine's place-order flow).
 
 ```rust
-pub fn track_order_for_test( &self, order_id: u64, contract: ApiContract, order: ApiOrder, instrument: InstrumentId, )
+pub fn track_order_for_test( &self, order_id: OrderId, contract: ApiContract, order: ApiOrder, instrument: InstrumentId, )
 ```
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `order_id` | `u64` | Order identifier. Must be unique per session. |
+| `order_id` | `OrderId` (`i64`) | Order identifier. Must be unique per session. |
 | `contract` | `ApiContract` | Contract specification (symbol, secType, exchange, currency, etc.). |
 | `order` | `ApiOrder` | Order parameters (action, quantity, type, price, TIF, etc.). |
 | `instrument` | `InstrumentId` | Instrument type for scanner (e.g. `"STK"`, `"FUT"`). |
@@ -591,7 +591,7 @@ pub fn parse_algo_params(strategy: &str, params: &[TagValue]) -> Result<AlgoPara
 
 #### `req_mkt_data`
 
-Subscribe to market data. When `snapshot` is true, delivers the first available quote then calls `tick_snapshot_end` and auto-cancels the subscription. `generic_tick_list` is NOT transmitted to the gateway, with one exception: "292" additionally subscribes per-contract news. Other generic tick types (RTVolume and friends) have no emission path, and `tick_generic` never fires (ibx#234). Delayed data cannot be requested either — see `req_market_data_type`.
+Subscribe to market data. When `snapshot` is true, delivers the first available quote then calls `tick_snapshot_end` and auto-cancels the subscription. `generic_tick_list` is checked as the reference checks it: a list with an unknown tick, or one not legal for the security type, is refused with error 321 (ibx#450). It is NOT transmitted to the gateway, with one exception: the news tick, "292" (every subscribed news source) or "292:CODE1+CODE2", subscribes the contract's headlines, delivered as `tick_news` (ibx#458); a derivative contract or a code that is not a subscribed source ends the request with error 10094. Other generic tick types (RTVolume and friends) have no emission path, and `tick_generic` fires only for a snapshot's halted state, 49 (ibx#234, ibx#446). Delayed data cannot be requested either — see `req_market_data_type`. Several request ids may ask for one contract, as with the reference (ibx#444): they share its subscription, a request that joins gets at once what the others have, and the subscription ends with the cancel of the last one.
 
 ```rust
 pub fn req_mkt_data( &self, req_id: i64, contract: &Contract, generic_tick_list: &str, snapshot: bool, regulatory_snapshot: bool, ) -> Result<(), String>
@@ -788,20 +788,6 @@ pub fn req_market_data_type(&self, market_data_type: i32)
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `market_data_type` | `i32` | 1=live, 2=frozen, 3=delayed, 4=delayed-frozen. |
-
----
-
-#### `set_news_providers`
-
-Set news provider codes for per-contract news ticks.
-
-```rust
-pub fn set_news_providers(&self, providers: &str)
-```
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `providers` | `&str` | News provider list. |
 
 ---
 
@@ -1169,7 +1155,7 @@ pub fn cancel_histogram_data(&self, req_id: i64) -> Result<(), String>
 Request historical tick data.
 
 ```rust
-pub fn req_historical_ticks( &self, req_id: i64, contract: &Contract, start_date_time: &str, end_date_time: &str, number_of_ticks: i32, what_to_show: &str, use_rth: bool, ) -> Result<(), String>
+pub fn req_historical_ticks( &self, req_id: i64, contract: &Contract, start_date_time: &str, end_date_time: &str, number_of_ticks: i32, what_to_show: &str, use_rth: bool, ignore_size: bool, _misc_options: &[TagValue], ) -> Result<(), String>
 ```
 
 | Parameter | Type | Description |
@@ -1240,7 +1226,7 @@ pub fn req_news_providers(&self, wrapper: &mut impl Wrapper)
 
 #### `req_current_time`
 
-Request current server time. Returns local system time (no server round-trip).
+Request current server time. Answered locally, as the reference: the local clock plus the offset to the server clock of the logon (no server round-trip).
 
 ```rust
 pub fn req_current_time(&self, wrapper: &mut impl Wrapper)
@@ -1923,7 +1909,7 @@ Per-contract news tick.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `ticker_id` | `i64` | Ticker/request ID. |
-| `timestamp` | `i64` | Timestamp string. |
+| `timestamp` | `i64` | Time of the headline, epoch milliseconds. |
 | `provider_code` | `&str` | News provider code (e.g. `"BRFG"`). |
 | `article_id` | `&str` | News article identifier. |
 | `headline` | `&str` | News headline text. |

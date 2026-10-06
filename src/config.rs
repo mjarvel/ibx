@@ -18,6 +18,37 @@ pub fn farm_host_override() -> Option<String> {
 }
 pub const AUTH_PORT: u16 = 4001;
 
+/// The auth connection runs on TLS, the reference's setting `[Logon]
+/// UseSSL` of its jts.ini (ibx#423). `IBX_USE_SSL=false` (or `0`) gives the
+/// reference's mode without it: a plain socket on the port before the TLS
+/// port (4000) and the key exchange on the auth connection. The default is
+/// the setting of the reference's install this was read from
+/// (`UseSSL=true`).
+pub fn use_ssl() -> bool {
+    use_ssl_setting(std::env::var("IBX_USE_SSL").ok().as_deref())
+}
+
+/// [`use_ssl`] of a setting value: false only for `false` (any case) or
+/// `0`.
+pub fn use_ssl_setting(value: Option<&str>) -> bool {
+    !matches!(value.map(str::trim), Some(v) if v.eq_ignore_ascii_case("false") || v == "0")
+}
+
+/// The reference's API precaution "Bypass Redirect Order warning for Stock
+/// API Orders" (`ApiSettings.n()`, `m_bypassRedirectWarning`, false by
+/// default): off, a stock order directed to an exchange other than SMART
+/// is discarded with 10311 (10329 for OVERNIGHT and IBEOS), ibx#486.
+/// `IBX_BYPASS_REDIRECT_ORDER_WARNING=true` (or `1`) turns the bypass on.
+pub fn bypass_redirect_order_warning() -> bool {
+    bypass_setting(std::env::var("IBX_BYPASS_REDIRECT_ORDER_WARNING").ok().as_deref())
+}
+
+/// An API precaution bypass of a setting value: on only for `true` (any
+/// case) or `1`, off by default as the reference's.
+pub fn bypass_setting(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some(v) if v.eq_ignore_ascii_case("true") || v == "1")
+}
+
 /// Heartbeat intervals (seconds).
 pub const CCP_HEARTBEAT: u64 = 10;
 pub const FARM_HEARTBEAT: u64 = 30;
@@ -345,5 +376,33 @@ mod expiry_tests {
         assert!(parse_ib_expiry("20260620 18:00").is_err()); // needs seconds
         assert!(parse_ib_expiry("20261320").is_err()); // month 13
         assert!(parse_ib_expiry("20260620 18:00:00 Mars/Olympus").is_err());
+    }
+}
+
+#[cfg(test)]
+mod use_ssl_tests {
+    // ibx#423: the TLS setting of the auth connection: on unless set to
+    // false or 0, as this machine's gateway runs with UseSSL=true.
+    #[test]
+    fn use_ssl_setting_values() {
+        assert!(super::use_ssl_setting(None));
+        assert!(super::use_ssl_setting(Some("true")));
+        assert!(super::use_ssl_setting(Some("1")));
+        assert!(!super::use_ssl_setting(Some("false")));
+        assert!(!super::use_ssl_setting(Some(" FALSE ")));
+        assert!(!super::use_ssl_setting(Some("0")));
+    }
+}
+
+#[cfg(test)]
+mod precaution_tests {
+    // ibx#486: an API precaution bypass is off unless set to true or 1.
+    #[test]
+    fn bypass_settings_are_off_by_default() {
+        assert!(!super::bypass_setting(None));
+        assert!(!super::bypass_setting(Some("false")));
+        assert!(!super::bypass_setting(Some("")));
+        assert!(super::bypass_setting(Some("TRUE")));
+        assert!(super::bypass_setting(Some(" 1 ")));
     }
 }
