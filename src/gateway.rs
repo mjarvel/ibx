@@ -1583,6 +1583,15 @@ fn reconnect_ccp_attempt(auth: &ReconnectAuth, token_hash: &str, host: &str, dep
 }
 
 
+/// The push gate owns partial-frame progress and must see each poll timeout.
+struct LoginPollIo<'a, S>(&'a mut ControlledIo<S>);
+impl<S: Read> Read for LoginPollIo<'_, S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> { self.0.read_poll(buf) }
+}
+impl<S: Write> Write for LoginPollIo<'_, S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> { self.0.write(buf) }
+    fn flush(&mut self) -> io::Result<()> { self.0.flush() }
+}
 /// Start the upstream TLS login protocol through the bounded transport. A
 /// refusal is terminal; controlled login never resends or downgrades encryption.
 fn controlled_ccp_login_start<S: Read + Write>(
@@ -1735,11 +1744,19 @@ impl Gateway {
         }
     }
 
-    /// One caller-controlled paper login with no internal retry or DNS/hardware work.
+    /// One caller-controlled login with no internal retry or DNS/hardware work.
     /// Returns only after scoped farm workers have completed; failed attempts abort
     /// every registered socket. Account/route evidence is required, not guessed.
     pub fn connect_once(config: &GatewayConfig, control: &ConnectionControl) -> io::Result<(Self, Connection, Connection, Option<Connection>)> {
-        if !config.paper || config.accept_invalid_certs { return Err(io::Error::new(io::ErrorKind::Unsupported, "controlled login requires paper mode and certificate validation")); }
+        // Reject callback workers and certificate bypass before beginning a scope,
+        // registering sockets, or sending credentials. Controlled live login supports
+        // only broker-selected mobile push; it never invokes the detached code worker.
+        if config.accept_invalid_certs || config.code_provider.is_some() {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "controlled login requires verified TLS and mobile push approval"));
+        }
+        if config.ib_key_token_sub_type.len() > 64 || config.ib_key_token_sub_type.chars().any(char::is_control) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid controlled mobile push configuration"));
+        }
         control.check()?;
         control.begin_login()?;
         if config.username.trim().is_empty() || config.username.len() > 256 || config.host.trim().is_empty() || config.host.len() > 253 || config.password.is_empty() || config.password.len() > 4096 {
@@ -1869,66 +1886,84 @@ impl Gateway {
         let second_factor = if config.paper {
             None
         } else {
-            let token = auth_start.mobile_key_token(&config.ib_key_token_sub_type)?;
+            let token = auth_start.mobile_key_token(&config.ib_key_token_sub_type)
+                .map_err(|error| if control.is_some() {
+                    io::Error::new(error.kind(), "unsupported controlled second factor")
+                } else { error })?;
             if token.is_none() {
                 log::info!("Auth start lists no second factor: none required");
             }
             token
         };
         if let Some(token_sub_type) = second_factor {
-            // No client deadline unless one is set, as in the reference: the
-            // wait ends with the server's answer or its close of the socket
-            // (ibx#208).
-            let deadline = session::ib_key_deadline(config.ib_key_timeout_secs);
-            let bound = if deadline.is_some() {
-                format!("up to {}s", config.ib_key_timeout_secs)
-            } else {
-                "until the server answers or closes (about 18 min)".to_string()
-            };
-            // Live logins enter a human-approval window here: connect() blocks
-            // until the second factor is approved (mobile push) or the wait
-            // ends. Announce it up front so a stalled connect() reads as
-            // "waiting for approval" rather than a hang (ibx#203 / ibx#207).
-            // Accounts with no second factor fall straight through (Skipped).
-            if config.code_provider.is_none() {
-                log::info!(
-                    "Live login for {}: waiting for second-factor approval (mobile push);                      connect() blocks {}. Use paper=true, an ib_key_timeout_secs,                      or a code_provider to avoid this.",
-                    config.username, bound,
-                );
-            } else {
-                log::info!(
-                    "Live login for {}: second-factor via code_provider (Challenge/Response);                      connect() blocks {} awaiting the challenge.",
-                    config.username, bound,
-                );
-            }
-            // Short read timeout: the wait checks the code provider and the
-            // deadline between reads (ibx#244).
-            set_login_read_timeout(tls.stream.tcp(), Some(Duration::from_millis(FARM_LOGON_POLL_MS)), control)?;
-            match session::do_ib_key_2fa(
-                &mut tls,
-                &token_sub_type,
-                deadline,
-                config.code_provider.as_ref(),
-            )? {
-                session::IbKeyOutcome::Skipped => {
-                    log::info!("2FA gate: skipped (no second factor)");
-                }
-                session::IbKeyOutcome::Approved { approval_url, session_id, soft_token_hex } => {
-                    log::info!(
-                        "2FA gate: approved (session_id={}, approval_url={}, token_hex_len={})",
-                        if session_id.is_empty() { "<none>" } else { &session_id },
-                        if approval_url.is_empty() { "<none>" } else { &approval_url },
-                        soft_token_hex.len(),
-                    );
+            if control.is_some() {
+                set_login_read_timeout(tls.stream.tcp(), Some(crate::lifecycle::CONTROLLED_IO_POLL), control)?;
+                let outcome = session::do_ib_key_push_bounded(
+                    &mut LoginPollIo(&mut tls), &token_sub_type,
+                    session::ib_key_deadline(config.ib_key_timeout_secs),
+                    LOGIN_FRAME_BYTES, LOGIN_BYTES, 128,
+                )?;
+                if let session::IbKeyOutcome::Approved { soft_token_hex, .. } = outcome {
                     if !soft_token_hex.is_empty() {
-                        if let Some(tok) = BigUint::parse_bytes(soft_token_hex.as_bytes(), 16) {
-                            soft_token = Some(tok);
-                        } else {
-                            log::warn!("2FA gate: SOFT token hex did not parse — falling back to session_key");
+                        soft_token = Some(BigUint::parse_bytes(soft_token_hex.as_bytes(), 16)
+                            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid controlled push token"))?);
+                    }
+                }
+            } else {
+                // No client deadline unless one is set, as in the reference: the
+                // wait ends with the server's answer or its close of the socket
+                // (ibx#208).
+                let deadline = session::ib_key_deadline(config.ib_key_timeout_secs);
+                let bound = if deadline.is_some() {
+                    format!("up to {}s", config.ib_key_timeout_secs)
+                } else {
+                    "until the server answers or closes (about 18 min)".to_string()
+                };
+                // Live logins enter a human-approval window here: connect() blocks
+                // until the second factor is approved (mobile push) or the wait
+                // ends. Announce it up front so a stalled connect() reads as
+                // "waiting for approval" rather than a hang (ibx#203 / ibx#207).
+                // Accounts with no second factor fall straight through (Skipped).
+                if config.code_provider.is_none() {
+                    log::info!(
+                        "Live login for {}: waiting for second-factor approval (mobile push);                      connect() blocks {}. Use paper=true, an ib_key_timeout_secs,                      or a code_provider to avoid this.",
+                        config.username, bound,
+                    );
+                } else {
+                    log::info!(
+                        "Live login for {}: second-factor via code_provider (Challenge/Response);                      connect() blocks {} awaiting the challenge.",
+                        config.username, bound,
+                    );
+                }
+                // Short read timeout: the wait checks the code provider and the
+                // deadline between reads (ibx#244).
+                set_login_read_timeout(tls.stream.tcp(), Some(Duration::from_millis(FARM_LOGON_POLL_MS)), control)?;
+                match session::do_ib_key_2fa(
+                    &mut tls,
+                    &token_sub_type,
+                    deadline,
+                    config.code_provider.as_ref(),
+                )? {
+                    session::IbKeyOutcome::Skipped => {
+                        log::info!("2FA gate: skipped (no second factor)");
+                    }
+                    session::IbKeyOutcome::Approved { approval_url, session_id, soft_token_hex } => {
+                        log::info!(
+                            "2FA gate: approved (session_id={}, approval_url={}, token_hex_len={})",
+                            if session_id.is_empty() { "<none>" } else { &session_id },
+                            if approval_url.is_empty() { "<none>" } else { &approval_url },
+                            soft_token_hex.len(),
+                        );
+                        if !soft_token_hex.is_empty() {
+                            if let Some(tok) = BigUint::parse_bytes(soft_token_hex.as_bytes(), 16) {
+                                soft_token = Some(tok);
+                            } else {
+                                log::warn!("2FA gate: SOFT token hex did not parse — falling back to session_key");
+                            }
                         }
                     }
                 }
-            }
+                }
         }
 
         // Receive post-auth messages (encrypted via 534) and wait for the
@@ -2142,7 +2177,7 @@ impl Gateway {
                 && session_epoch.is_empty()
             {
                 session_epoch = v.clone();
-                log::info!("Auth: session epoch {}", session_epoch);
+                if control.is_none() { log::info!("Auth: session epoch {}", session_epoch); }
             }
             // Tag 8035: try parsed fields first, then raw byte search
             if server_session_id.is_empty() {
@@ -2277,10 +2312,12 @@ impl Gateway {
         }
 
         let max_real_time_requests = max_real_time_requests(&ticker_limit_tags);
-        log::info!(
-            "Auth logon: account={} session_id={} hb={}s scale_us_lots={} max_real_time_requests={}",
-            account_id, server_session_id, heartbeat_interval, scale_us_lots, max_real_time_requests
-        );
+        if control.is_none() {
+            log::info!(
+                "Auth logon: account={} session_id={} hb={}s scale_us_lots={} max_real_time_requests={}",
+                account_id, server_session_id, heartbeat_interval, scale_us_lots, max_real_time_requests
+            );
+        } else { log::info!("Controlled auth logon received"); }
 
         // --- Post-logon init sequence ---
         let account = if account_id.is_empty() { config.username.clone() } else { account_id.clone() };
@@ -2361,14 +2398,15 @@ impl Gateway {
         let algo_definitions = parse_algo_definitions(&init_str);
         log::info!("Algo definitions in the login burst: {}", algo_definitions.len());
         match &account_config {
-            Some((features, mifid)) => log::info!("Account config: features {:?}, MiFID config {:?}", features, mifid),
+            Some((features, mifid)) if control.is_none() => log::info!("Account config: features {:?}, MiFID config {:?}", features, mifid),
+            Some(_) => log::info!("Account configuration received"),
             None => log::warn!("No account config answer in the login burst"),
         }
         // TEMP diagnostic (ib-agent#128 follow-up): log every part containing
         // "farm" or "hmds" so we can locate the routing tags.
         for part in init_str.split('\x01') {
             if control.is_none() && (part.contains("farm") || part.contains("hmds") || part.contains("secdef")) {
-                log::info!("Init scan: routing-shaped part = {:?}", part);
+                if control.is_none() { log::info!("Init scan: routing-shaped part = {:?}", part); }
             }
         }
         for part in init_str.split('\x01') {
@@ -2377,7 +2415,7 @@ impl Gateway {
                 if val.starts_with("DU") || val.starts_with("DF") || val.starts_with("U") {
                     if account_id.is_empty() || account_id == config.username {
                         account_id = val.to_string();
-                        log::info!("Found account ID from init response: {}", account_id);
+                        if control.is_none() { log::info!("Found account ID from init response: {}", account_id); }
                     }
                 }
             } else if part.starts_with("6522=") && raw_soft_dollar_tiers.is_empty() {
@@ -4218,11 +4256,22 @@ mod controlled_gateway_tests {
         control.join_workers(Duration::from_secs(1)).unwrap();
     }
     #[test]
-    fn controlled_live_and_credentials_reject_before_tcp() {
+    fn controlled_code_callback_and_credentials_reject_before_tcp() {
         let control = control();
         let mut config = config(); config.paper = false;
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_called = called.clone();
+        config.code_provider = Some(Arc::new(move |_| {
+            callback_called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok("never-called".into())
+        }));
         assert_eq!(Gateway::connect_once(&config, &control).err().unwrap().kind(), io::ErrorKind::Unsupported);
-        config.paper = true; config.password.clear();
+        assert!(!control.is_cancelled(), "callback is rejected before beginning login");
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+        config.code_provider = None; config.accept_invalid_certs = true;
+        assert_eq!(Gateway::connect_once(&config, &control).err().unwrap().kind(), io::ErrorKind::Unsupported);
+        assert!(!control.is_cancelled());
+        config.accept_invalid_certs = false; config.password.clear();
         assert_eq!(Gateway::connect_once(&config, &control).err().unwrap().kind(), io::ErrorKind::InvalidInput);
         control.join_workers(Duration::from_secs(1)).unwrap();
     }
@@ -4274,3 +4323,7 @@ fn read_login_key_exchange_answer<S: Read>(
     process_controlled_hello(channel, &parts[2..], control)?;
     Ok(true)
 }
+
+#[cfg(test)]
+#[path = "controlled_login_tests.rs"]
+mod controlled_login_tests;

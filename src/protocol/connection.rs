@@ -211,6 +211,8 @@ pub struct Connection {
     /// The first write error. The connection is unusable from then on: the
     /// owner drops it and reconnects; no frame is written again.
     write_error: Option<(io::ErrorKind, String)>,
+    /// The first bounded receive failure. Retire the transport after it.
+    limited_read_error: Option<(io::ErrorKind, String)>,
 }
 
 impl Connection {
@@ -239,6 +241,7 @@ impl Connection {
             out_pos: 0,
             queued_writes: false,
             write_error: None,
+            limited_read_error: None,
         }
     }
 
@@ -438,6 +441,131 @@ impl Connection {
             self.buf.drain(..1);
         }
         frames
+    }
+
+    /// Read at most one complete frame under explicit retained/frame byte limits.
+    ///
+    /// Returns no frames for a partial frame or an idle transport. EOF, malformed
+    /// headers/checksums, exceeded limits and hard transport errors are sticky:
+    /// retire this connection instead of retrying it. Unknown bytes are rejected,
+    /// never skipped. Only FIX.4.1, FIXCOMP and 8=O/1/X headers are admitted.
+    /// Header bytes are inspected before body growth; the declared total must
+    /// fit both limits. This does not inflate, unsign or interpret a frame.
+    ///
+    /// One frame per call bounds owned result count/bytes even under a flood.
+    /// Existing login seed buffers are checked before new allocation. The legacy
+    /// initial 32KiB capacity is unchanged; these limits bound retained lengths.
+    pub fn poll_limited(&mut self, max_buffer_bytes: usize, max_frame_bytes: usize) -> io::Result<Vec<Frame>> {
+        if let Some((kind, text)) = &self.limited_read_error {
+            return Err(io::Error::new(*kind, text.clone()));
+        }
+        if max_frame_bytes == 0 || max_frame_bytes > max_buffer_bytes {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid receive limits"));
+        }
+        let result = self.poll_limited_inner(max_buffer_bytes, max_frame_bytes);
+        if let Err(error) = &result {
+            self.limited_read_error = Some((error.kind(), error.to_string()));
+        }
+        result
+    }
+
+    fn poll_limited_inner(&mut self, max_buffer_bytes: usize, max_frame_bytes: usize) -> io::Result<Vec<Frame>> {
+        if self.buf.len() > max_buffer_bytes {
+            return Err(limited_frame_error("retained receive byte limit exceeded"));
+        }
+        loop {
+            let announced = limited_frame_length(&self.buf, max_frame_bytes)?;
+            if let Some((total, kind)) = announced {
+                if total > max_buffer_bytes {
+                    return Err(limited_frame_error("announced receive byte limit exceeded"));
+                }
+                if self.buf.len() >= total {
+                    // Signed FIX computes checksum before XOR distortion. The
+                    // caller must verify HMAC, then checksum on undistorted bytes.
+                    if matches!(kind, LimitedFrameKind::Fix) && !fix::is_signed(&self.buf[..total]) {
+                        validate_limited_fix_checksum(&self.buf[..total])?;
+                    }
+                    let bytes: Vec<u8> = self.buf.drain(..total).collect();
+                    let frame = match kind {
+                        LimitedFrameKind::Fix => Frame::Fix(bytes),
+                        LimitedFrameKind::FixComp => Frame::FixComp(bytes),
+                        LimitedFrameKind::Binary => Frame::Binary(bytes),
+                        LimitedFrameKind::Control => Frame::Control(bytes),
+                    };
+                    return Ok(vec![frame]);
+                }
+            }
+            // Until a header announces a valid total, read just one stack byte.
+            // Afterwards read only this frame's admitted remainder. No coalesced
+            // suffix can exceed the budget while the caller processes this frame.
+            let wanted = announced.map_or(1, |(total, _)| total - self.buf.len())
+                .min(RECV_BUF_SIZE).min(max_buffer_bytes.saturating_sub(self.buf.len()));
+            if wanted == 0 {
+                return Err(limited_frame_error("incomplete frame exhausted receive budget"));
+            }
+            let mut chunk = [0u8; RECV_BUF_SIZE];
+            match self.stream.read(&mut chunk[..wanted]) {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "bounded transport closed")),
+                Ok(count) => {
+                    // Validate the next header byte in fixed stack storage before
+                    // extending the owned buffer. Header length is independently
+                    // limited, including unterminated decimal length fields.
+                    if announced.is_none() {
+                        let mut header = [0u8; LIMITED_HEADER_BYTES];
+                        let used = self.buf.len();
+                        if used >= header.len() {
+                            return Err(limited_frame_error("frame header byte limit exceeded"));
+                        }
+                        header[..used].copy_from_slice(&self.buf);
+                        header[used] = chunk[0];
+                        limited_frame_length(&header[..used + 1], max_frame_bytes)?;
+                    }
+                    self.buf.try_reserve_exact(count).map_err(|_| limited_frame_error("receive allocation failed"))?;
+                    self.buf.extend_from_slice(&chunk[..count]);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock || error.kind() == io::ErrorKind::TimedOut => return Ok(Vec::new()),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => return Ok(Vec::new()),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Send a bounded signed FIX control frame with at most one in-flight write.
+    ///
+    /// Requires queued-write mode. Any pending plaintext or Rustls ciphertext
+    /// rejects admission with WouldBlock before allocation, signing or sequence
+    /// changes. The caller should retire a session on an excessive TestRequest
+    /// flood instead of creating an unbounded retry queue. Hard write failures
+    /// remain sticky through the existing write_error/flush_queued contract.
+    /// Fields are restricted to 1..=32, bounded in total, without embedded SOH or
+    /// generated framing tags; sequence exhaustion fails before writing.
+    pub fn send_fix_limited(&mut self, fields: &[(u32, &str)], max_frame_bytes: usize) -> io::Result<()> {
+        if self.write_error.is_some() {
+            return Err(self.failed());
+        }
+        if !self.queued_writes {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "bounded sends require queued-write mode"));
+        }
+        if self.has_queued_output() {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "bounded output is still pending"));
+        }
+        if fields.is_empty() || fields.len() > 32 || max_frame_bytes == 0 || self.seq >= 999_999 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid bounded FIX send"));
+        }
+        // Conservatively includes headers, checksum, sequence and HMAC trailer.
+        // Admission precedes the native builder's owned temporary buffers.
+        let mut admitted = 64usize;
+        for &(tag, value) in fields {
+            if matches!(tag, 8 | 9 | 10 | 34 | 8349) || value.as_bytes().contains(&SOH) {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid bounded FIX field"));
+            }
+            admitted = admitted.checked_add(12).and_then(|n| n.checked_add(value.len()))
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bounded FIX size overflow"))?;
+            if admitted > max_frame_bytes {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "bounded FIX frame byte limit exceeded"));
+            }
+        }
+        self.send_fix(fields)
     }
 
     /// Unsign a received frame using the read IV.
@@ -646,6 +774,73 @@ impl Connection {
     pub fn inject_buf(&mut self, data: &[u8]) {
         self.buf.extend_from_slice(data);
     }
+}
+
+// A valid complete header needs at most 10 + 2 + 20 + 1 bytes on 64-bit.
+// A fixed ceiling also prevents endless unterminated versions/length fields.
+const LIMITED_HEADER_BYTES: usize = 64;
+
+#[derive(Clone, Copy)]
+enum LimitedFrameKind { Fix, FixComp, Binary, Control }
+
+fn limited_frame_error(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+/// Inspect a borrowed prefix without allocating or permissive resynchronization.
+fn limited_frame_length(bytes: &[u8], max_frame_bytes: usize) -> io::Result<Option<(usize, LimitedFrameKind)>> {
+    if bytes.is_empty() { return Ok(None); }
+    let headers: [(&[u8], LimitedFrameKind); 5] = [
+        (b"8=FIX.4.1\x01", LimitedFrameKind::Fix),
+        (b"8=FIXCOMP\x01", LimitedFrameKind::FixComp),
+        (b"8=O\x01", LimitedFrameKind::Binary),
+        (b"8=1\x01", LimitedFrameKind::Control),
+        (b"8=X\x01", LimitedFrameKind::Control),
+    ];
+    let Some((header, kind)) = headers.into_iter().find(|(header, _)| bytes.starts_with(header)) else {
+        if bytes.len() < LIMITED_HEADER_BYTES && headers.iter().any(|(header, _)| header.starts_with(bytes)) {
+            return Ok(None);
+        }
+        return Err(limited_frame_error("unsupported frame header"));
+    };
+    let rest = &bytes[header.len()..];
+    if rest.len() < 2 {
+        return if b"9=".starts_with(rest) { Ok(None) } else { Err(limited_frame_error("frame body length tag missing")) };
+    }
+    if !rest.starts_with(b"9=") { return Err(limited_frame_error("frame body length tag missing")); }
+    let mut length = 0usize;
+    for (index, &byte) in rest[2..].iter().enumerate() {
+        let header_end = header.len() + 2 + index + 1;
+        if header_end > LIMITED_HEADER_BYTES { return Err(limited_frame_error("frame header byte limit exceeded")); }
+        if byte == SOH {
+            if index == 0 { return Err(limited_frame_error("empty frame body length")); }
+            let trailer = if matches!(kind, LimitedFrameKind::Fix) { 7 } else { 0 };
+            let total = header_end.checked_add(length).and_then(|n| n.checked_add(trailer))
+                .ok_or_else(|| limited_frame_error("frame total length overflow"))?;
+            if total > max_frame_bytes { return Err(limited_frame_error("announced frame byte limit exceeded")); }
+            return Ok(Some((total, kind)));
+        }
+        if !byte.is_ascii_digit() { return Err(limited_frame_error("invalid frame body length")); }
+        length = length.checked_mul(10).and_then(|n| n.checked_add((byte - b'0') as usize))
+            .ok_or_else(|| limited_frame_error("frame body length overflow"))?;
+        // This check rejects an already oversized decimal prefix, before its
+        // terminator (or any payload) is buffered.
+        if length > max_frame_bytes { return Err(limited_frame_error("announced frame byte limit exceeded")); }
+    }
+    if bytes.len() >= LIMITED_HEADER_BYTES { return Err(limited_frame_error("frame header byte limit exceeded")); }
+    Ok(None)
+}
+
+fn validate_limited_fix_checksum(bytes: &[u8]) -> io::Result<()> {
+    if bytes.len() < 7 { return Err(limited_frame_error("missing FIX checksum")); }
+    let trailer = &bytes[bytes.len() - 7..];
+    if !trailer.starts_with(b"10=") || trailer[6] != SOH || !trailer[3..6].iter().all(u8::is_ascii_digit) {
+        return Err(limited_frame_error("invalid FIX checksum trailer"));
+    }
+    let expected = bytes[..bytes.len() - 7].iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+    let supplied = (trailer[3] - b'0') as u16 * 100 + (trailer[4] - b'0') as u16 * 10 + (trailer[5] - b'0') as u16;
+    if supplied != expected as u16 { return Err(limited_frame_error("FIX checksum mismatch")); }
+    Ok(())
 }
 
 /// Frame headers the reader recognizes.
@@ -1447,5 +1642,178 @@ mod controlled_queued_tls_tests {
         server.reader().read_exact(&mut plaintext).unwrap();
         assert_eq!(&plaintext, b"first-framesecond-frame");
         assert_eq!(server.reader().read(&mut [0u8; 1]).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    }
+}
+
+#[cfg(test)]
+mod bounded_transport_tests {
+    use super::*;
+    use crate::protocol::fix::fix_build;
+
+    fn pair() -> (Connection, MemTransport) {
+        let (stream, peer) = mem_pair();
+        let connection = Connection::new_mem(stream);
+        connection.set_mem_read_timeout(std::time::Duration::ZERO);
+        (connection, peer)
+    }
+
+    #[test]
+    fn bounded_announced_lengths_fail_before_body_allocation() {
+        for header in ["8=FIX.4.1\x01", "8=FIXCOMP\x01", "8=O\x01", "8=1\x01", "8=X\x01"] {
+            let (mut connection, mut peer) = pair();
+            let capacity = connection.buf.capacity();
+            peer.write_all(format!("{header}9=999999999999999999999999\x01").as_bytes()).unwrap();
+            let error = connection.poll_limited(128, 128).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(connection.buffered() < 32, "only admitted header prefix retained");
+            assert_eq!(connection.buf.capacity(), capacity, "no owned body allocation");
+            // A later valid frame cannot hide the prior framing failure.
+            peer.write_all(&fix_build(&[(35, "0")], 1)).unwrap();
+            assert_eq!(connection.poll_limited(128, 128).unwrap_err().to_string(), error.to_string());
+        }
+    }
+
+    #[test]
+    fn bounded_signed_fix_is_admitted_and_verified_before_checksum_validation() {
+        let key = vec![7; 20];
+        let iv: Vec<u8> = (0..16).collect();
+        let plain = fix_build(&[(35, "0"), (112, "signed-test")], 1);
+        let (signed, _) = fix::fix_sign(&plain, &key, &iv);
+        let (mut connection, mut peer) = pair();
+        connection.set_keys(Vec::new(), Vec::new(), key.clone(), iv.clone());
+        peer.write_all(&signed).unwrap();
+        let frames = connection.poll_limited(512, 512).unwrap();
+        let [Frame::Fix(bytes)] = frames.as_slice() else { panic!("signed frame expected") };
+        let (undistorted, valid) = connection.unsign(bytes);
+        assert!(valid);
+        validate_limited_fix_checksum(&undistorted).unwrap();
+        let (mut connection, mut peer) = pair();
+        connection.set_keys(Vec::new(), Vec::new(), key, iv);
+        let mut bad = signed.clone();
+        let position = find_subsequence(&bad, b"8349=").unwrap() + 5;
+        bad[position] = if bad[position] == b'0' { b'1' } else { b'0' };
+        peer.write_all(&bad).unwrap();
+        let frames = connection.poll_limited(512, 512).unwrap();
+        let [Frame::Fix(bytes)] = frames.as_slice() else { panic!("signed frame expected") };
+        assert!(!connection.unsign(bytes).1, "corrupt HMAC must not be accepted");
+    }
+    #[test]
+    fn bounded_decimal_overflow_and_malformed_headers_are_rejected() {
+        let overflow = format!("8=O\x019={}0\x01", usize::MAX);
+        for data in [overflow.as_bytes(), b"8=O\x019=-1\x01", b"8=X\x019=\x01", b"8=FIX.4.2\x019=1\x01", b"junk8=O\x019=1\x01", b"8=O\x0135=0\x019=1\x01"] {
+            let (mut connection, mut peer) = pair();
+            peer.write_all(data).unwrap();
+            assert_eq!(connection.poll_limited(usize::MAX, usize::MAX).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn bounded_incremental_reads_preserve_and_cap_valid_frames() {
+        let frame = fix_build(&[(35, "0"), (112, "test")], 1);
+        let (mut connection, mut peer) = pair();
+        for (index, byte) in frame.iter().enumerate() {
+            peer.write_all(&[*byte]).unwrap();
+            let frames = connection.poll_limited(frame.len(), frame.len()).unwrap();
+            assert!(connection.buffered() <= frame.len());
+            if index + 1 == frame.len() {
+                assert!(matches!(frames.as_slice(), [Frame::Fix(bytes)] if bytes == &frame));
+                assert_eq!(connection.buffered(), 0);
+            } else {
+                assert!(frames.is_empty());
+                assert_eq!(connection.buffered(), index + 1);
+            }
+        }
+        let mut corrupted = frame.clone();
+        let checksum_digit = corrupted.len() - 2;
+        corrupted[checksum_digit] = if corrupted[checksum_digit] == b'9' { b'8' } else { b'9' };
+        peer.write_all(&corrupted).unwrap();
+        assert_eq!(connection.poll_limited(frame.len(), frame.len()).unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn bounded_coalesced_seed_and_wire_return_one_frame_per_poll() {
+        let first = fix_build(&[(35, "0")], 1);
+        let compressed = fixcomp::fixcomp_build(&first);
+        let binary = b"8=O\x019=1\x01x".to_vec();
+        let control = b"8=1\x019=1\x01y".to_vec();
+        let frames = [&first, &compressed, &binary, &control];
+        for seeded in [false, true] {
+            let (mut connection, mut peer) = pair();
+            let bytes: Vec<u8> = frames.iter().flat_map(|frame| frame.iter().copied()).collect();
+            if seeded { connection.seed_buffer(&bytes); } else { peer.write_all(&bytes).unwrap(); }
+            for expected in frames {
+                let returned = connection.poll_limited(bytes.len(), bytes.len()).unwrap();
+                assert_eq!(returned.len(), 1);
+                let actual = match &returned[0] {
+                    Frame::Fix(bytes) | Frame::FixComp(bytes) | Frame::Binary(bytes) | Frame::Control(bytes) => bytes,
+                };
+                assert_eq!(actual, expected);
+            }
+            assert_eq!(connection.buffered(), 0);
+        }
+    }
+
+    #[test]
+    fn bounded_seed_limit_and_eof_are_explicit_and_sticky() {
+        let (mut connection, peer) = pair();
+        let frame = fix_build(&[(35, "0")], 1);
+        connection.seed_buffer(&frame);
+        let capacity = connection.buf.capacity();
+        assert_eq!(connection.poll_limited(8, 8).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(connection.buf.capacity(), capacity);
+        drop(peer);
+        assert_eq!(connection.poll_limited(128, 128).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        let (mut connection, mut peer) = pair();
+        peer.write_all(b"8=O\x019=4\x01a").unwrap();
+        drop(peer);
+        assert_eq!(connection.poll_limited(128, 128).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(connection.poll_limited(128, 128).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn bounded_outgoing_admission_preserves_sequence_and_signature_under_backpressure() {
+        let (mut connection, mut peer) = pair();
+        if let Stream::Mem(stream) = &connection.stream { stream.set_write_capacity(Some(3)); }
+        connection.set_queued_writes(true);
+        connection.set_keys(vec![1; 20], vec![2; 16], Vec::new(), Vec::new());
+        connection.send_fix_limited(&[(35, "0"), (112, "first")], 256).unwrap();
+        assert!(connection.has_queued_output());
+        let iv = connection.sign_iv.clone();
+        let queued: Vec<Vec<u8>> = connection.out.iter().cloned().collect();
+        for _ in 0..100 {
+            assert_eq!(connection.send_fix_limited(&[(35, "0"), (112, "second")], 256).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        }
+        assert_eq!(connection.seq, 1);
+        assert_eq!(connection.sign_iv, iv);
+        assert_eq!(connection.out.iter().cloned().collect::<Vec<_>>(), queued);
+        assert_eq!(connection.out.len(), 1);
+        let mut received = Vec::new();
+        while connection.has_queued_output() {
+            let mut chunk = [0u8; 3];
+            let count = peer.read(&mut chunk).unwrap();
+            received.extend_from_slice(&chunk[..count]);
+            connection.flush_queued().unwrap();
+        }
+        let mut chunk = [0u8; 3];
+        peer.set_read_timeout(Some(std::time::Duration::ZERO)).unwrap();
+        if let Ok(count) = peer.read(&mut chunk) { received.extend_from_slice(&chunk[..count]); }
+        assert_eq!(received, queued[0]);
+    }
+
+    #[test]
+    fn bounded_send_rejects_oversize_before_state_changes_and_hard_failures_remain_sticky() {
+        let (mut connection, peer) = pair();
+        connection.set_queued_writes(true);
+        assert!(connection.send_fix_limited(&[(35, "0"), (112, &"x".repeat(256))], 128).is_err());
+        assert!(connection.send_fix_limited(&[(35, "0\x01bad")], 128).is_err());
+        assert_eq!(connection.seq, 0);
+        assert!(!connection.has_queued_output());
+        assert!(connection.write_error().is_none());
+        drop(peer);
+        assert_eq!(connection.send_fix_limited(&[(35, "0")], 128).unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        assert!(connection.write_error().is_some());
+        assert_eq!(connection.seq, 0);
+        assert_eq!(connection.send_fix_limited(&[(35, "0")], 128).unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(connection.flush_queued().unwrap_err().kind(), io::ErrorKind::BrokenPipe);
     }
 }

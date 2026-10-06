@@ -636,6 +636,15 @@ impl AuthStart {
             ));
         }
         let number = |i: usize| fields.get(i).and_then(|f| f.trim().parse::<u32>().ok()).unwrap_or(0);
+        if !log_unknown {
+            let entries: Vec<_> = fields.get(4).copied().unwrap_or("")
+                .split(',').filter(|e| !e.trim().is_empty()).collect();
+            if entries.len() > 16 || entries.iter().any(|entry|
+                entry.len() > 64 || SecondFactor::parse(entry).is_none())
+            {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid bounded second-factor list"));
+            }
+        }
         let second_factors = fields.get(4).copied().unwrap_or("")
             .split(',')
             .filter(|e| !e.trim().is_empty())
@@ -762,7 +771,14 @@ struct NsFramePoller {
 impl NsFramePoller {
     /// The next frame payload, or `None` when a read timed out first.
     fn poll<R: Read>(&mut self, stream: &mut R) -> io::Result<Option<Vec<u8>>> {
+        self.poll_impl(stream, None, None)
+    }
+
+    fn poll_impl<R: Read>(&mut self, stream: &mut R, limit: Option<usize>, deadline: Option<std::time::Instant>) -> io::Result<Option<Vec<u8>>> {
         loop {
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "mobile push approval deadline expired"));
+            }
             let needed = if self.buf.len() < 8 {
                 8 - self.buf.len()
             } else {
@@ -779,7 +795,11 @@ impl NsFramePoller {
                         format!("NS frame length {:#010x} is negative", len),
                     ));
                 }
-                let total = 8 + len as usize;
+                if limit.is_some_and(|max| len as usize > max) {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "bounded push frame limit exceeded"));
+                }
+                let total = 8usize.checked_add(len as usize).ok_or_else(||
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid push frame length"))?;
                 if self.buf.len() >= total {
                     let payload = self.buf[8..total].to_vec();
                     self.buf.drain(..total);
@@ -1507,6 +1527,118 @@ pub fn do_ib_key_2fa<S: Read + Write>(
     }
 }
 
+/// Execute one mobile-push approval exchange, without a callback worker or retry.
+///
+/// Limits admit payload bytes before allocation and bound aggregate inbound wire bytes and
+/// frame count, including backup notices and heartbeats. Supply a cancellation-aware
+/// stream with short reads that expose poll timeouts; a generic stream itself cannot
+/// promise cancellation. The function consumes exactly through AUTH_FINISH, leaving
+/// coalesced post-auth frames unread. Errors and logs never echo peer contents.
+pub fn do_ib_key_push_bounded<S: Read + Write>(
+    stream: &mut S,
+    token_sub_type: &str,
+    deadline: Option<std::time::Instant>,
+    max_frame_bytes: usize,
+    max_wire_bytes: usize,
+    max_frames: usize,
+) -> io::Result<IbKeyOutcome> {
+    if max_frame_bytes == 0 || max_wire_bytes < 8 || max_frames == 0
+        || token_sub_type.len() > 64 || token_sub_type.chars().any(char::is_control)
+    {
+        return Err(ib_key_err(io::ErrorKind::InvalidInput, "invalid bounded push configuration"));
+    }
+    let check_deadline = || {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            Err(ib_key_err(io::ErrorKind::TimedOut, "mobile push approval deadline expired"))
+        } else { Ok(()) }
+    };
+    check_deadline()?;
+    let init = xyz::xyz_wrap(&xyz::xyz_build_swcr_token_init(token_sub_type));
+    stream.write_all(&init)?;
+    stream.flush()?;
+    log::info!("Controlled login: waiting for mobile push approval");
+    let mut poller = NsFramePoller::default();
+    let mut wire_bytes = 0usize;
+    let mut frames = 0usize;
+    let mut challenge = None;
+    loop {
+        check_deadline()?;
+        // The poller retains partial frames across poll timeouts. Admission uses
+        // the smaller remaining aggregate budget before reading an announced body.
+        let remaining = max_wire_bytes.saturating_sub(wire_bytes);
+        if frames == max_frames || remaining < 8 {
+            return Err(ib_key_err(io::ErrorKind::InvalidData, "bounded push exchange limit exceeded"));
+        }
+        let payload = match poller.poll_impl(stream, Some(max_frame_bytes.min(remaining - 8)), deadline) {
+            Ok(Some(payload)) => payload,
+            Ok(None) => continue,
+            Err(error) => {
+                let kind = if matches!(error.kind(), io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::ConnectionReset) {
+                    io::ErrorKind::ConnectionAborted
+                } else { error.kind() };
+                return Err(ib_key_err(kind, "bounded mobile push read failed"));
+            }
+        };
+        check_deadline()?;
+        frames += 1;
+        wire_bytes += payload.len() + 8;
+        if !ns::is_ns_text(&payload) { validate_bounded_xyz(&payload)?; }
+        let message = classify_payload(&payload).map_err(|_|
+            ib_key_err(io::ErrorKind::InvalidData, "invalid bounded mobile push message"))?;
+        match message {
+            RecvMsg::Xyz { msg_id, state: 2, fields, .. } if msg_id == xyz::XYZ_MSG_SWCR_TOKEN => {
+                challenge = Some(xyz::parse_swcr_token_challenge(&fields));
+            }
+            RecvMsg::Xyz { msg_id, state: 4, fields, .. } if msg_id == xyz::XYZ_MSG_SWCR_TOKEN => {
+                if !fields.iter().any(|field| field.eq_ignore_ascii_case("PASSED")) {
+                    return Err(ib_key_err(io::ErrorKind::PermissionDenied, "mobile push approval declined"));
+                }
+            }
+            RecvMsg::Xyz { msg_id, state: 3 | 5, fields, .. } if msg_id == xyz::XYZ_MSG_TOKEN_AUTH => {
+                if !fields.iter().any(|field| field.eq_ignore_ascii_case("PASSED"))
+                    || fields.iter().any(|field| field.eq_ignore_ascii_case("FAILED"))
+                {
+                    return Err(ib_key_err(io::ErrorKind::PermissionDenied, "mobile push approval declined"));
+                }
+                let mut soft_token_hex = String::new();
+                for field in &fields {
+                    if field.len() >= 32 && field.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        if field.len() > 2048 {
+                            return Err(ib_key_err(io::ErrorKind::InvalidData, "bounded push token limit exceeded"));
+                        }
+                        if !soft_token_hex.is_empty() {
+                            return Err(ib_key_err(io::ErrorKind::InvalidData, "ambiguous bounded push token"));
+                        }
+                        soft_token_hex = field.clone();
+                    }
+                }
+                log::info!("Controlled login: mobile push approved");
+                return match challenge {
+                    None if soft_token_hex.is_empty() => Ok(IbKeyOutcome::Skipped),
+                    value => {
+                        let value = value.unwrap_or_default();
+                        Ok(IbKeyOutcome::Approved {
+                            approval_url: value.approval_url,
+                            session_id: value.session_id,
+                            soft_token_hex,
+                        })
+                    }
+                };
+            }
+            RecvMsg::Ns { msg_type: NS_TEST_REQUEST, fields, .. } => {
+                let timestamp = fields.iter().find(|f| !f.is_empty()).map(String::as_str).unwrap_or("");
+                stream.write_all(&ns_build_heart_beat(NS_VERSION, timestamp))?;
+                stream.flush()?;
+            }
+            RecvMsg::Ns { msg_type, .. } if msg_type == NS_BACKUP_HOST => {}
+            RecvMsg::Ns { msg_type, .. } if msg_type == NS_ERROR_RESPONSE || msg_type == NS_SECURE_ERROR => {
+                return Err(ib_key_err(io::ErrorKind::PermissionDenied, "mobile push refused by server"));
+            }
+            _ => return Err(ib_key_err(io::ErrorKind::Unsupported, "unsupported bounded mobile push message")),
+        }
+    }
+}
 /// Result of soft token authentication attempt.
 pub enum SoftTokenOutcome {
     /// Token accepted.
@@ -1864,11 +1996,12 @@ mod tests {
     }
 
     #[test]
-    fn bounded_auth_start_ignores_unknown_factor_without_peer_diagnostics() {
+    fn bounded_auth_start_rejects_unknown_factor_without_peer_diagnostics() {
         let frame = ns::ns_build(50, NS_AUTH_START, &["1", "1", "private-unknown-factor", "0"], "");
         let mut channel = SecureChannel::new();
-        let start = recv_auth_start_limited(&mut io::Cursor::new(frame), &mut channel, 1024).unwrap();
-        assert!(start.second_factors.is_empty());
+        let error = recv_auth_start_limited(&mut io::Cursor::new(frame), &mut channel, 1024).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!error.to_string().contains("private-unknown-factor"));
     }
 
     #[test]
@@ -3044,3 +3177,7 @@ mod tests {
         assert_eq!(tail, b"next", "bytes after the frame stay unread");
     }
 }
+
+#[cfg(test)]
+#[path = "controlled_push_tests.rs"]
+mod controlled_push_tests;

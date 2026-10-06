@@ -1,4 +1,4 @@
-# Local patch: bounded paper login and strict history
+# Local patch: bounded login, connection control and strict history
 
 Our fork's dev branch reconciles the local patch with upstream
 `e491575a59d9ef5d069a1e0c4afa132bce32a281`. Tested source checkpoint:
@@ -11,14 +11,14 @@ acceptance has been performed. Legacy entry points are retained.
 See [fork workflow](fork-workflow.md) for branch roles and contribution guidance.
 ## Controlled connection contract
 
-`EClient::connect_once(config, control)` performs a single paper-login attempt.
+`Gateway::connect_once` and `EClient::connect_once(config, control)` perform one paper or live authentication attempt. Controlled live authentication accepts broker-selected mobile push or no-factor login.
 Run it on an owned blocking worker. `ConnectionControl::new(timeout, addresses,
 hw_info)` requires a positive login budget, at most 32 explicitly resolved host
 names with at most 8 IPs each, and prepared hardware information (1..=1024 bytes).
 No DNS, hardware discovery, subprocess or autonomous reconnect is performed by
 this path. Redirect and farm hosts must be present in the supplied address map.
 Hostnames are at most 253 bytes; usernames at most 256 bytes and passwords at most
-4096 bytes. Live login and disabled certificate validation are rejected.
+4096 bytes. Disabled certificate validation and challenge-response callbacks are rejected before effects.
 
 The control is single-use for physical login. All sockets are registered with an
 owned watchdog; TCP connects and blocking reads/writes poll at most every 100ms.
@@ -164,3 +164,35 @@ complete in under a second. TLS fixtures verify local chain/hostname checks,
 reject untrusted roots, interrupt stalled handshakes, retain partial reads and
 ciphertext under backpressure, and check the captured login start/no-downgrade
 protocol. They do not establish full successful broker login acceptance.
+## Connection-only follow-up (2026-10-06)
+
+`auth::session::do_ib_key_push_bounded` preserves partial frames and post-approval
+carry, supports server heartbeat/TestRequest during mobile push, and admits finite
+frame bytes, total wire bytes and frame count. Its deadline is checked across idle
+polls. Decline, malformed factors, unsupported factors and broker close fail without
+echoing challenge, URL or peer diagnostics. Legacy callback authentication remains.
+
+ControlledIo reports cancellation as terminal ConnectionAborted at transport read,
+write and flush boundaries. Public ConnectionControl::check retains Interrupted.
+This distinction prevents std read_exact/read_to_end from retrying cancellation
+forever. The offline stage tests found and reproduced this defect before the fix.
+
+`Connection::poll_limited(buffer_limit, frame_limit)` admits framing sizes before
+body allocation, preserves partial data and returns at most one frame per poll.
+Receive errors/EOF remain sticky. Unsigned FIX checksums are verified immediately;
+signed FIX requires valid signing state and checksum validation after unsigning.
+`send_fix_limited(fields, frame_limit)` bounds fields/output and admits only one
+pending frame (including pending Rustls ciphertext), preserving sequence/signature
+state on rejection. Legacy connection methods remain available.
+
+Our wrapper's connection-only adapter uses Gateway and the returned connections
+directly, without native HotLoop/SharedState caches. It owns/joins its login worker,
+checks exact account identity before readiness, bounds idle reads/inflation/control
+writes, and exposes no native orders or data requests. Native low-level primitives
+alone do not prove that an independently owned application worker is disposed.
+
+New offline evidence is recorded in the wrapper progress file. Stage fixtures enter
+the actual controlled login primitives on registered loopback sockets and exercise
+cancellation, timeout, scoped farm joins and rejected callbacks before effects.
+They do not synthesize a complete successful Gateway login or claim real broker
+acceptance. Existing native HotLoop data/cache bounds remain a later milestone.

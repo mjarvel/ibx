@@ -402,6 +402,23 @@ pub(crate) struct ControlledIo<S> {
     received: usize,
 }
 impl<S> ControlledIo<S> {
+    /// std::Read/Write helpers retry Interrupted, so scope cancellation must be
+    /// terminal at the I/O boundary. Public control.check retains its stop result.
+    fn check_transport_control(&self) -> io::Result<()> {
+        if let Some(control) = &self.control {
+            control.check().map_err(|error| {
+                if error.kind() == io::ErrorKind::Interrupted {
+                    io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "controlled login transport stopped",
+                    )
+                } else {
+                    error
+                }
+            })?;
+        }
+        Ok(())
+    }
     pub(crate) fn new(stream: S, control: Option<&ConnectionControl>) -> Self {
         Self {
             stream,
@@ -414,9 +431,7 @@ impl<S: io::Read> ControlledIo<S> {
     /// One poll for idle-gap drains. A timeout remains visible to the caller;
     /// frame-oriented Read retries below preserve partial read_exact progress.
     pub(crate) fn read_poll(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if let Some(control) = &self.control {
-            control.check()?;
-        }
+        self.check_transport_control()?;
         if buf.is_empty() {
             return Ok(0);
         }
@@ -436,9 +451,7 @@ impl<S: io::Read> ControlledIo<S> {
         if let Ok(amount) = result {
             self.received += amount;
         }
-        if let Some(control) = &self.control {
-            control.check()?;
-        }
+        self.check_transport_control()?;
         result
     }
 }
@@ -460,20 +473,16 @@ impl<S: io::Read> io::Read for ControlledIo<S> {
 }
 impl<S: io::Write> io::Write for ControlledIo<S> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if let Some(control) = &self.control {
-            control.check()?;
-        }
+        self.check_transport_control()?;
         let amount = self.stream.write(buf)?;
-        if let Some(control) = &self.control {
-            control.check()?;
-        }
+        self.check_transport_control()?;
         Ok(amount)
     }
     fn flush(&mut self) -> io::Result<()> {
-        if let Some(control) = &self.control {
-            control.check()?;
-        }
-        self.stream.flush()
+        self.check_transport_control()?;
+        let result = self.stream.flush();
+        self.check_transport_control()?;
+        result
     }
 }
 
@@ -852,6 +861,58 @@ mod controlled_poll_tests {
         )
         .await
         .unwrap();
+        control.join_workers(Duration::from_secs(1)).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod controlled_terminal_io_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    struct NoEffects;
+    impl Read for NoEffects {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            panic!("cancelled transport read underlying stream")
+        }
+    }
+    impl Write for NoEffects {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            panic!("cancelled transport wrote underlying stream")
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            panic!("cancelled transport flushed underlying stream")
+        }
+    }
+    #[test]
+    fn controlled_cancelled_std_io_helpers_are_terminal_without_retry_or_effects() {
+        let control = ConnectionControl::new(
+            Duration::from_secs(1),
+            BTreeMap::from([("localhost".into(), vec![IpAddr::from([127, 0, 0, 1])])]),
+            "offline-hardware".into(),
+        )
+        .unwrap();
+        control.cancel();
+        assert_eq!(
+            control.check().unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        let active = control.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut io = ControlledIo::new(NoEffects, Some(&active));
+            let errors = [
+                io.read_exact(&mut [0]).unwrap_err().kind(),
+                io.read_to_end(&mut Vec::new()).unwrap_err().kind(),
+                io.write_all(b"never").unwrap_err().kind(),
+                io.flush().unwrap_err().kind(),
+            ];
+            tx.send(errors).unwrap();
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            [io::ErrorKind::ConnectionAborted; 4]
+        );
+        worker.join().unwrap();
         control.join_workers(Duration::from_secs(1)).unwrap();
     }
 }

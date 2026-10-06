@@ -213,6 +213,7 @@ impl EClient {
     }
 
     /// Perform one caller-controlled login attempt without autonomous recovery.
+    /// Live accounts use broker-selected mobile push approval; no code callback worker is spawned.
     /// `control` must include all allowed pre-resolved login/farm hosts. This
     /// blocking method belongs on an owned worker, not a Tokio executor thread.
     /// On error, cancel and join the scope before starting any replacement.
@@ -231,7 +232,6 @@ impl EClient {
         // Validate before duplicating controlled plaintext/configuration storage.
         if let Some(control) = connection_control {
             control.check()?;
-            if !config.paper { return Err(io::Error::new(io::ErrorKind::Unsupported, "controlled login supports paper only").into()); }
             if config.username.trim().is_empty() || config.username.len() > 256 || config.password.is_empty() || config.password.len() > 4096 || config.host.trim().is_empty() || config.host.len() > 253 {
                 control.cancel();
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "controlled login configuration exceeds supported bounds").into());
