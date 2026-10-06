@@ -40,10 +40,13 @@ A Git merge-tree preview found conflicts in seven files:
 - src/protocol/fixcomp.rs
 - src/protocol/ns.rs
 
-The preview did not change files or branches. No unresolved working-tree merge was
-started. The patch has not been tested against current upstream. Its original
-Windows offline validation remains attached to the exact tested commit.
-
+The seven conflicts were reconciled on dev in merge cb0d10d. Reviewed follow-up
+ba9cb81ec902e3822fd5be73e3db742aec4c6840 fixes terminal controlled Shutdown and
+verifies the new controlled TLS login protocol. The inspected offline regression
+filters, integration targets, native library check and rustdoc passed; exact counts
+and limitations are in [local patch](local-patch.md). The original contribution
+branch stays unchanged. Main remains at the inspected upstream commit. Dev is our
+reconciled working version; no PR or production wrapper dependency adoption follows.
 ## Updating later
 
 When the checkout is clean, the usual sequence is:
@@ -65,8 +68,7 @@ fast-forward only: it refuses an unexpected divergence rather than discarding wo
 Merging main into dev brings the maintainers' work into our patched version.
 Conflicts mean both sides changed overlapping code; each resolution needs review
 and tests. Do not mechanically select our whole file or the whole upstream file.
-Do not run these merge commands blindly at the present checkpoint: the seven
-conflicts need an implementation/reconciliation pass first. No force push/reset
+No force push/reset
 is part of this normal workflow. Syncing main is deliberate, not automatic.
 
 ## Possible contributions

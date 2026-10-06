@@ -1,10 +1,14 @@
 # Local patch: bounded paper login and strict history
 
-This checkout carries our local patch on `codex/patch-ibx-bounded-lifecycle`, based
-on upstream `53cfa34b9813b480f311a36c458f0a35aa4d31e2` (0.7.1). It has been validated
-with offline fixtures on Windows MSVC Rust 1.97.1. No broker login or production
-acceptance has been performed. Legacy connection/parser entry points are retained.
-
+Our fork's dev branch reconciles the local patch with upstream
+`e491575a59d9ef5d069a1e0c4afa132bce32a281`. Tested source checkpoint:
+`ba9cb81ec902e3822fd5be73e3db742aec4c6840`, following merge `cb0d10d`.
+The original patch `f391500b55af8893a803c1c7c279edf1171579c9` against
+`53cfa34b9813b480f311a36c458f0a35aa4d31e2` remains on
+`codex/patch-ibx-bounded-lifecycle`. Both upstream snapshots are package 0.7.1.
+Offline fixtures run on Windows MSVC Rust 1.97.1. No broker login or production
+acceptance has been performed. Legacy entry points are retained.
+See [fork workflow](fork-workflow.md) for branch roles and contribution guidance.
 ## Controlled connection contract
 
 `EClient::connect_once(config, control)` performs a single paper-login attempt.
@@ -29,7 +33,7 @@ roots, with no platform root lookup or certificate URL retrieval. This changes
 trust-store semantics relative to legacy native TLS: machine-installed roots do
 not affect controlled login. TLS 1.2/1.3 use Rustls safe defaults. No global crypto
 provider, certificate bypass, machine trust changes or key logging is installed.
-Legacy `connect` still uses native TLS. Existing dependency versions remain pinned
+Legacy `connect` retains upstream native-TLS/plain selection. Controlled auth always uses verified TLS; controlled farms follow the upstream SSL farm list, using registered raw sockets and bounded NS encryption where appropriate. Existing dependency versions remain pinned
 in Cargo.lock; the patch adds the Rustls dependency graph.
 
 Login limits: NS/XYZ payloads at most 256KiB; retained stage buffers and aggregate
@@ -38,14 +42,14 @@ at most 8192 bits, with operand validation before big-integer construction.
 FIX/FIXCOMP acknowledgements use declared-length framing, validate FIX checksums,
 retain coalesced suffixes, and reject malformed/oversized frames. Compressed login
 frames are inflated under output limits. Caller cancellation remains effective
-through raw farm token/SRP exchanges. Missing account identity, unsupported route
+through raw farm token/SRP exchanges. Controlled auth follows the new upstream protocol: no redundant DH exchange inside TLS, no encryption-refusal downgrade or automatic resend. It skips detached misc-URL discovery and derives farm LAN identity from the registered TCP socket. Missing account identity, unsupported route
 ports and malformed bounded input fail rather than manufacturing a fallback.
 These primitives do not establish complete broker account validation.
 
 A successfully initialized EClient disarms only the login deadline; explicit
-cancellation remains effective. Controlled hot loops never spawn native reconnect
+cancellation remains effective. Controlled hot loops reject pre-existing/on-demand farm pools, release pool transports during stop, and never spawn native reconnect
 workers and check stop independently of command queues. `try_send_control` is
-nonblocking; acceptance does not prove wire transmission. Full queues reject
+nonblocking; acceptance does not prove wire transmission. A controlled Shutdown stops its command batch before later issuance. Queued Rustls writes retain pending ciphertext and accepted plaintext offsets across backpressure; they never replay already accepted bytes. Full queues reject
 admission. Controlled panic recovery preserves the panic for the joining caller.
 
 `disconnect_checked(timeout)` confirms the actual engine, retained engine handles
@@ -79,14 +83,14 @@ missing, duplicate and invalid fields without echoing response text.
 
 `StrictHistoricalResponse` contains original query ID, timezone, bars and explicit
 completion. Only `eoq=true` proves a final frame. `StrictHistoricalBar` contains
-original time text, finite f64 OHLC, optional i64 volume, optional f64 WAP and
+original time text, optional original end-time text (`endTime`), optional finite time average (`timeAvg`, distinct from WAP), finite f64 OHLC, optional i64 volume, optional f64 WAP and
 optional u32 count. Missing/empty statistics and volume/count -1 are absent; real
 zero remains present. WAP -1 remains raw because its interpretation depends on
 the requested price family. No range or timestamp conversion is invented.
 
 The caller must bound multipart totals and separately delivered notices, reject
 parser failures before publishing completion and preserve generation ownership.
-The legacy dispatcher is not rewired to this parser by this patch.
+The legacy dispatcher is not rewired to this parser by this patch. New upstream start/end strings are generated from saved request bounds; they are not broker-reported coverage. Legacy missing/malformed statistics now use -1 sentinels, but missing/malformed required prices still become zero and truncated rows can disappear. Upstream also preserves explicit multiplier text, including 1, in contract callbacks.
 
 ## Remaining production gates
 
@@ -119,13 +123,44 @@ cargo +stable test --offline --locked --lib api::client::tests --target-dir <tar
 cargo +stable check --offline --locked --lib --target-dir <target>
 ```
 
-The controlled filter passed 18 tests; bounded filter passed 23 (overlapping
-framing/authentication tests and one existing cache test); lifecycle basics 4;
-strict history 10; NS 28; FIXCOMP 16; gateway helpers 44; existing EClient API 246.
-All passed at the final checkpoint. Library check and rustdoc generation also passed; existing rustdoc link/HTML warnings remain. An existing unused `event_rx` warning remains
-in the native test suite. An early Windows socket fixture took roughly 120s:
-shutdown on a cloned socket did not interrupt the pending read promptly. The patch
-now applies 100ms read/write polls before socket registration and keeps shutdown
-on the watchdog. The final lifecycle fixture group completes in under a second.
-TLS fixtures verify local certificate/hostname checks, reject untrusted roots,
-interrupt stalled handshakes and preserve segmented reads across idle polls.
+The original f391500 checkpoint passed controlled_ 18, bounded_ 23, lifecycle basics
+4, strict history 10, NS 28, FIXCOMP 16, gateway helpers 44 and EClient API 246.
+The reconciled source ba9cb81 passed these inspected groups:
+
+| Library filter | Passed |
+| --- | ---: |
+| controlled_ | 24 |
+| bounded_ | 24 |
+| lifecycle::tests | 4 |
+| strict_history | 11 |
+| protocol::ns::tests | 28 |
+| protocol::fixcomp::tests | 16 |
+| protocol::connection::tests | 29 |
+| gateway:: | 84 |
+| api::client::tests | 309 |
+| engine::hot_loop::pool::tests | 6 |
+| engine::hot_loop::robustness_tests | 9 |
+
+Filters overlap; counts are not a unique-test total. Additional reviewed offline
+integration targets passed: scripted_peer 4; scenario_replay 27 (7 existing ignored
+cases remain ignored); hot_loop_lifecycle 2; control_plane 14; error_edge_concurrency
+34; protocol_vectors 22; gw_catalog 46. Use `--features test-support` explicitly for
+integration targets: Cargo's self dev-dependency feature unification did not reliably
+expose the gated harness/benchmark on this Windows build. That initial compile
+failure was resolved by the feature flag, without changing production features.
+The first catalog run also detected our local pool failure mislabeled as broker
+1100; it now logs a local reason and cancels through connection health instead.
+
+Library check and rustdoc generation passed. Existing upstream warnings remain:
+unused FixSink (library), OrderStatus/event_rx (tests), nine rustdoc link/HTML/private
+link warnings, and a bin/lib ibx.pdb name collision during integration builds.
+No all-target/live suite or coverage percentage is claimed. The independent wrapper
+native evidence package passes seven socket-free dispatcher/parser fixtures.
+
+An early original Windows socket fixture took roughly 120s because cloned-socket
+shutdown did not promptly release pending recv. The patch applies 100ms read/write
+polls before registration and watchdog-owned shutdown. Final controlled fixtures
+complete in under a second. TLS fixtures verify local chain/hostname checks,
+reject untrusted roots, interrupt stalled handshakes, retain partial reads and
+ciphertext under backpressure, and check the captured login start/no-downgrade
+protocol. They do not establish full successful broker login acceptance.

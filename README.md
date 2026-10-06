@@ -288,4 +288,4 @@ This approach is consistent with the principle of **interoperability through pro
 
 For users and contributors in the European Union: Article 6 of the EU Software Directive (2009/24/EC) permits reverse engineering for the purpose of achieving interoperability with independently created software, provided that specific conditions are met. IBX was developed with this legal framework in mind, enabling interoperability with IB's trading infrastructure on platforms where the official Java-based Gateway cannot run (headless Linux, containers, embedded systems).
 
-Local fork reconciliation status and pending validation: [checkpoint](docs/reconciliation-checkpoint.md).
+Local fork reconciliation results and remaining production gates: [checkpoint](docs/reconciliation-checkpoint.md).

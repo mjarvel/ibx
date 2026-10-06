@@ -33,3 +33,13 @@ Use C:\Users\Markus\.cargo\bin\cargo.exe +stable and target\ibx-spike, with
 CARGO_PROFILE_DEV_DEBUG=0, CARGO_PROFILE_TEST_DEBUG=0, CARGO_INCREMENTAL=0.
 Do not run live/ignored broker tests. See the wrapper docs/ibx_pause_checkpoint.md
 for remaining review, safe test filters and evidence/doc updates.
+## Resumed review completed
+
+After the requested usage refresh, lead review and the inspected offline matrix
+completed at source ba9cb81ec902e3822fd5be73e3db742aec4c6840. The pause evidence
+above is historical; current results and remaining production gates are recorded
+in local-patch.md. Follow-up fixes stop controlled Shutdown before subsequent
+commands and avoid assigning broker error 1100 to a local unsupported pool path.
+Captured protocol fixtures cover the actual controlled TLS login-start entry.
+The reviewed source is ready for the explicitly authorized fork dev push. No PR
+or production dependency adoption is part of this checkpoint.
