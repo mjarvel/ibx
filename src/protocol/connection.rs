@@ -33,6 +33,7 @@ pub enum Frame {
 /// Stream wrapper supporting both TLS and raw TCP.
 enum Stream {
     Tls(TlsStream<TcpStream>),
+    Rustls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
     Raw(TcpStream),
 }
 
@@ -40,6 +41,7 @@ impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Tls(s) => s.read(buf),
+            Self::Rustls(s) => s.read(buf),
             Self::Raw(s) => s.read(buf),
         }
     }
@@ -49,6 +51,7 @@ impl Write for Stream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
             Self::Tls(s) => s.write(buf),
+            Self::Rustls(s) => write_controlled_tls(s, buf),
             Self::Raw(s) => s.write(buf),
         }
     }
@@ -56,9 +59,72 @@ impl Write for Stream {
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Self::Tls(s) => s.flush(),
+            Self::Rustls(s) => s.flush(),
             Self::Raw(s) => s.flush(),
         }
     }
+}
+
+/// Login transport selection stays private. Controlled TLS uses fixed trust
+/// configuration prepared by the lifecycle boundary, without OS certificate URL
+/// retrieval. Legacy clients retain their native-tls transport unchanged.
+pub(crate) enum LoginTls {
+    Native(TlsStream<TcpStream>),
+    Controlled(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl LoginTls {
+    pub(crate) fn get_ref(&self) -> &TcpStream {
+        match self {
+            Self::Native(stream) => stream.get_ref(),
+            Self::Controlled(stream) => &stream.sock,
+        }
+    }
+
+    pub(crate) fn into_connection(self) -> io::Result<Connection> {
+        match self {
+            Self::Native(stream) => Connection::new(stream),
+            Self::Controlled(stream) => Connection::new_controlled_tls(stream),
+        }
+    }
+}
+
+impl Read for LoginTls {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Native(stream) => stream.read(buf),
+            Self::Controlled(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl Write for LoginTls {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Native(stream) => stream.write(buf),
+            Self::Controlled(stream) => write_controlled_tls(stream, buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Native(stream) => stream.flush(),
+            Self::Controlled(stream) => stream.flush(),
+        }
+    }
+}
+
+// rustls StreamOwned::write accepts plaintext then suppresses a complete_io
+// error. Flush immediately so the caller sees transport errors in this attempt.
+// An error can still follow partial effects: the caller must retire the socket,
+// never retry/replay this write on the same or a replacement controlled session.
+fn write_controlled_tls(
+    stream: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+    buf: &[u8],
+) -> io::Result<usize> {
+    let written = stream.write(buf)?;
+    stream.flush()?;
+    Ok(written)
 }
 
 /// Per-connection state for an auth or data socket.
@@ -89,6 +155,24 @@ impl Connection {
         stream.get_ref().set_read_timeout(Some(std::time::Duration::from_millis(1)))?;
         Ok(Self {
             stream: Stream::Tls(stream),
+            buf: Vec::with_capacity(RECV_BUF_SIZE),
+            seq: 0,
+            sign_key: Vec::new(),
+            sign_iv: Vec::new(),
+            read_key: Vec::new(),
+            read_iv: Vec::new(),
+        })
+    }
+
+    /// Carry an already-established controlled TLS stream into the engine. The
+    /// cancellation scope continues to own an abort clone of its raw socket.
+    /// Trust configuration and TLS handshake completion belong to the caller.
+    pub(crate) fn new_controlled_tls(
+        stream: Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>,
+    ) -> io::Result<Self> {
+        stream.sock.set_read_timeout(Some(std::time::Duration::from_millis(1)))?;
+        Ok(Self {
+            stream: Stream::Rustls(stream),
             buf: Vec::with_capacity(RECV_BUF_SIZE),
             seq: 0,
             sign_key: Vec::new(),
@@ -205,23 +289,9 @@ impl Connection {
             let earliest = match earliest {
                 Some(e) => e,
                 None => {
-                    // ibx#183 follow-up: dump the FULL payload (hex + ascii) of
-                    // anything we're about to discard. We need the whole frame
-                    // for upstream analysis (ib-agent#152 sister fixture), not
-                    // just a 64-byte prefix.
-                    let full_hex: String = self.buf
-                        .iter()
-                        .map(|b| format!("{:02x}", b))
-                        .collect();
-                    let head_n = self.buf.len().min(64);
-                    let head_ascii: String = self.buf[..head_n]
-                        .iter()
-                        .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
-                        .collect();
-                    log::warn!(
-                        "extract_frames: dropping {}B (no header). first {}B ascii={:?} full_hex={}",
-                        self.buf.len(), head_n, head_ascii, full_hex,
-                    );
+                    // Unknown input can include login tokens. Record only length;
+                    // never format raw payload bytes into a diagnostic log.
+                    log::warn!("extract_frames: dropping {}B (no header)", self.buf.len());
                     self.buf.clear();
                     break;
                 }
@@ -304,6 +374,7 @@ impl Connection {
     pub fn shutdown(&mut self) {
         let tcp = match &self.stream {
             Stream::Tls(s) => s.get_ref(),
+            Stream::Rustls(s) => &s.sock,
             Stream::Raw(s) => s,
         };
         let _ = tcp.shutdown(std::net::Shutdown::Both);
@@ -757,5 +828,41 @@ mod tests {
         let (_, valid) = conn.unsign(&signed);
         assert!(valid);
         assert_eq!(conn.read_iv, next_iv, "IV advanced after a match");
+    }
+
+    #[test]
+    fn controlled_tls_connection_preserves_framing_and_closes_raw_socket() {
+        // This fixture tests transport ownership/conversion, not a TLS login.
+        // Actual verified handshake/cancellation fixtures belong to lifecycle.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions().unwrap()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+        let tls = rustls::ClientConnection::new(std::sync::Arc::new(config),
+            rustls::pki_types::ServerName::try_from("localhost").unwrap().to_owned()).unwrap();
+        let login = LoginTls::Controlled(Box::new(rustls::StreamOwned::new(tls, socket)));
+        let local_address = login.get_ref().local_addr().unwrap();
+        let mut connection = login.into_connection().unwrap();
+        match &connection.stream {
+            Stream::Rustls(stream) => {
+                assert_eq!(stream.sock.local_addr().unwrap(), local_address);
+                assert_eq!(stream.sock.read_timeout().unwrap(),
+                    Some(std::time::Duration::from_millis(1)));
+            }
+            _ => panic!("controlled TLS must not switch to legacy native-tls"),
+        }
+        let frame = fix_build(&[(35, "0")], 1);
+        connection.seed_buffer(&frame);
+        assert!(matches!(connection.extract_frames().as_slice(),
+            [Frame::Fix(bytes)] if bytes == &frame));
+        connection.shutdown();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
+        let mut byte = [0];
+        assert_eq!(peer.read(&mut byte).unwrap(), 0);
     }
 }

@@ -1,5 +1,8 @@
 //! Gateway: orchestrates auth + data connections into a running HotLoop.
 
+#[path = "protocol/login_frames.rs"]
+mod login_frames;
+
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
@@ -23,6 +26,7 @@ use crate::engine::hot_loop::HotLoop;
 use crate::protocol::connection::Connection;
 use crate::protocol::fix::{self, fix_build, fix_parse, fix_read_deadline, SOH};
 use crate::protocol::fixcomp;
+use crate::lifecycle::{ConnectionControl, ControlledIo, LOGIN_BYTES, LOGIN_FRAME_BYTES};
 use crate::protocol::ns;
 use crate::types::ControlCommand;
 
@@ -85,7 +89,7 @@ fn has_complete_response_frame(buf: &[u8]) -> bool {
                 let soh_pos = tag9_pos + soh_off;
                 if let Ok(s) = std::str::from_utf8(&buf[tag9_pos + 2..soh_pos]) {
                     if let Ok(body_len) = s.parse::<usize>() {
-                        return soh_pos + 1 + body_len <= buf.len();
+                        return soh_pos.checked_add(1).and_then(|n| n.checked_add(body_len)).is_some_and(|n| n <= buf.len());
                     }
                 }
             }
@@ -96,7 +100,7 @@ fn has_complete_response_frame(buf: &[u8]) -> bool {
     while cursor + 12 <= buf.len() {
         if buf[cursor..].starts_with(b"8=FIXCOMP\x01") {
             if let Some(total_len) = fixcomp::fixcomp_length(&buf[cursor..]) {
-                return cursor + total_len <= buf.len();
+                return cursor.checked_add(total_len).is_some_and(|n| n <= buf.len());
             }
             return false;
         }
@@ -250,12 +254,7 @@ pub fn build_farm_encrypted_logon(
         0,
     );
 
-    log::info!(
-        "{} FIX 35=A pre-encrypt ({} bytes): {}",
-        farm_name,
-        inner.len(),
-        String::from_utf8_lossy(&inner).replace('\x01', "|"),
-    );
+    log::info!("{} FIX 35=A prepared ({} bytes)", farm_name, inner.len());
     let encrypted_raw = channel.encrypt(&inner);
     let b64_str = B64.encode(&encrypted_raw);
 
@@ -282,17 +281,24 @@ pub fn farm_logon_exchange(
     read_mac_key: &[u8],
     initial_read_iv: &[u8],
 ) -> io::Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    farm_logon_exchange_inner(stream, channel, session_token, username, password, read_mac_key, initial_read_iv, None)
+}
+fn farm_logon_exchange_inner(
+    stream: &mut TcpStream, channel: &mut SecureChannel, session_token: &BigUint,
+    username: &str, password: &str, read_mac_key: &[u8], initial_read_iv: &[u8],
+    control: Option<&ConnectionControl>,
+) -> io::Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     // Poll on a short read timeout and tolerate transient WouldBlock/TimedOut
     // returns until an overall deadline. A single slow response segment from a
     // high-latency regional gateway must not tear down the connection (ibx#237).
-    stream.set_read_timeout(Some(Duration::from_millis(FARM_LOGON_POLL_MS)))?;
+    set_login_read_timeout(stream, Some(Duration::from_millis(FARM_LOGON_POLL_MS)), control)?;
     let deadline = std::time::Instant::now() + Duration::from_secs_f64(TIMEOUT_FARM_LOGON);
     let mut buf = Vec::new();
     let mut read_iv = initial_read_iv.to_vec();
 
     for _msg_num in 0..20 {
         // Read until we have a complete frame
-        let msg = loop {
+        let msg = loop { check_control(control)?;
             if let Some((msg, consumed)) = try_frame_farm_msg(&buf) {
                 buf.drain(..consumed);
                 break msg;
@@ -319,7 +325,7 @@ pub fn farm_logon_exchange(
                     "farm connection closed during logon",
                 ));
             }
-            buf.extend_from_slice(&tmp[..n]);
+            if control.is_some() && buf.len().saturating_add(n) > LOGIN_BYTES { return Err(io::Error::new(io::ErrorKind::InvalidData, "farm login byte bound exceeded")); } buf.extend_from_slice(&tmp[..n]);
         };
 
         // FIX.4.1 message
@@ -370,12 +376,13 @@ pub fn farm_logon_exchange(
                     // ACK. Threading `buf` through keeps those trailing ACK bytes
                     // so the loop below re-frames them instead of stalling on a
                     // read for bytes already consumed (ibx#237).
-                    match do_soft_token(stream, session_token, &mut buf)? {
+                    let token_result = if control.is_some() { session::do_soft_token_bounded(&mut ControlledIo::new(&mut *stream, control), session_token, &mut buf, LOGIN_FRAME_BYTES, 8192) } else { do_soft_token(stream, session_token, &mut buf) };
+                    match token_result? {
                         session::SoftTokenOutcome::Passed => {}
                         session::SoftTokenOutcome::Unknown => {
                             log::warn!("Soft token rejected — falling back to SRP farm auth");
-                            stream.set_read_timeout(Some(Duration::from_millis(FARM_LOGON_POLL_MS)))?;
-                            session::do_srp_farm(stream, username, password, &mut buf)?;
+                            set_login_read_timeout(stream, Some(Duration::from_millis(FARM_LOGON_POLL_MS)), control)?;
+                            if control.is_some() { session::do_srp_farm_bounded(&mut ControlledIo::new(&mut *stream, control), username, password, &mut buf, LOGIN_FRAME_BYTES, 8192)?; } else { session::do_srp_farm(stream, username, password, &mut buf)?; }
                         }
                     }
                 }
@@ -394,7 +401,7 @@ pub fn farm_logon_exchange(
                 let text = fields.get(&58).map(|s| s.as_str()).unwrap_or("unknown");
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    format!("Farm logon rejected: {}", text),
+                    if control.is_some() { "controlled farm logon rejected".into() } else { format!("Farm logon rejected: {}", text) },
                 ));
             }
         } else if msg.starts_with(b"8=1\x01") {
@@ -428,7 +435,7 @@ fn try_frame_farm_msg(buf: &[u8]) -> Option<(Vec<u8>, usize)> {
     let val_start = tag9_pos + 3;
     let soh_pos = buf[val_start..].iter().position(|&b| b == SOH)? + val_start;
     let body_len: usize = std::str::from_utf8(&buf[val_start..soh_pos]).ok()?.parse().ok()?;
-    let total = soh_pos + 1 + body_len + 7; // +7 for "10=XXX\x01"
+    let total = soh_pos.checked_add(1)?.checked_add(body_len)?.checked_add(7)?; // +7 for "10=XXX\x01"
     if buf.len() < total {
         return None;
     }
@@ -556,25 +563,33 @@ pub fn connect_farm(
     encoded: &str,
     slot: u32,
 ) -> io::Result<Connection> {
+    connect_farm_inner(host, farm_id, username, password, paper, server_session_id, session_key, hw_info, encoded, slot, None)
+}
+fn connect_farm_inner(
+    host: &str, farm_id: &str, username: &str, password: &str, paper: bool,
+    server_session_id: &str, session_key: &BigUint, hw_info: &str, encoded: &str,
+    slot: u32, control: Option<&ConnectionControl>,
+) -> io::Result<Connection> {
     let port = misc_port();
     let farm_host = farm_host_override().unwrap_or_else(|| host.to_string());
     log::info!("Connecting to {} {}:{}", farm_id, farm_host, port);
-    let addr = format!("{}:{}", farm_host, port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "DNS resolution failed"))?;
-    let farm_tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(TIMEOUT_FARM_CONNECT))
-        .map_err(|e| io::Error::new(e.kind(), format!("{} TCP connect: {}", farm_id, e)))?;
+    let farm_tcp = if let Some(control) = control {
+        control.connect_tcp(&farm_host, port)?
+    } else {
+        let addr = format!("{}:{}", farm_host, port).to_socket_addrs()?.next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "DNS resolution failed"))?;
+        TcpStream::connect_timeout(&addr, Duration::from_secs(TIMEOUT_FARM_CONNECT))?
+    };
     farm_tcp.set_nodelay(true)?;
-    farm_tcp.set_read_timeout(Some(Duration::from_secs(TIMEOUT_FARM_CONNECT)))?;
+    set_login_read_timeout(&farm_tcp, Some(Duration::from_secs(TIMEOUT_FARM_CONNECT)), control)?;
 
     // Key exchange (raw TCP)
     let mut channel = SecureChannel::new();
     let dh_msg = channel.build_secure_connect(NS_VERSION, NS_VERSION);
-    let mut stream = farm_tcp;
+    let mut stream = ControlledIo::new(farm_tcp, control);
     stream.write_all(&dh_msg)?;
 
-    let (payload, _) = ns::ns_recv(&mut stream)?;
+    let (payload, _) = recv_ns(&mut stream, control)?;
     let text = String::from_utf8_lossy(&payload);
     let parts: Vec<&str> = text.split(';').collect();
     let msg_type: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -584,7 +599,7 @@ pub fn connect_farm(
             format!("{} DH: expected 533, got {}", farm_id, msg_type),
         ));
     }
-    channel.process_server_hello(&parts[2..])
+    process_controlled_hello(&mut channel, &parts[2..], control)
         .map_err(|e| io::Error::new(e.kind(), format!("{} {}", farm_id, e)))?;
     log::info!("{} key exchange complete", farm_id);
 
@@ -604,9 +619,9 @@ pub fn connect_farm(
     // Logon exchange: challenge → token auth → logon ACK
     let read_mac_key = channel.key_block().map(|kb| kb[84..104].to_vec()).unwrap_or_default();
     let initial_read_iv = channel.key_block().map(|kb| kb[48..64].to_vec()).unwrap_or_default();
-    let (read_iv, sign_iv, logon_remaining) = farm_logon_exchange(
-        &mut stream, &mut channel, session_key, username, password,
-        &read_mac_key, &initial_read_iv,
+    let (read_iv, sign_iv, logon_remaining) = farm_logon_exchange_inner(
+        &mut stream.stream, &mut channel, session_key, username, password,
+        &read_mac_key, &initial_read_iv, control,
     )?;
     log::info!("{} logon exchange complete, {} bytes remaining", farm_id, logon_remaining.len());
 
@@ -633,15 +648,15 @@ pub fn connect_farm(
     // Read routing response. Frame-based termination: poll with a short
     // timeout, break as soon as we have at least one complete FIXCOMP frame
     // buffered. The 5-s read timeout remains as the worst-case fallback.
-    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+    stream.stream.set_read_timeout(Some(Duration::from_millis(100)))?;
     let mut resp_buf = Vec::new();
     let routing_deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let mut tmp = [0u8; 8192];
-        match stream.read(&mut tmp) {
+        match stream.read_poll(&mut tmp) {
             Ok(0) => break,
             Ok(n) => {
-                resp_buf.extend_from_slice(&tmp[..n]);
+                if control.is_some() && resp_buf.len().saturating_add(n) > LOGIN_BYTES { return Err(io::Error::new(io::ErrorKind::InvalidData, "routing byte bound exceeded")); } resp_buf.extend_from_slice(&tmp[..n]);
                 if has_complete_response_frame(&resp_buf) { break; }
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock
@@ -656,7 +671,7 @@ pub fn connect_farm(
     log::info!("{} routing response: {} bytes", farm_id, resp_buf.len());
 
     // Create Connection (switches to non-blocking), inject routing bytes
-    let mut conn = Connection::new_raw(stream)?;
+    let mut conn = Connection::new_raw(stream.stream)?;
     conn.set_keys(sign_mac_key, final_sign_iv, read_mac_key, read_iv);
     conn.seq = 1; // routing request was seq=1; next send_fix will be seq=2
 
@@ -677,10 +692,10 @@ pub fn connect_farm(
                 if !valid {
                     return Err(signature_mismatch(farm_id));
                 }
-                let inner = fixcomp::fixcomp_decompress(&unsigned).unwrap_or_else(|e| {
+                let inner = if control.is_some() { fixcomp::fixcomp_decompress_limited(&unsigned, LOGIN_BYTES)? } else { fixcomp::fixcomp_decompress(&unsigned).unwrap_or_else(|e| {
                     log::warn!("{}: dropping malformed FIXCOMP frame: {}", farm_id, e);
                     Vec::new()
-                });
+                }) };
                 for m in &inner {
                     let parsed = fix_parse(m);
                     let mt = parsed.get(&35).map(|s| s.as_str()).unwrap_or("");
@@ -1081,7 +1096,7 @@ impl Gateway {
     /// (ibx#423).
     pub fn connect(config: &GatewayConfig) -> io::Result<(Self, Connection, Connection, Option<Connection>)> {
         loop {
-            match Self::connect_to_host(config, &config.host, 0) {
+            match Self::connect_to_host(config, &config.host, 0, None) {
                 Err(e) if session::login_error(&e).is_some_and(|l| l.kind.is_retryable()) => {
                     let delay = crate::engine::hot_loop::reconnect_backoff();
                     log::warn!("{}; login retried in {:?}", e, delay);
@@ -1092,11 +1107,35 @@ impl Gateway {
         }
     }
 
+    /// One caller-controlled paper login with no internal retry or DNS/hardware work.
+    /// Returns only after scoped farm workers have completed; failed attempts abort
+    /// every registered socket. Account/route evidence is required, not guessed.
+    pub fn connect_once(config: &GatewayConfig, control: &ConnectionControl) -> io::Result<(Self, Connection, Connection, Option<Connection>)> {
+        if !config.paper || config.accept_invalid_certs { return Err(io::Error::new(io::ErrorKind::Unsupported, "controlled login requires paper mode and certificate validation")); }
+        control.check()?;
+        control.begin_login()?;
+        if config.username.trim().is_empty() || config.username.len() > 256 || config.host.trim().is_empty() || config.host.len() > 253 || config.password.is_empty() || config.password.len() > 4096 {
+            control.cancel();
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "controlled login credentials exceed supported bounds"));
+        }
+        // Abort sockets on error or unwinding, but preserve the original error.
+        struct Attempt<'a> { control: &'a ConnectionControl, succeeded: bool }
+        impl Drop for Attempt<'_> {
+            fn drop(&mut self) { if !self.succeeded { self.control.cancel(); } }
+        }
+        let mut attempt = Attempt { control, succeeded: false };
+        let result = Self::connect_to_host(config, &config.host, 0, Some(control))?;
+        control.check()?;
+        attempt.succeeded = true;
+        Ok(result)
+    }
+
     /// Internal: connect to a specific host, with redirect depth tracking.
     fn connect_to_host(
         config: &GatewayConfig,
         host: &str,
         redirect_depth: u32,
+        control: Option<&ConnectionControl>,
     ) -> io::Result<(Self, Connection, Connection, Option<Connection>)> {
         if redirect_depth > 3 {
             return Err(io::Error::new(
@@ -1105,46 +1144,51 @@ impl Gateway {
             ));
         }
 
-        let hw_info = session::get_hw_info();
+        check_control(control)?; let hw_info = match control { Some(control) => control.hardware_info().to_string(), None => session::get_hw_info() };
         // Tag 6266 carries `{jdkVer}/{platform}/{locale}/{dist}`. The locale
         // segment must be a canonical Java `Locale.toString()` value (e.g.
         // `en_US`, `fr`, `ja_JP`); bare `en` is rejected as `invalid twsInfo`.
         // `IBX_LOCALE` overrides just the locale; `IBX_ENCODED` overrides
         // the whole string for full control.
-        let encoded = std::env::var("IBX_ENCODED").unwrap_or_else(|_| {
+        let encoded = if control.is_some() { IB_ENCODED.to_string() } else { std::env::var("IBX_ENCODED").unwrap_or_else(|_| {
             match std::env::var("IBX_LOCALE") {
                 Ok(loc) if !loc.is_empty() => format!("17.0.10.0.101/W/{}/G", loc),
                 _ => IB_ENCODED.to_string(),
             }
-        });
+        }) };
 
         // --- Phase 1: TLS + auth ---
         log::info!("Connecting to auth server {}:{}", host, AUTH_PORT);
-        let addr = format!("{}:{}", host, AUTH_PORT)
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "DNS resolution failed"))?;
-        let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(TIMEOUT_SSL_AUTH))?;
+        let tcp = if let Some(control) = control {
+            control.connect_tcp(host, AUTH_PORT)?
+        } else {
+            let addr = format!("{}:{}", host, AUTH_PORT).to_socket_addrs()?.next()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "DNS resolution failed"))?;
+            TcpStream::connect_timeout(&addr, Duration::from_secs(TIMEOUT_SSL_AUTH))?
+        };
+        let tls = if let Some(control) = control {
+            crate::protocol::connection::LoginTls::Controlled(control.connect_tls(host, tcp)?)
+        } else {
+            let connector = TlsConnector::builder()
+                .danger_accept_invalid_certs(config.accept_invalid_certs)
+                .build()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            crate::protocol::connection::LoginTls::Native(connector.connect(host, tcp)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?)
+        };
 
-        let connector = TlsConnector::builder()
-            .danger_accept_invalid_certs(config.accept_invalid_certs)
-            .build()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        let mut tls = connector
-            .connect(host, tcp)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-
+        let mut tls = ControlledIo::new(tls, control);
         // Key exchange
         let mut channel = SecureChannel::new();
         let dh_msg = channel.build_secure_connect(NS_VERSION, NS_VERSION);
         tls.write_all(&dh_msg)?;
 
-        let (payload, _) = ns::ns_recv(&mut tls)?;
+        let (payload, _) = recv_ns(&mut tls, control)?;
         let text = String::from_utf8_lossy(&payload);
         let parts: Vec<&str> = text.split(';').collect();
         let msg_type: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
         if msg_type == ns::NS_SECURE_ERROR || msg_type == ns::NS_ERROR_RESPONSE {
-            return Err(session::ns_error(msg_type, &parts[2..]));
+            return Err(controlled_ns_error(msg_type, &parts[2..], control));
         }
         if msg_type != ns::NS_SECURE_CONNECTION_START {
             return Err(io::Error::new(
@@ -1152,7 +1196,7 @@ impl Gateway {
                 format!("Expected 533, got {}", msg_type),
             ));
         }
-        channel.process_server_hello(&parts[2..])?;
+        process_controlled_hello(&mut channel, &parts[2..], control)?;
         log::info!("Auth key exchange complete");
 
         // Send CONNECT_REQUEST (encrypted)
@@ -1184,22 +1228,22 @@ impl Gateway {
         session::send_secure(&mut tls, &mut channel, connect_req.as_bytes())?;
 
         // Receive AUTH_START (may get a redirect instead for paper accounts)
-        let auth_start = match session::recv_auth_start(&mut tls, &mut channel) {
+        let auth_start = match recv_auth_start(&mut tls, &mut channel, control) {
             Ok(start) => start,
             Err(e) if e.to_string().starts_with("REDIRECT:") => {
                 let target = e.to_string().strip_prefix("REDIRECT:").unwrap().to_string();
                 // Extract host (strip port if present — auth always uses AUTH_PORT)
-                let redirect_host = target.split(':').next().unwrap_or(&target);
+                let redirect_host = if control.is_some() { controlled_redirect_host(&target)? } else { target.split(':').next().unwrap_or(&target) };
                 log::info!("Redirected to {}, reconnecting...", redirect_host);
                 drop(tls);
-                return Self::connect_to_host(config, redirect_host, redirect_depth + 1);
+                return Self::connect_to_host(config, redirect_host, redirect_depth + 1, control);
             }
             Err(e) => return Err(e),
         };
 
         // Authentication
-        log::info!("Starting auth for {}", config.username);
-        let session_key = do_srp(&mut tls, &config.username, &config.password)?;
+        log::info!("Starting authentication");
+        let session_key = if control.is_some() { session::do_srp_bounded(&mut tls, &config.username, &config.password, LOGIN_FRAME_BYTES, 8192)? } else { do_srp(&mut tls, &config.username, &config.password)? };
         log::info!("Auth complete");
 
         // Per-session second-factor approval gate (IBKey / seamless push).
@@ -1245,7 +1289,7 @@ impl Gateway {
             }
             // Short read timeout: the wait checks the code provider and the
             // deadline between reads (ibx#244).
-            tls.get_ref().set_read_timeout(Some(Duration::from_millis(FARM_LOGON_POLL_MS)))?;
+            set_login_read_timeout(tls.stream.get_ref(), Some(Duration::from_millis(FARM_LOGON_POLL_MS)), control)?;
             match session::do_ib_key_2fa(
                 &mut tls,
                 &token_sub_type,
@@ -1280,12 +1324,12 @@ impl Gateway {
         // could exhaust a fixed iteration budget before it arrived (ibx#196).
         // Retry within an overall deadline and ignore intervening messages,
         // mirroring the CCP-reconnect path.
-        tls.get_ref().set_read_timeout(Some(Duration::from_secs_f64(TIMEOUT_FIX_LOGON)))?;
+        set_login_read_timeout(tls.stream.get_ref(), Some(Duration::from_secs_f64(TIMEOUT_FIX_LOGON)), control)?;
         let fix_deadline = std::time::Instant::now()
             + std::time::Duration::from_secs_f64(TIMEOUT_FIX_LOGON * 2.0);
         let mut fix_ready = false;
         while std::time::Instant::now() < fix_deadline {
-            let (payload, _) = match ns::ns_recv(&mut tls) {
+            let (payload, _) = match recv_ns(&mut tls, control) {
                 Ok(r) => r,
                 Err(e)
                     if e.kind() == io::ErrorKind::WouldBlock
@@ -1310,13 +1354,13 @@ impl Gateway {
                 channel.decrypt(&ct)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
             } else if raw_type == ns::NS_SECURE_ERROR || raw_type == ns::NS_ERROR_RESPONSE {
-                return Err(session::ns_error(raw_type, &parts[2..]));
+                return Err(controlled_ns_error(raw_type, &parts[2..], control));
             } else if raw_type == ns::NS_REDIRECT {
                 let target = parts.get(2).unwrap_or(&"");
-                let redirect_host = target.split(':').next().unwrap_or(target);
+                let redirect_host = if control.is_some() { controlled_redirect_host(target)? } else { target.split(':').next().unwrap_or(target) };
                 log::info!("Post-auth redirect to {}, reconnecting...", redirect_host);
                 drop(tls);
-                return Self::connect_to_host(config, redirect_host, redirect_depth + 1);
+                return Self::connect_to_host(config, redirect_host, redirect_depth + 1, control);
             } else {
                 payload
             };
@@ -1334,11 +1378,11 @@ impl Gateway {
                 session::send_secure(&mut tls, &mut channel, newcomm.as_bytes())?;
                 log::info!("Port type change sent");
             } else if msg_type == ns::NS_FIX_START {
-                log::info!("Data start: {}", inner_text);
+                log::info!("Data start received");
                 fix_ready = true;
                 break;
             } else if msg_type == ns::NS_ERROR_RESPONSE || msg_type == ns::NS_SECURE_ERROR {
-                return Err(session::ns_error(msg_type, &inner_parts[2..]));
+                return Err(controlled_ns_error(msg_type, &inner_parts[2..], control));
             } else if msg_type == ns::NS_BACKUP_HOST {
                 log::info!("Backup host notice received (ignored)");
             } else {
@@ -1364,7 +1408,7 @@ impl Gateway {
         // Read FIX messages until we get the logon ACK (35=A) with session info.
         // Short poll timeout + overall deadline so a slow ACK segment from a
         // high-latency gateway is retried, not fatal (ibx#237).
-        tls.get_ref().set_read_timeout(Some(Duration::from_millis(FARM_LOGON_POLL_MS)))?;
+        set_login_read_timeout(tls.stream.get_ref(), Some(Duration::from_millis(FARM_LOGON_POLL_MS)), control)?;
         let ack_deadline = std::time::Instant::now() + Duration::from_secs_f64(TIMEOUT_FARM_LOGON);
         let mut account_id = String::new();
         let mut heartbeat_interval = CCP_HEARTBEAT;
@@ -1394,15 +1438,18 @@ impl Gateway {
         let mut mktdata_route = String::new();    // tag 6171
         let mut secdef_route  = String::new();    // tag 8008
 
+        let mut auth_carry = Vec::new();
         for _ in 0..5 {
-            let raw_response = fix_read_deadline(&mut tls, ack_deadline)?;
+            let raw_response = if control.is_some() {
+                login_frames::read_frame(&mut tls, &mut auth_carry, LOGIN_BYTES)?
+            } else { fix_read_deadline(&mut tls, ack_deadline)? };
             // The auth-logon ACK arrives as `8=FIXCOMP` with a DEFLATE-
             // compressed inner body containing the per-account routing tags
             // (6145/6171/8008) and other init data. Inflate before parsing.
             // (See ib-agent#128 + #129.)
             let mut response = raw_response.clone();
             if raw_response.starts_with(b"8=FIXCOMP\x01") {
-                let inflated_msgs = fixcomp::fixcomp_decompress(&raw_response)?;
+                let inflated_msgs = if control.is_some() { fixcomp::fixcomp_decompress_limited(&raw_response, LOGIN_BYTES)? } else { fixcomp::fixcomp_decompress(&raw_response)? };
                 let total: usize = inflated_msgs.iter().map(|m| m.len()).sum();
                 log::info!("Auth FIXCOMP envelope: {} bytes compressed → {} inner messages, ~{} inflated bytes",
                     raw_response.len(), inflated_msgs.len(), total);
@@ -1419,7 +1466,7 @@ impl Gateway {
             log::info!("Auth msg type={} ({} bytes raw / {} bytes parsed)",
                 msg_type, raw_response.len(), response.len());
             for tag in [6144u32, 6145, 6146, 6147, 6171, 6172, 8008, 8009, 6160, 6161] {
-                if let Some(v) = fields.get(&tag) {
+                if let Some(v) = fields.get(&tag).filter(|_| control.is_none()) {
                     log::info!("Auth msg type={} tag={}: {:?}", msg_type, tag, v);
                 }
             }
@@ -1429,7 +1476,7 @@ impl Gateway {
                     let reason = fields.get(&58).map(|s| s.as_str()).unwrap_or("unknown");
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
-                        format!("FIX Logon rejected: {}", reason),
+                        if control.is_some() { "controlled FIX logon rejected".into() } else { format!("FIX Logon rejected: {}", reason) },
                     ));
                 }
                 _ => {}
@@ -1556,7 +1603,7 @@ impl Gateway {
                 break;
             }
         }
-        tls.get_ref().set_read_timeout(None)?;
+        set_login_read_timeout(tls.stream.get_ref(), None, control)?;
 
         // Fall back to our auth session_id if server didn't provide one (Python does the same)
         if server_session_id.is_empty() {
@@ -1603,17 +1650,20 @@ impl Gateway {
         // until it FINs the socket at ~140 s. A 300 ms idle-gap is past any
         // intra-burst jitter (the burst is continuous) and well short of the
         // 10 s keep-alive trickle interval, so we exit promptly after burst-end.
-        tls.get_ref().set_read_timeout(Some(Duration::from_millis(300)))?;
-        let mut init_data: Vec<u8> = Vec::with_capacity(65536);
+        set_login_read_timeout(tls.stream.get_ref(), Some(Duration::from_millis(300)), control)?;
+        // Preserve every byte read beyond the logon ACK for init processing.
+        let mut init_data = auth_carry;
         let mut tmp_buf = vec![0u8; 65536];
         let read_start = std::time::Instant::now();
+        let mut last_init_read = read_start;
         loop {
-            match tls.read(&mut tmp_buf) {
+            match tls.read_poll(&mut tmp_buf) {
                 Ok(0) => break,
-                Ok(n) => init_data.extend_from_slice(&tmp_buf[..n]),
+                Ok(n) => { last_init_read = std::time::Instant::now(); if control.is_some() && init_data.len().saturating_add(n) > LOGIN_BYTES { return Err(io::Error::new(io::ErrorKind::InvalidData, "initialization byte bound exceeded")); } init_data.extend_from_slice(&tmp_buf[..n]); },
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock
                     || e.kind() == io::ErrorKind::TimedOut =>
                 {
+                    if control.is_some() && last_init_read.elapsed() < Duration::from_millis(300) { continue; }
                     // First 1-s idle gap = burst is done. Anything past
                     // this is the server's 10-s keep-alive trickle, which
                     // we don't want to drain (would push grace-window
@@ -1633,7 +1683,7 @@ impl Gateway {
         // in the inflated content. The scan reads a copy with that content
         // appended; `init_data` itself seeds the connection buffer below
         // unchanged (ibx#317).
-        let scan_data = init_scan_buffer(&init_data);
+        let scan_data = if control.is_some() { init_scan_buffer_limited(&init_data, LOGIN_BYTES)? } else { init_scan_buffer(&init_data) };
 
         // Scan init response for account ID and gateway-local init tags
         let init_str = String::from_utf8_lossy(&scan_data);
@@ -1645,7 +1695,7 @@ impl Gateway {
         // TEMP diagnostic (ib-agent#128 follow-up): log every part containing
         // "farm" or "hmds" so we can locate the routing tags.
         for part in init_str.split('\x01') {
-            if part.contains("farm") || part.contains("hmds") || part.contains("secdef") {
+            if control.is_none() && (part.contains("farm") || part.contains("hmds") || part.contains("secdef")) {
                 log::info!("Init scan: routing-shaped part = {:?}", part);
             }
         }
@@ -1693,6 +1743,7 @@ impl Gateway {
             }
         }
 
+        if control.is_some() && account_id.is_empty() { return Err(io::Error::new(io::ErrorKind::InvalidData, "controlled login lacks broker account identity")); }
         // Per ib-agent#134: CCP server FINs the connection ~12s after the
         // init-burst response if no application-level traffic arrives in the
         // grace window — heartbeats alone do not satisfy "client alive".
@@ -1780,10 +1831,10 @@ impl Gateway {
             ccp_seq
         );
 
-        tls.get_ref().set_read_timeout(None)?;
+        set_login_read_timeout(tls.stream.get_ref(), None, control)?;
 
         // Auth connection (non-blocking TLS for hot loop)
-        let mut ccp_conn = Connection::new(tls)?;
+        let mut ccp_conn = tls.stream.into_connection()?;
         ccp_conn.seq = ccp_seq;
         // CCP HMAC signing IV: derived by AES-CBC encrypting the logon message.
         // The logon was sent as plaintext over TLS, but the AES-CBC computation
@@ -1817,6 +1868,7 @@ impl Gateway {
         //   trading (6145):  "<host>/<farm>"            (port from tag 6146, default 4000)
         //   mktdata (6171):  "<host>/<farm>/<port>"
         //   secdef  (8008):  "<host>/<farm>/<port>"
+        if control.is_some() { validate_route(&trading_route)?; validate_route(&mktdata_route)?; }
         let (trading_host, trading_farm) = parse_farm_route(&trading_route)
             .unwrap_or_else(|| (host.to_string(), "usfarm".to_string()));
         let (mktdata_host, mktdata_farm) = parse_farm_route(&mktdata_route)
@@ -1845,18 +1897,18 @@ impl Gateway {
             let hw = &hw_info;
             let enc = &encoded;
             let trading_handle = scope.spawn(move || {
-                connect_farm(&trading_host, &trading_farm, username, password,
-                    paper, ssid, token, hw, enc, 18)
+                connect_farm_inner(&trading_host, &trading_farm, username, password,
+                    paper, ssid, token, hw, enc, 18, control)
             });
             let mktdata_handle = scope.spawn(move || {
-                connect_farm(&mktdata_host, &mktdata_farm, username, password,
-                    paper, ssid, token, hw, enc, 17)
+                connect_farm_inner(&mktdata_host, &mktdata_farm, username, password,
+                    paper, ssid, token, hw, enc, 17, control)
             });
             let trading = trading_handle.join().expect("trading farm thread panicked");
             let mktdata = mktdata_handle.join().expect("mktdata farm thread panicked");
             (trading, mktdata)
         });
-        let farm_conn = farm_conn?;
+        check_control(control)?; let farm_conn = farm_conn?;
         let hmds_conn = match hmds_conn {
             Ok(c) => { log::info!("Historical data farm connected"); Some(c) }
             Err(e) => { log::warn!("Historical data farm connection failed (non-fatal): {}", e); None }
@@ -2857,4 +2909,115 @@ mod account_config_tests {
         assert_eq!(mifid, "");
         assert!(parse_account_config("8=FIX.4.1\x0135=U\x016040=75\x01").is_none());
     }
+}
+
+fn check_control(control: Option<&ConnectionControl>) -> io::Result<()> {
+    match control { Some(control) => control.check(), None => Ok(()) }
+}
+fn recv_ns<S: Read>(stream: &mut S, control: Option<&ConnectionControl>) -> io::Result<(Vec<u8>,usize)> {
+    check_control(control)?;
+    match control { Some(_) => ns::ns_recv_limited(stream, LOGIN_FRAME_BYTES), None => ns::ns_recv(stream) }
+}
+fn recv_auth_start<S: Read>(stream: &mut S, channel: &mut SecureChannel, control: Option<&ConnectionControl>) -> io::Result<session::AuthStart> {
+    match control { Some(_) => session::recv_auth_start_limited(stream, channel, LOGIN_FRAME_BYTES), None => session::recv_auth_start(stream, channel) }
+}
+fn validate_route(route: &str) -> io::Result<()> {
+    if parse_farm_route(route).is_none() { return Err(io::Error::new(io::ErrorKind::InvalidData, "controlled login requires genuine farm routes")); }
+    if route.split('/').nth(2).is_some_and(|port| port.parse::<u16>().ok() != Some(misc_port())) {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "controlled login cannot ignore a nondefault farm route port"));
+    }
+    Ok(())
+}
+
+
+
+
+/// Reject unsupported redirected ports instead of silently connecting elsewhere.
+fn controlled_redirect_host(target: &str) -> io::Result<&str> {
+    let mut parts = target.split(':');
+    let host = parts.next().unwrap_or("");
+    if host.is_empty() || parts.next().is_some_and(|port| port.parse::<u16>().ok() != Some(AUTH_PORT)) || parts.next().is_some() {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "controlled redirect requires a host and the authentication port"));
+    }
+    Ok(host)
+}
+
+/// Bounded scan copy; malformed/truncated compressed frames never disappear.
+fn init_scan_buffer_limited(init_data: &[u8], max_bytes: usize) -> io::Result<Vec<u8>> {
+    if init_data.len() > max_bytes { return Err(io::Error::new(io::ErrorKind::InvalidData, "initialization scan byte bound exceeded")); }
+    let mut scan = init_data.to_vec();
+    let mut cursor = 0;
+    while cursor < init_data.len() {
+        if init_data[cursor..].starts_with(b"8=FIXCOMP\x01") {
+            let total = fixcomp::fixcomp_length(&init_data[cursor..]).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "incomplete initialization compressed frame"))?;
+            if total > init_data.len() - cursor { return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated initialization compressed frame")); }
+            let remaining = max_bytes - scan.len();
+            for inner in fixcomp::fixcomp_decompress_limited(&init_data[cursor..cursor + total], remaining)? {
+                if inner.len().saturating_add(1) > max_bytes - scan.len() { return Err(io::Error::new(io::ErrorKind::InvalidData, "inflated initialization byte bound exceeded")); }
+                scan.extend_from_slice(&inner);
+                scan.push(b'\x01');
+            }
+            cursor += total;
+        } else { cursor += 1; }
+    }
+    Ok(scan)
+}
+
+#[cfg(test)]
+mod controlled_gateway_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    fn control() -> ConnectionControl {
+        ConnectionControl::new(Duration::from_secs(1), BTreeMap::from([("offline.invalid".into(), vec!["127.0.0.1".parse().unwrap()])]), "offline-hardware".into()).unwrap()
+    }
+    fn config() -> GatewayConfig {
+        GatewayConfig { username: "offline".into(), password: Zeroizing::new("offline-password".into()), host: "unresolved.invalid".into(), paper: true, accept_invalid_certs: false, ib_key_timeout_secs: 1, ib_key_token_sub_type: String::new(), code_provider: None }
+    }
+    #[test]
+    fn controlled_login_preserves_original_failure_and_prevents_scope_reuse() {
+        let control = control();
+        assert_eq!(Gateway::connect_once(&config(), &control).err().unwrap().kind(), io::ErrorKind::Unsupported);
+        assert!(control.is_cancelled());
+        assert!(Gateway::connect_once(&config(), &control).is_err());
+        control.join_workers(Duration::from_secs(1)).unwrap();
+    }
+    #[test]
+    fn controlled_live_and_credentials_reject_before_tcp() {
+        let control = control();
+        let mut config = config(); config.paper = false;
+        assert_eq!(Gateway::connect_once(&config, &control).err().unwrap().kind(), io::ErrorKind::Unsupported);
+        config.paper = true; config.password.clear();
+        assert_eq!(Gateway::connect_once(&config, &control).err().unwrap().kind(), io::ErrorKind::InvalidInput);
+        control.join_workers(Duration::from_secs(1)).unwrap();
+    }
+    #[test]
+    fn controlled_redirect_and_initial_scan_fail_closed() {
+        assert_eq!(controlled_redirect_host("offline:4000").unwrap_err().kind(), io::ErrorKind::Unsupported);
+        assert_eq!(controlled_redirect_host("offline:4001:1").unwrap_err().kind(), io::ErrorKind::Unsupported);
+        assert_eq!(controlled_redirect_host("offline:4001").is_ok(), AUTH_PORT == 4001);
+        assert_eq!(controlled_redirect_host("offline").unwrap(), "offline");
+        assert_eq!(init_scan_buffer_limited(b"plain", 5).unwrap(), b"plain");
+        assert!(init_scan_buffer_limited(b"plain", 4).is_err());
+        assert!(init_scan_buffer_limited(b"8=FIXCOMP\x019=99999\x01", 64).is_err());
+    }
+}
+fn controlled_ns_error(msg_type: u32, fields: &[&str], control: Option<&ConnectionControl>) -> io::Error {
+    if control.is_some() { io::Error::new(io::ErrorKind::PermissionDenied, "controlled authentication refused by server") }
+    else { session::ns_error(msg_type, fields) }
+}
+/// Bound peer big integers and random input before the native DH decoder/math.
+/// The native DH group is fixed; these conservative limits admit its 128-byte
+/// public values while refusing frame-sized arbitrary operands.
+fn process_controlled_hello(channel: &mut SecureChannel, fields: &[&str], control: Option<&ConnectionControl>) -> io::Result<()> {
+    check_control(control)?;
+    if control.is_some() && (fields.first().is_none_or(|v| v.len() > 88) || fields.get(1).is_none_or(|v| v.len() > 1368)) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "controlled key exchange operand bound exceeded"));
+    }
+    channel.process_server_hello(fields)?;
+    check_control(control)
+}
+fn set_login_read_timeout(stream: &TcpStream, timeout: Option<Duration>, control: Option<&ConnectionControl>) -> io::Result<()> {
+    check_control(control)?;
+    let timeout = if control.is_some() { Some(timeout.unwrap_or(crate::lifecycle::CONTROLLED_IO_POLL).min(crate::lifecycle::CONTROLLED_IO_POLL)) } else { timeout };
+    stream.set_read_timeout(timeout)
 }

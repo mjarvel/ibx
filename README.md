@@ -26,6 +26,12 @@
 
 IBX connects directly to Interactive Brokers servers — without requiring the official Java Gateway. Built in Rust for ultra-low-latency, available as both a Rust library and a Python library via PyO3. Both expose an ibapi-compatible `EClient`/`Wrapper` API.
 
+## Local patch
+
+This local branch carries our bounded paper-login/lifecycle and opt-in strict
+history patch. See [the contract, limits and offline validation](docs/local-patch.md).
+Direct backend production adoption remains gated.
+
 ## Benchmarks
 
 ### Processing Latency (no network)
