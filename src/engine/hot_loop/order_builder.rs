@@ -57,6 +57,27 @@ pub(crate) fn drain_and_send_orders(
             global_cancel(conn, context, account_id, hb, shared);
             continue;
         }
+        // A new order under the id of one that was never sent (held with
+        // transmit off, now transmitted, ibx#509) is that order, on the
+        // contract its lookup found while it was held.
+        if !what_if && order_req.new_order_qty().is_some() {
+            for id in request_order_ids(&order_req) {
+                if let Some((held_on, ..)) = context.unsent.remove(&id)
+                    && let Some(instrument) = order_req.new_order_instrument_mut()
+                {
+                    *instrument = held_on;
+                }
+            }
+            // The orders transmitted together leave together (ibx#547):
+            // each waits until the contract of every one is known.
+            if let Some(unknown) = group_contracts_unknown(context, oid) {
+                for instrument in unknown {
+                    look_up_order_contract(context, conn, hb, instrument);
+                }
+                context.rth_parked.push(rewrap(order_req));
+                continue;
+            }
+        }
         // A request that depends on one waiting for its contract definition
         // waits behind it, so the orders go out in the order they were
         // placed, as the reference sends them: a child behind its parent, an
@@ -205,6 +226,15 @@ pub(crate) fn drain_and_send_orders(
         // (ibx#464; captured 23/09/2026): 10147 for an order it does not
         // know, 10148 with the state for one that is finished or has a
         // cancel pending.
+        // The cancel of an order refused with 387 before it was sent ends
+        // it as the reference does (ibx#542, paper 09/10/2026): orderStatus
+        // Cancelled with nothing filled, 202 "Order was discarded", then
+        // 161, the answer to a cancel of an order that cannot be cancelled.
+        // A second cancel finds it cancelled (10148).
+        // An order held with transmit off ends the same way (ibx#509).
+        if let OrderRequest::Cancel { order_id } = &order_req && end_unsent(context, shared, *order_id) {
+            continue;
+        }
         if let OrderRequest::Cancel { order_id } = &order_req {
             if let Some((code, message)) = cancel_refusal(context, *order_id) {
                 log::warn!("Cancel of order {} refused: {}", order_id, message);
@@ -245,6 +275,33 @@ pub(crate) fn drain_and_send_orders(
         // A new order goes out under a server id of the reference's order
         // id generator; its API order id is its key, sent in 6121.
         if !what_if {
+            // An order of an earlier session can be held under the id of
+            // this new order (ibx#538). Another client's goes back under
+            // its own server id: the reference keeps the orders of each
+            // client id apart, and the new order must not go out under
+            // that order's identity (the server refused it as a duplicate
+            // and the caller was told nothing). This client's own working
+            // order is the order with that id: a new order under its id is
+            // refused, and the order is left as it is.
+            let mut own = None;
+            for id in order_req.new_order_ids() {
+                match context.earlier_session_order(id) {
+                    Some(true) => own = Some(id),
+                    Some(false) => {
+                        if let Some(server) = context.release_recovered_key(id) {
+                            shared.orders.rekey_order(id, server);
+                            log::info!("Order id {} of this session: the order of another client held under it is now under {}", id, server);
+                        }
+                    }
+                    None => {}
+                }
+            }
+            if let Some(id) = own {
+                log::warn!("Order {} refused: an order of this client with that id is working", id);
+                let (code, message) = crate::client_core::DUPLICATE_ORDER_ID;
+                shared.orders.push_order_error(id, code, message.into());
+                continue;
+            }
             for id in order_req.new_order_ids() {
                 context.assign_server_id(id);
             }
@@ -1436,14 +1493,16 @@ pub(crate) fn drain_and_send_orders(
                         // Until the server reports again, the order has the
                         // stop price of the replace, as the reference's
                         // openOrder shows (ib-agent#195, ibx#491).
-                        if let crate::types::OrderKind::TrailingStopLimit { trail_stop_price, .. } = kind {
+                        if let crate::types::OrderKind::TrailingStopLimit { trail_stop_price, .. }
+                            | crate::types::OrderKind::TrailLit { trail_stop_price, .. } = kind {
                             if trail_stop_price > 0 { r.stop = trail_stop_price; }
                         }
                         Some(r.offset)
                     }
                     None => {
                         let computed = computed_trail_limit_offset(kind, orig.map(|o| o.side));
-                        if let (Some(offset), crate::types::OrderKind::TrailingStopLimit { lmt_price: Some(price), trail_stop_price, .. }) = (computed, kind) {
+                        if let (Some(offset), crate::types::OrderKind::TrailingStopLimit { lmt_price: Some(price), trail_stop_price, .. }
+                            | crate::types::OrderKind::TrailLit { price, trail_stop_price, .. }) = (computed, kind) {
                             context.trail_limit_reported.insert(order_id, crate::engine::context::TrailLimitReported {
                                 offset, limit: price, stop: trail_stop_price,
                             });
@@ -1639,7 +1698,8 @@ fn cancel_fields(context: &mut Context, account_id: &str, order_id: crate::types
 ///   an OCA group, and not a child whose parent goes in this cancel
 ///   (`trader.order.ay.c(List, bs, bE)@96-183`);
 /// - an order with a cancel or a replace pending is not sent: 161 to its
-///   client (`ay.a(pe, bs, bE, boolean)@176`); a finished one is left.
+///   client (`ay.a(pe, bs, bE, boolean)@176`); so is an ended order the
+///   book still holds ([`crate::engine::context::EndedOrder`], ibx#545).
 ///
 /// Captured 01/10/2026 (17:11:41, paper): 8 orders of earlier sessions,
 /// known from the logon replay, cancelled in one write, in the book's
@@ -1651,6 +1711,13 @@ fn global_cancel(
     hb: &mut HeartbeatState,
     shared: &Arc<SharedState>,
 ) {
+    // The orders that were never sent (held with transmit off, ibx#509)
+    // end as their own cancel ends them (paper 09/10/2026).
+    let mut unsent: Vec<OrderId> = context.unsent.keys().copied().collect();
+    unsent.sort_unstable();
+    for &id in &unsent {
+        end_unsent(context, shared, id);
+    }
     // The orders that wait (a what-if is not an order: it keeps waiting),
     // and those the reference kept pending.
     let parked = std::mem::take(&mut context.rth_parked);
@@ -1669,22 +1736,37 @@ fn global_cancel(
         api_cancelled(context, shared, &req);
     }
 
-    // The book, in its order.
+    // The book, in its order: the working orders, and the ended ones the
+    // reference still holds (ibx#545), but for those this cancel ended.
+    let kept = context.ended_orders(Instant::now());
     let table = book_table_size(context.book_peak);
-    let mut book: Vec<(OrderId, OrderId, crate::engine::context::BookEntry)> = context.book.iter()
+    let mut book: Vec<(OrderId, OrderId, crate::engine::context::BookEntry, bool)> = context.book.iter()
         .filter(|(id, _)| context.order(**id).is_some())
-        .map(|(&id, e)| (id, context.server_id(id), e.clone()))
+        .map(|(&id, e)| (id, context.server_id(id), e.clone(), false))
+        .chain(kept.into_iter().filter(|e| !unsent.contains(&e.order_id)).map(|e| (e.order_id, e.server_id, e.entry, true)))
         .collect();
-    book.sort_by_key(|(_, server, e)| (book_bucket(*server, table), e.seq));
-    book.sort_by_key(|(_, _, e)| e.parent != 0);
+    book.sort_by_key(|(_, server, e, _)| (book_bucket(*server, table), e.seq));
+    book.sort_by_key(|(_, _, e, _)| e.parent != 0);
 
     let mut groups: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut taken: std::collections::HashSet<OrderId> = std::collections::HashSet::new();
-    for (id, server, entry) in book {
+    for (id, server, entry, ended) in book {
         if !entry.oca_group.is_empty() && !groups.insert(entry.oca_group.clone()) {
             continue;
         }
         if entry.parent != 0 && taken.contains(&entry.parent) {
+            continue;
+        }
+        // An ended order cannot be cancelled: 161 to its client, after
+        // the callbacks of the orders this cancel ended. It does not
+        // stand for its children (`ay.c@141`, `pe.i4()`): paper
+        // 09/10/2026, a bracket cancelled 5 s before gave 161 for its
+        // parent and for the first of its two children.
+        if ended {
+            if entry.owner.is_none_or(|owner| owner == context.api_client_id) {
+                shared.orders.push_order_notice(id, 161, format!(
+                    "Cancel attempted when order is not in a cancellable state.  Order permId ={}", server));
+            }
             continue;
         }
         let Some(status) = context.order(id).map(|o| o.status) else { continue };
@@ -2082,7 +2164,9 @@ fn field<'a>(fields: &[(u32, &'a str)], tag: u32) -> Option<&'a str> {
 /// reference in no fixed order; they get one fixed place each here, as
 /// seen in captured frames where it could be.
 fn in_reference_order(fields: &mut [(u32, &str)]) {
-    let touched = touched_type(fields);
+    // TRAIL MIT and TRAIL LIT write their trigger there too (ibx#469,
+    // captured 28/09/2026).
+    let touched = touched_type(fields) || matches!(field(fields, 40), Some("TMIT" | "TLIT"));
     fields.sort_by_key(|&(tag, _)| rank_in_frame(tag, touched));
 }
 
@@ -2151,6 +2235,9 @@ pub(crate) fn reference_rank(tag: u32) -> u16 {
         // The price management flag, most often last of the attributes in
         // the reference's frames (captures of 28/09 and 01/10/2026).
         8339 => 95,
+        // The compete attributes of pegged to best (ibx#469).
+        8411 => 96,
+        8412 => 97,
         // Algo: its strategy fields, then the parameter group.
         849 => 100,
         847 => 101,
@@ -2264,6 +2351,14 @@ fn peg_bench_attrs(
     if stock_ref_price > 0 { tags.push((6580, format_price_ref(stock_ref_price).to_string())); }
     if new_order && !ref_exchange.is_empty() { tags.push((6942, condition_exchange(ref_exchange))); }
     tags
+}
+
+/// The compete attributes of a pegged-to-best order (ibx#469; captured
+/// 26/09/2026 and 28/09/2026): the minimum compete size and the offset
+/// against the best price. The client sets neither; the reference writes
+/// these two values itself.
+fn peg_best_attrs() -> Vec<(u32, String)> {
+    vec![(8411, "100".to_string()), (8412, "0.02".to_string())]
 }
 
 /// The replace message for a working order, in the reference's field order
@@ -2401,6 +2496,46 @@ fn modify_fields(
             before_account.push((99, p(stop_price)));
             stop_trigger = Some(p(stop_price));
             "3"
+        }
+        // TRAIL MIT and TRAIL LIT (ib-agent#197, captured 26/09/2026,
+        // 28/09/2026 and 07/10/2026): the trailing value in both fields, the trigger
+        // restated when the order has one, and for TRAIL LIT the limit
+        // price with the offset the server reported.
+        K::TrailMit { trail, percent, trail_stop_price } => {
+            before_account.push((99, p(trail)));
+            if trail_stop_price > 0 { touched_trigger = Some(p(trail_stop_price)); }
+            trail_unit = Some(if percent { "100" } else { "0" });
+            after_type.push((211, p(trail)));
+            "TMIT"
+        }
+        K::TrailLit { price, trail, percent, trail_stop_price } => {
+            before_account.push((44, p(price)));
+            before_account.push((99, p(trail)));
+            if trail_stop_price > 0 { touched_trigger = Some(p(trail_stop_price)); }
+            trail_offset = trail_limit_offset.map(p);
+            trail_unit = Some(if percent { "100" } else { "0" });
+            after_type.push((211, p(trail)));
+            "TLIT"
+        }
+        // Not captured: a pegged-to-best order was never accepted, and the
+        // retail price improvement one was cancelled at once. The prices
+        // are restated in the fields of the new order.
+        K::PegBest { price } => {
+            if price > 0 { before_account.push((44, p(price))); }
+            bench_attrs = peg_best_attrs();
+            "E2M"
+        }
+        K::Rpi { price, offset } => {
+            before_account.push((44, p(price)));
+            before_account.push((99, p(offset)));
+            after_type.push((211, p(offset)));
+            "RPI"
+        }
+        K::PassvRel { price, offset } => {
+            if price > 0 { before_account.push((44, p(price))); }
+            before_account.push((99, p(offset)));
+            after_type.push((211, p(offset)));
+            "PSVR"
         }
         // The starting price and the benchmark attributes, without the
         // reference contract and exchange (ib-agent#197, 26/09/2026).
@@ -2578,6 +2713,9 @@ fn pegged_type_refusal(
             let oid = req.order_id();
             log::warn!("Order {} refused: its order type is not in the list of this exchange", oid);
             shared.orders.push_order_error(oid, 387, crate::engine::outside_rth::UNSUPPORTED_ORDER_TYPE.to_string());
+            // Kept, unlisted, for its cancel (ibx#542).
+            let parent = req.new_order_side().and_then(|(_, a)| a).map_or(0, |a| a.parent_id);
+            context.unsent.insert(oid, (instrument, req.new_order_qty().unwrap_or(0), parent));
             Some(true)
         }
         Definition::Known(..) => None,
@@ -2757,6 +2895,98 @@ pub(crate) fn sweep_rth_lookups(context: &mut Context) {
     release_rth_parked(context);
 }
 
+/// The end of an order that was never sent, at its cancel (ibx#542,
+/// ibx#509): orderStatus Cancelled with nothing filled, 202 "Order was
+/// discarded", then 161. False when `order_id` is not such an order.
+fn end_unsent(context: &mut Context, shared: &Arc<SharedState>, order_id: OrderId) -> bool {
+    let Some((instrument, qty, parent_id)) = context.unsent.remove(&order_id) else { return false };
+    // The id it was given when it was placed, as the reference's permId.
+    let perm_id = match context.server_id(order_id) {
+        id if id != order_id => id,
+        _ => context.new_server_id(),
+    };
+    shared.orders.push_order_update(OrderUpdate {
+        order_id,
+        instrument,
+        status: OrderStatus::Cancelled,
+        filled_qty_fixed: 0,
+        remaining_qty_fixed: qty,
+        avg_fill_price: 0,
+        perm_id,
+        parent_id,
+        timestamp_ns: context.now_ns(),
+    });
+    shared.orders.push_order_notice(order_id, 202, "Order Canceled - reason:Order was discarded.".into());
+    shared.orders.push_order_notice(order_id, 161,
+        format!("Cancel attempted when order is not in a cancellable state.  Order permId ={}", perm_id));
+    context.finish_unsent(order_id, OrderStatus::Cancelled);
+    // The reference keeps it in its book for the session: a later global
+    // cancel answers 161 for it each time (ibx#545).
+    let entry = crate::engine::context::BookEntry { parent: parent_id, ..Default::default() };
+    context.keep_ended(order_id, perm_id, entry, None);
+    true
+}
+
+/// The new orders one placeOrder transmits together (ibx#547; the
+/// reference's messages of 26/09 and 09/10/2026: a held parent, its held
+/// children and the order that transmits them leave in one write, after
+/// the contract lookup of the transmitting order came back). They join
+/// the queue in their order; none goes out while a contract is unknown.
+pub(crate) fn take_order_group(context: &mut Context, requests: Vec<OrderRequest>) {
+    let group: Vec<(OrderId, crate::types::InstrumentId)> = requests.iter().filter_map(|r| {
+        let id = r.order_id();
+        let instrument = context.unsent.get(&id).map(|h| h.0).or_else(|| r.instrument())?;
+        Some((id, instrument))
+    }).collect();
+    if group.len() > 1 {
+        context.order_groups.push(group);
+    }
+    for request in requests {
+        context.pending_orders.push(request);
+    }
+}
+
+/// The instruments of the group of `order_id` whose contract is not known
+/// yet, `None` when the order is in no group or the group can go. A group
+/// that can go is forgotten.
+fn group_contracts_unknown(context: &mut Context, order_id: OrderId) -> Option<Vec<crate::types::InstrumentId>> {
+    let at = context.order_groups.iter().position(|g| g.iter().any(|(id, _)| *id == order_id))?;
+    let unknown: Vec<crate::types::InstrumentId> = context.order_groups[at].iter()
+        .map(|(_, i)| *i).filter(|i| context.market.con_id(*i) == Some(0)).collect();
+    if unknown.is_empty() {
+        // Gone once its last order is through.
+        let group = &mut context.order_groups[at];
+        group.retain(|(id, _)| *id != order_id);
+        if group.is_empty() {
+            context.order_groups.remove(at);
+        }
+        return None;
+    }
+    Some(unknown)
+}
+
+/// An order placed with transmit off (ibx#509; the bracket recordings of
+/// 26/09/2026 and the paper run of 09/10/2026): the reference sends
+/// nothing for it but the lookup of a contract given without a conId,
+/// lists it nowhere, and ends it at its cancel as an order that was never
+/// sent.
+pub(crate) fn hold_order(
+    conn: &mut Option<Connection>, context: &mut Context, hb: &mut HeartbeatState,
+    order_id: OrderId, instrument: crate::types::InstrumentId, qty: crate::types::Qty, parent_id: i64,
+) {
+    // Held again with new values: the order stays on the contract it has,
+    // which its lookup may have moved to another slot since.
+    let instrument = context.unsent.get(&order_id).map_or(instrument, |h| h.0);
+    context.unsent.insert(order_id, (instrument, qty, parent_id));
+    // Its permId is the next id when it is placed, not when it is sent
+    // (paper 09/10/2026: the held orders 37333 and 37334 took the two ids
+    // before the next order placed).
+    context.assign_server_id(order_id);
+    if context.market.con_id(instrument) == Some(0) && let Some(conn) = conn.as_mut() {
+        look_up_order_contract(context, conn, hb, instrument);
+    }
+}
+
 /// Request numbers of the contract lookups of orders (ibx#486): a range
 /// of their own, below the historical-data lookups (0xD000_0000).
 pub(crate) const ORDER_LOOKUP_FIRST_ID: u32 = 0xC000_0000;
@@ -2767,6 +2997,18 @@ const ORDER_LOOKUP_IDS: u32 = 0x1000_0000;
 /// `FixSecDefReqBySymbol` of contract details, `6088=Socket`, `100=BEST`).
 fn look_up_order_contract(context: &mut Context, conn: &mut Connection, hb: &mut HeartbeatState, instrument: crate::types::InstrumentId) {
     if context.order_lookups.iter().any(|(_, i)| *i == instrument) {
+        return;
+    }
+    // An order placed while the lookup of the same contract is on its way
+    // takes its answer (ibx#547; the bracket recordings of 26/09/2026:
+    // three orders placed at once, one lookup; placed three seconds apart
+    // on 09/10/2026, one lookup each).
+    let same = |m: &crate::engine::market_state::MarketState, a, b| {
+        m.symbol(a) == m.symbol(b) && m.order_routing(a) == m.order_routing(b)
+            && m.exchange(a) == m.exchange(b) && m.currency(a) == m.currency(b)
+    };
+    if let Some(&(in_flight, _)) = context.order_lookups.iter().find(|(_, other)| same(&context.market, *other, instrument)) {
+        context.order_lookups.push((in_flight, instrument));
         return;
     }
     let lookup_id = ORDER_LOOKUP_FIRST_ID + context.next_order_lookup % ORDER_LOOKUP_IDS;
@@ -2795,44 +3037,65 @@ fn look_up_order_contract(context: &mut Context, conn: &mut Connection, hb: &mut
 /// reply's records as any other reply.
 pub(crate) fn order_contract_reply(context: &mut Context, shared: &SharedState, req_id: &str, msg: &[u8]) -> bool {
     let Some(number) = crate::control::contracts::secdef_request_number(req_id) else { return false };
-    let Some(idx) = context.order_lookups.iter().position(|(id, _)| crate::types::ReqId::from(*id) == number) else { return false };
-    let (_, slot) = context.order_lookups.swap_remove(idx);
+    // The slots that wait for this answer: the one that asked, and those
+    // of the orders placed while it was on its way.
+    let slots: Vec<crate::types::InstrumentId> = context.order_lookups.iter()
+        .filter(|(id, _)| crate::types::ReqId::from(*id) == number).map(|(_, slot)| *slot).collect();
+    if slots.is_empty() { return false; }
+    context.order_lookups.retain(|(id, _)| crate::types::ReqId::from(*id) != number);
     let mut con_ids: Vec<i64> = crate::control::contracts::parse_secdef_records(msg).unwrap_or_default()
         .iter().map(|d| d.con_id).filter(|c| *c != 0).collect();
     con_ids.sort_unstable();
     con_ids.dedup();
-    if let [con_id] = con_ids[..] {
-        // The slot of that conId when it routes the same way: the
-        // waiting orders take it and this slot is freed; else this slot
-        // keeps the conId.
-        let same_route = |m: &crate::engine::market_state::MarketState, a, b| {
-            m.order_routing(a) == m.order_routing(b) && m.currency(a) == m.currency(b)
-        };
-        match context.market.instrument_by_con_id(con_id).filter(|&known| known != slot && same_route(&context.market, known, slot)) {
-            Some(known) => {
-                for req in context.rth_parked.iter_mut() {
-                    if let Some(i) = req.new_order_instrument_mut().filter(|i| **i == slot) {
-                        *i = known;
+    for slot in slots {
+        if let [con_id] = con_ids[..] {
+            // The slot of that conId when it routes the same way: the
+            // waiting orders take it and this slot is freed; else this slot
+            // keeps the conId.
+            let same_route = |m: &crate::engine::market_state::MarketState, a, b| {
+                m.order_routing(a) == m.order_routing(b) && m.currency(a) == m.currency(b)
+            };
+            match context.market.instrument_by_con_id(con_id).filter(|&known| known != slot && same_route(&context.market, known, slot)) {
+                Some(known) => {
+                    for req in context.rth_parked.iter_mut() {
+                        if let Some(i) = req.new_order_instrument_mut().filter(|i| **i == slot) {
+                            *i = known;
+                        }
                     }
+                    // An order held with transmit off takes it too (ibx#509).
+                    for held in context.unsent.values_mut().filter(|h| h.0 == slot) {
+                        held.0 = known;
+                    }
+                    for member in context.order_groups.iter_mut().flatten().filter(|m| m.1 == slot) {
+                        member.1 = known;
+                    }
+                    context.market.unregister(slot);
                 }
+                None => context.market.resolve_con_id(slot, con_id),
+            }
+            log::info!("Order contract lookup {}: conId {}", req_id, con_id);
+        } else {
+            log::warn!("Order contract lookup {}: {} contracts: error 200", req_id, con_ids.len());
+            let (refused, kept): (Vec<OrderRequest>, Vec<OrderRequest>) = std::mem::take(&mut context.rth_parked).into_iter()
+                .partition(|r| r.instrument() == Some(slot) && !matches!(r, OrderRequest::CancelAll { .. }));
+            context.rth_parked = kept;
+            for r in refused {
+                let oid = r.order_id();
+                shared.orders.push_order_error(oid, crate::engine::combo::NO_DEFINITION.0, crate::engine::combo::NO_DEFINITION.1.to_string());
+                if !matches!(r, OrderRequest::SubmitWhatIf { .. }) {
+                    context.api_pending.insert(oid, r);
+                }
+            }
+            // The orders of a group on another contract go on without it.
+            for group in context.order_groups.iter_mut() {
+                group.retain(|m| m.1 != slot);
+            }
+            // A held order keeps the slot: its contract is asked again when
+            // the order is transmitted, and refused then (ibx#509).
+            if !context.unsent.values().any(|h| h.0 == slot) {
                 context.market.unregister(slot);
             }
-            None => context.market.resolve_con_id(slot, con_id),
         }
-        log::info!("Order contract lookup {}: conId {}", req_id, con_id);
-    } else {
-        log::warn!("Order contract lookup {}: {} contracts: error 200", req_id, con_ids.len());
-        let (refused, kept): (Vec<OrderRequest>, Vec<OrderRequest>) = std::mem::take(&mut context.rth_parked).into_iter()
-            .partition(|r| r.instrument() == Some(slot) && !matches!(r, OrderRequest::CancelAll { .. }));
-        context.rth_parked = kept;
-        for r in refused {
-            let oid = r.order_id();
-            shared.orders.push_order_error(oid, crate::engine::combo::NO_DEFINITION.0, crate::engine::combo::NO_DEFINITION.1.to_string());
-            if !matches!(r, OrderRequest::SubmitWhatIf { .. }) {
-                context.api_pending.insert(oid, r);
-            }
-        }
-        context.market.unregister(slot);
     }
     release_rth_parked(context);
     true
@@ -2916,13 +3179,14 @@ fn release_rth_parked(context: &mut Context) {
     context.pending_orders.prepend(parked);
 }
 
-/// The limit offset of a TRAIL LIMIT set by its limit price, as the
-/// reference computes it when the order has none (ib-agent#195): the stop
-/// price minus the limit price for a sell, the limit price minus the stop
-/// price for a buy.
+/// The limit offset of a TRAIL LIMIT set by its limit price, or of a
+/// TRAIL LIT, as the reference computes it when the order has none
+/// (ib-agent#195): the stop price minus the limit price for a sell, the
+/// limit price minus the stop price for a buy.
 fn computed_trail_limit_offset(kind: crate::types::OrderKind, side: Option<Side>) -> Option<crate::types::Price> {
     match kind {
         crate::types::OrderKind::TrailingStopLimit { lmt_price: Some(price), trail_stop_price, .. }
+        | crate::types::OrderKind::TrailLit { price, trail_stop_price, .. }
             if trail_stop_price > 0 =>
         {
             Some(match side? {
@@ -3098,6 +3362,11 @@ fn send_order_ex(
         K::Rel { price, offset } => (b'R', price, offset),
         K::AdjustableStop { stop_price, .. } => (b'3', 0, stop_price),
         K::PegBench { starting_price, .. } => (crate::types::ORD_PEG_BENCH, starting_price, 0),
+        K::TrailMit { .. } => (crate::types::ORD_TRAIL_MIT, 0, 0),
+        K::TrailLit { price, .. } => (crate::types::ORD_TRAIL_LIT, price, 0),
+        K::PegBest { price } => (crate::types::ORD_PEG_BEST, price, 0),
+        K::Rpi { price, offset } => (crate::types::ORD_RPI, price, offset),
+        K::PassvRel { price, offset } => (crate::types::ORD_PASSV_REL, price, offset),
     };
     context.insert_order(crate::types::Order::new(
         order_id, instrument, side, qty, track_price, ord_type_byte, tif, track_stop,
@@ -3246,6 +3515,54 @@ fn send_order_ex(
             fields.push((40, "PB".to_string()));
             if starting_price > 0 { fields.push((99, format_price_ref(starting_price).to_string())); }
         }
+        // As the reference (ibx#469, captured 26/09/2026 and 28/09/2026):
+        // the trailing amount or percent in both fields, the trigger when
+        // set, no instruction; the unit is added when the order is sent
+        // unless it is a percent.
+        K::TrailMit { trail, percent, trail_stop_price } => {
+            let t = format_price_ref(trail).to_string();
+            fields.push((40, "TMIT".to_string()));
+            fields.push((99, t.clone()));
+            fields.push((211, t));
+            if percent { fields.push((6268, "100".to_string())); }
+            if trail_stop_price > 0 { fields.push((6117, format_price_ref(trail_stop_price).to_string())); }
+        }
+        K::TrailLit { price, trail, percent, trail_stop_price } => {
+            let t = format_price_ref(trail).to_string();
+            fields.push((40, "TLIT".to_string()));
+            fields.push((44, format_price_ref(price).to_string()));
+            fields.push((99, t.clone()));
+            fields.push((211, t));
+            if percent { fields.push((6268, "100".to_string())); }
+            if trail_stop_price > 0 { fields.push((6117, format_price_ref(trail_stop_price).to_string())); }
+        }
+        // Pegged to best: the limit price; its compete attributes follow
+        // the common block below.
+        K::PegBest { price } => {
+            fields.push((40, "E2M".to_string()));
+            if price > 0 { fields.push((44, format_price_ref(price).to_string())); }
+        }
+        // Retail price improvement (captured 07/10/2026): the limit price,
+        // the offset in both fields, 0.00 when unset.
+        K::Rpi { price, offset } => {
+            let o = format_price_ref(offset).to_string();
+            fields.push((40, "RPI".to_string()));
+            fields.push((44, format_price_ref(price).to_string()));
+            fields.push((99, o.clone()));
+            fields.push((211, o));
+        }
+        // Passive relative, from the reference's code (`jibtypes.R`,
+        // `jclient.pe.b(jibtypes.s,boolean)@41`, `pe.o@213-332`; not
+        // captured): its own order type, the limit price when set, the
+        // offset in both fields like the retail price improvement type,
+        // no instruction.
+        K::PassvRel { price, offset } => {
+            let o = format_price_ref(offset).to_string();
+            fields.push((40, "PSVR".to_string()));
+            if price > 0 { fields.push((44, format_price_ref(price).to_string())); }
+            fields.push((99, o.clone()));
+            fields.push((211, o));
+        }
     }
 
     fields.push((59, tif_str));
@@ -3274,6 +3591,7 @@ fn send_order_ex(
         fields.extend(peg_bench_attrs(stock_ref_price, ref_con_id, is_peg_decrease,
             pegged_change_amount, ref_change_amount, &attrs.reference_exchange, true));
     }
+    if matches!(kind, K::PegBest { .. }) { fields.extend(peg_best_attrs()); }
 
     push_bracket_key(&mut fields, context, order_id, attrs);
     // Extended attributes — same tag order as the historical SubmitLimitEx
@@ -4689,6 +5007,106 @@ mod tests {
             (9, OrderStatus::ApiCancelled, 0, 3 * crate::types::QTY_SCALE, 0));
     }
 
+    /// The 161 notices of one global cancel after `setup`, and the
+    /// context after it.
+    fn global_cancel_notices(setup: impl FnOnce(&mut Context)) -> (Vec<(i64, i64)>, Context) {
+        let mut context = Context::new();
+        context.order_ids.start_at(FIRST as i32);
+        context.market.register(265598);
+        context.api_client_id = 7;
+        setup(&mut context);
+        context.pending_orders.push(OrderRequest::GlobalCancel);
+        let shared = Arc::new(SharedState::new());
+        let (conn, mut peer) = crate::test_support::Peer::pair();
+        let mut conn = Some(conn);
+        drain_and_send_orders(&mut conn, &mut context, "DU1", &mut HeartbeatState::new(), false, &shared);
+        assert!(peer.messages().is_empty(), "nothing is sent for an ended order");
+        assert!(shared.orders.drain_order_errors().is_empty());
+        (shared.orders.drain_order_notices().into_iter().map(|n| (n.0, n.1)).collect(), context)
+    }
+
+    fn ended(parent: OrderId, oca_group: &str) -> crate::engine::context::BookEntry {
+        crate::engine::context::BookEntry { parent, oca_group: oca_group.to_string(), ..Default::default() }
+    }
+
+    // ibx#545, paper 09/10/2026: a global cancel answers 161 for a
+    // cancelled order the reference's book still holds (seen 6 and 7 s
+    // after the cancel, not 17 s after), with the order's permId.
+    #[test]
+    fn global_cancel_answers_161_for_an_order_cancelled_just_before() {
+        let (notices, mut context) = global_cancel_notices(|ctx| {
+            ctx.insert_order(Order::new(61, 0, Side::Buy, 1, 100, b'2', b'0', 0));
+            ctx.bind_server_id(61, 7061);
+            ctx.finish_order(61, OrderStatus::Cancelled);
+            // A filled order is not kept by this rule.
+            ctx.insert_order(Order::new(62, 0, Side::Buy, 1, 100, b'2', b'0', 0));
+            ctx.finish_order(62, OrderStatus::Filled);
+        });
+        assert_eq!(notices, [(61, 161)]);
+        let kept = context.ended_orders(Instant::now());
+        assert_eq!(kept.iter().map(|e| (e.order_id, e.server_id)).collect::<Vec<_>>(), [(61, 7061)]);
+        let until = kept[0].until.unwrap();
+        assert!(until <= Instant::now() + crate::engine::context::CANCELLED_ORDER_KEPT);
+        // Its time over, it is out of the book: nothing.
+        assert!(context.ended_orders(until).is_empty());
+        let (notices, _) = global_cancel_notices(|ctx| {
+            ctx.keep_ended(61, 7061, ended(0, ""), Some(Instant::now()));
+        });
+        assert!(notices.is_empty());
+    }
+
+    // ibx#545, the reference's run of 09/10/2026 (cases of ibx#509): a
+    // held order ended by the global cancel, then 161 for the ended
+    // orders of the book in the book's order, a child last. 37347 had
+    // been cancelled 7 s before; the three others were never sent and
+    // got 161 again at the next global cancel.
+    #[test]
+    fn global_cancel_answers_161_in_the_books_order() {
+        let setup = |ctx: &mut Context| {
+            ctx.keep_ended(37333, 1219931939, ended(0, ""), None);
+            ctx.keep_ended(37334, 1219931940, ended(37333, ""), None);
+            ctx.keep_ended(37342, 1219931948, ended(0, ""), None);
+            ctx.keep_ended(37347, 1219931953, ended(0, ""), Some(Instant::now() + std::time::Duration::from_secs(3)));
+        };
+        let (notices, mut context) = global_cancel_notices(|ctx| {
+            setup(ctx);
+            ctx.unsent.insert(37348, (0, crate::types::QTY_SCALE, 0));
+            ctx.bind_server_id(37348, 1219931954);
+        });
+        assert_eq!(notices, [(37348, 202), (37348, 161), (37333, 161), (37347, 161), (37342, 161), (37334, 161)]);
+        // The next one: the order that was never sent is still there.
+        context.ended.retain(|e| e.order_id != 37347);
+        let kept = context.ended.clone();
+        let (notices, _) = global_cancel_notices(|ctx| ctx.ended = kept);
+        assert_eq!(notices, [(37348, 161), (37333, 161), (37342, 161), (37334, 161)]);
+    }
+
+    // ibx#545, the reference's run of 09/10/2026 (cases of ibx#547): a
+    // bracket cancelled through its parent 5 s before. 161 for the parent
+    // and for the first child of the book; the other child is of the same
+    // OCA group. An ended parent does not stand for its children.
+    #[test]
+    fn global_cancel_answers_161_for_one_child_of_an_ended_bracket() {
+        let (notices, _) = global_cancel_notices(|ctx| {
+            let soon = Some(Instant::now() + std::time::Duration::from_secs(5));
+            ctx.keep_ended(39086, 771315648, ended(0, ""), None);
+            ctx.keep_ended(39092, 771315653, ended(0, ""), soon);
+            ctx.keep_ended(39093, 771315654, ended(39092, "771315653"), soon);
+            ctx.keep_ended(39094, 771315655, ended(39092, "771315653"), soon);
+        });
+        assert_eq!(notices, [(39086, 161), (39092, 161), (39094, 161)]);
+    }
+
+    // An ended order of another client gives nothing to this one.
+    #[test]
+    fn global_cancel_gives_no_161_for_an_ended_order_of_another_client() {
+        let (notices, _) = global_cancel_notices(|ctx| {
+            let entry = crate::engine::context::BookEntry { owner: Some(3), ..Default::default() };
+            ctx.keep_ended(71, 7071, entry, None);
+        });
+        assert!(notices.is_empty());
+    }
+
     // An order of another session kept under its API order id: its
     // cancel goes under the server's id, at the version the server gave
     // (`jfix.co.bp()@44`).
@@ -5140,6 +5558,143 @@ mod tests {
         }
     }
 
+    // ibx#469 (captured 26/09/2026, 28/09/2026 and 07/10/2026, SMART,
+    // account masked): TRAIL MIT by amount and by percent, TRAIL LIT, PEG
+    // BEST with the compete values the reference writes itself, and RPI
+    // with its offset unset and set. The values are compared field by
+    // field; none carries an instruction or a field of another type.
+    #[test]
+    fn trail_mit_trail_lit_peg_best_and_rpi_from_the_api_match_the_reference() {
+        const TAGS: [u32; 11] = [40, 44, 99, 211, 6117, 6268, 6115, 8411, 8412, 59, 100];
+        let order = |order_type: &str, action: &str| crate::api::types::Order {
+            action: action.into(), total_quantity: 1.0, order_type: order_type.into(), tif: "DAY".into(),
+            ..Default::default()
+        };
+        let cases = [
+            ("35=D|11=x|99=20.00|1=DU1|6122=c|6117=748.26|6115=0|6268=0|6121=1|6119=262|38=1|40=TMIT|211=20.00|55=SPY|167=STK|231=1.00|54=2|59=0|100=BEST|6210=BEST|6008=756733|6088=Socket|15=USD|6211=|6238=",
+             crate::api::types::Order { aux_price: 20.0, trail_stop_price: 748.26, ..order("TRAIL MIT", "SELL") }),
+            ("35=D|11=x|99=3.00|1=DU1|6122=c|6115=0|6268=100|6121=2|6119=262|38=1|40=TMIT|211=3.00|55=SPY|167=STK|231=1.00|54=2|59=0|100=BEST|6210=BEST|6008=756733|6088=Socket|15=USD|6211=|6238=",
+             crate::api::types::Order { trailing_percent: 3.0, ..order("TRAIL MIT", "SELL") }),
+            ("35=D|11=x|44=743.26|99=20.00|1=DU1|6122=c|8339=1|6117=748.26|6115=0|6268=0|6121=3|6119=262|38=1|40=TLIT|211=20.00|55=SPY|167=STK|231=1.00|54=2|59=0|100=BEST|6210=BEST|6008=756733|6088=Socket|15=USD|6211=|6238=",
+             crate::api::types::Order { lmt_price: 743.26, aux_price: 20.0, trail_stop_price: 748.26, ..order("TRAIL LIT", "SELL") }),
+            // By percent (captured 07/10/2026).
+            ("35=D|11=x|44=789.98|99=3.00|1=DU1|6010=fourleg|6115=0|6122=c|8339=1|6268=100|6117=794.98|6121=139|6119=198|38=1|40=TLIT|211=3.00|55=SPY|167=STK|231=1.00|54=2|59=0|100=BEST|6210=BEST|6008=756733|6088=Socket|15=USD|6211=|6238=",
+             crate::api::types::Order { lmt_price: 789.98, trailing_percent: 3.0, trail_stop_price: 794.98, ..order("TRAIL LIT", "SELL") }),
+            ("35=D|11=x|44=718.26|1=DU1|6122=c|8339=1|8411=100|8412=0.02|6121=7|6119=262|38=1|40=E2M|55=SPY|167=STK|231=1.00|54=1|59=0|100=BEST|6210=BEST|6008=756733|6088=Socket|15=USD|6211=|6238=",
+             crate::api::types::Order { lmt_price: 718.26, ..order("PEG BEST", "BUY") }),
+            ("35=D|11=x|44=198.90|99=0.00|1=DU1|6122=c|8339=1|6121=132|6119=198|38=1|40=RPI|211=0.00|55=IBM|167=STK|231=1.00|54=1|59=0|100=BEST|6210=BEST|6008=8314|6088=Socket|15=USD|6211=|6238=",
+             crate::api::types::Order { lmt_price: 198.9, ..order("RPI", "BUY") }),
+            ("35=D|11=x|44=198.90|99=0.01|1=DU1|6122=c|8339=1|6121=133|6119=198|38=1|40=RPI|211=0.01|55=IBM|167=STK|231=1.00|54=1|59=0|100=BEST|6210=BEST|6008=8314|6088=Socket|15=USD|6211=|6238=",
+             crate::api::types::Order { lmt_price: 198.9, aux_price: 0.01, ..order("RPI", "BUY") }),
+        ];
+        for (id, (reference, order)) in cases.into_iter().enumerate() {
+            crate::client_core::ClientCore::validate_order(&order).unwrap();
+            let ours = wire_tags(api_request(&order, 90 + id as OrderId));
+            let want = captured(reference, &TAGS);
+            assert_eq!(ours_as(&ours, &want), want, "{reference}");
+            for absent in TAGS.iter().chain(&[18]).filter(|t| !want.iter().any(|(w, _)| w == *t)) {
+                assert!(tag(&ours, *absent).is_none(), "field {absent} is not sent: {reference}");
+            }
+        }
+    }
+
+    // ibx#469 (captured 26/09/2026, SPY SELL 1, account masked): a TRAIL
+    // MIT replace restates its trigger although the server reported the
+    // same one, and a TRAIL LIT replace the offset the server reported
+    // (5, from a trigger of 751.35 and a limit of 746.35) next to the new
+    // limit price. The attributes are compared as a set.
+    #[test]
+    fn trail_mit_and_trail_lit_replaces_match_the_reference() {
+        use crate::types::{OrderAttrs, OrderKind as K};
+        const TMIT: &str = "35=G|11=7.1|41=7.0|99=20.10|1=|6117=751.35|6122=c|6010=fourleg|6268=0|38=1|54=2|40=TMIT|211=20.10|55=SPY|167=STK|6035=SPY|59=0|6008=265598|6088=Socket|6211=|6238=";
+        const TLIT: &str = "35=G|11=7.1|41=7.0|44=746.25|99=20.00|1=|6117=751.35|6122=c|6010=fourleg|6370=5.00|6268=0|38=1|54=2|40=TLIT|211=20.00|55=SPY|167=STK|6035=SPY|59=0|6008=265598|6088=Socket|6211=|6238=";
+        let replace = |kind, reported: bool| wire_tags_with(|ctx| {
+            ctx.set_symbol(0, "SPY".to_string());
+            ctx.insert_order(Order::new(7, 0, Side::Sell, 1, 0, b'2', b'0', 0));
+            ctx.reported_stop.insert(7, px(751.35));
+            if reported {
+                ctx.trail_limit_reported.insert(7, crate::engine::context::TrailLimitReported {
+                    offset: px(5.0), limit: px(746.35), stop: px(751.35),
+                });
+            }
+        }, OrderRequest::Modify {
+            new_order_id: 7, order_id: 7, qty: 1, kind, tif: b'0',
+            attrs: OrderAttrs { order_ref: "fourleg".into(), ..Default::default() },
+        }).into_iter().filter(|(t, _)| !crate::test_support::normalise::FRAMING.contains(t)).collect::<Vec<_>>();
+        let sorted = |mut v: Vec<(u32, String)>| { v.sort(); v };
+        let same = |ours: Vec<(u32, String)>, reference: &str| {
+            let (mine, theirs) = common_order(&ours, reference);
+            assert_eq!(mine, theirs, "{reference}");
+            let mut want = parse_frame(reference);
+            // The ids and the account of this test's session.
+            for (t, v) in want.iter_mut() {
+                if matches!(*t, 11 | 41 | 1) { *v = tag(&ours, *t).unwrap_or("").to_string(); }
+            }
+            assert_eq!(sorted(ours), sorted(want), "{reference}");
+        };
+        same(replace(K::TrailMit { trail: px(20.1), percent: false, trail_stop_price: px(751.35) }, false), TMIT);
+        let lit = K::TrailLit { price: px(746.25), trail: px(20.0), percent: false, trail_stop_price: px(751.35) };
+        same(replace(lit, true), TLIT);
+        // By percent (captured 07/10/2026): the percent, its unit, the
+        // offset and the trigger.
+        const TLIT_PCT: &str = "35=G|11=7.1|41=7.0|44=746.25|99=3.10|1=|6010=fourleg|6122=c|6370=5.00|6268=100|6117=751.35|38=1|54=2|40=TLIT|211=3.10|55=SPY|167=STK|6035=SPY|59=0|6008=265598|6088=Socket|6211=|6238=";
+        same(replace(K::TrailLit { price: px(746.25), trail: px(3.1), percent: true, trail_stop_price: px(751.35) }, true), TLIT_PCT);
+        // Before any report the offset is the trigger minus the new limit
+        // price of a sell, as for a TRAIL LIMIT.
+        assert_eq!(tag(&replace(lit, false), 6370), Some("5.10"));
+        // A percent keeps its unit, and no trigger is restated when the
+        // order has none (captured 28/09/2026).
+        let pct = replace(K::TrailMit { trail: px(3.1), percent: true, trail_stop_price: 0 }, false);
+        assert_eq!((tag(&pct, 99), tag(&pct, 211), tag(&pct, 6268), tag(&pct, 6117)),
+            (Some("3.10"), Some("3.10"), Some("100"), None));
+    }
+
+    // ibx#469: a passive relative order as the reference's code writes it
+    // (not captured): its own type, the limit price when set, the offset
+    // in both offset fields, 0.00 when unset, no instruction.
+    #[test]
+    fn passive_relative_from_the_api_follows_the_code_read() {
+        let order = |lmt_price: f64, aux_price: f64| crate::api::types::Order {
+            action: "BUY".into(), total_quantity: 1.0, order_type: "PASSV REL".into(), tif: "DAY".into(),
+            lmt_price, aux_price, ..Default::default()
+        };
+        let ours = wire_tags(api_request(&order(718.26, 0.5), 96));
+        assert_eq!((tag(&ours, 40), tag(&ours, 44), tag(&ours, 99), tag(&ours, 211), tag(&ours, 18)),
+            (Some("PSVR"), Some("718.26"), Some("0.50"), Some("0.50"), None));
+        let unset = wire_tags(api_request(&order(0.0, 0.0), 97));
+        assert_eq!((tag(&unset, 44), tag(&unset, 99), tag(&unset, 211)), (None, Some("0.00"), Some("0.00")));
+    }
+
+    // ibx#469: PEG BEST and RPI are checked against the order-type list
+    // of the contract on the order's exchange (captured 28/09/2026 and
+    // 07/10/2026: RPI refused with 387 on SPY, sent on IBM); TRAIL MIT and
+    // TRAIL LIT are not: every recorded exchange list has their keys but
+    // one, and the reference sent both types to that one too (07/10/2026).
+    #[test]
+    fn peg_best_and_rpi_are_checked_against_the_order_type_list() {
+        use crate::engine::outside_rth::{pegged_type_check, RthTypes};
+        use crate::types::{OrderAttrs, OrderKind as K};
+        let list = |tokens: &str| {
+            let tokens: Vec<String> = tokens.split(',').map(String::from).collect();
+            RthTypes::from_definition(&tokens, "USSTK", "STK", "USD")
+        };
+        let (spy, ibm) = (list("LMT/3,REL2MID/1,TRAILLIT/1,TRAILMIT/1"), list("LMT/3,REL2MID/1,RPI/1"));
+        let req = |kind| OrderRequest::SubmitEx {
+            order_id: 1, instrument: 0, side: Side::Buy, qty: 1, kind, tif: b'0', attrs: OrderAttrs::default(),
+        };
+        let allowed = |kind, types: &RthTypes| pegged_type_check(&req(kind)).map(|(_, check)| check(types));
+        let rpi = K::Rpi { price: P, offset: 0 };
+        assert_eq!((allowed(rpi, &spy), allowed(rpi, &ibm)), (Some(false), Some(true)));
+        // Passive relative: its key is in no recorded list.
+        let passive = K::PassvRel { price: P, offset: P / 2 };
+        assert_eq!((allowed(passive, &spy), allowed(passive, &ibm), allowed(passive, &list("LMT/3,PASSVREL/1"))),
+            (Some(false), Some(false), Some(true)));
+        let best = K::PegBest { price: P };
+        assert_eq!((allowed(best, &spy), allowed(best, &list("LMT/3"))), (Some(true), Some(false)));
+        assert!(pegged_type_check(&req(K::TrailMit { trail: P, percent: false, trail_stop_price: 0 })).is_none());
+        assert!(pegged_type_check(&req(K::TrailLit { price: P, trail: P, percent: false, trail_stop_price: 0 })).is_none());
+    }
+
     // ibx#467 (captured 28/09/2026 in the overnight session, SPY BUY 1 LMT
     // 600 SMART, account masked): OVERNIGHT and OVERNIGHT + DAY go out as
     // a DAY order; DAY with includeOvernight adds the overnight attribute.
@@ -5296,6 +5851,156 @@ mod tests {
         let (frames, errors) = run("SMART", &with_prot, mkt_prt(97));
         assert_eq!((frames.len(), tag(&frames[0], 40)), (1, Some("U")));
         assert!(errors.is_empty());
+    }
+
+    // ibx#542, paper 09/10/2026 (the reference and ibx on the same case):
+    // an order refused with 387 is kept, unlisted; its cancel gives
+    // orderStatus Cancelled, 202 "Order was discarded" and 161; a second
+    // cancel finds it cancelled.
+    #[test]
+    fn the_cancel_of_an_order_refused_with_387_ends_it() {
+        const LIST: &str = "DAY/3,LMT/3,MKT/1,STP/1";
+        let (client, mut server) = crate::protocol::connection::mem_pair();
+        let mut conn = Some(Connection::new_mem(client));
+        let shared = Arc::new(SharedState::new());
+        let mut context = Context::new();
+        context.market.register(265598);
+        context.set_symbol(0, "AAPL".to_string());
+        context.market.set_routing(0, "STK", "SMART");
+        context.pending_orders.push(OrderRequest::SubmitPegMkt { order_id: 94, instrument: 0, side: Side::Buy, qty: 1, price: 0, offset: px(0.05) });
+        let frames = drain_frames(&mut context, &shared, &mut conn, &mut server);
+        let id = tag(&frames[0], 320).unwrap().to_string();
+        assert!(rth_definition_reply(&mut context, &id, &definition_reply(&id, tag(&frames[0], 6004).unwrap(), LIST)));
+        assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty(), "nothing sent");
+        assert_eq!(shared.orders.drain_order_errors().iter().map(|e| e.1).collect::<Vec<_>>(), [387]);
+        assert!(shared.orders.drain_order_updates().is_empty(), "no status with the refusal");
+
+        context.pending_orders.push(OrderRequest::Cancel { order_id: 94 });
+        assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty(), "nothing sent");
+        let updates = shared.orders.drain_order_updates();
+        assert_eq!(updates.iter().map(|u| (u.order_id, u.status, u.filled_qty_fixed, u.remaining_qty_fixed)).collect::<Vec<_>>(),
+            [(94, OrderStatus::Cancelled, 0, crate::types::QTY_SCALE)]);
+        let notices = shared.orders.drain_order_notices();
+        assert_eq!(notices.iter().map(|n| (n.0, n.1)).collect::<Vec<_>>(), [(94, 202), (94, 161)]);
+        assert_eq!(notices[0].2, "Order Canceled - reason:Order was discarded.");
+        assert_eq!(notices[1].2, format!("Cancel attempted when order is not in a cancellable state.  Order permId ={}", updates[0].perm_id));
+        assert!(shared.orders.drain_order_errors().is_empty());
+
+        context.pending_orders.push(OrderRequest::Cancel { order_id: 94 });
+        drain_frames(&mut context, &shared, &mut conn, &mut server);
+        assert_eq!(shared.orders.drain_order_errors(),
+            [(94, 10148, "OrderId 94 that needs to be cancelled cannot be cancelled, state: Cancelled.".to_string())]);
+    }
+
+    // ibx#509, paper 09/10/2026: an order held with transmit off sends
+    // nothing; its cancel, or a global cancel, ends it as an order that was
+    // never sent (Cancelled, 202 "Order was discarded", 161), and a second
+    // cancel finds it cancelled; sent as a new order, it is held no more.
+    #[test]
+    fn an_order_held_with_transmit_off_ends_at_its_cancel() {
+        let (client, mut server) = crate::protocol::connection::mem_pair();
+        let mut conn = Some(Connection::new_mem(client));
+        let shared = Arc::new(SharedState::new());
+        let mut context = Context::new();
+        context.market.register(265598);
+        context.set_symbol(0, "AAPL".to_string());
+        context.market.set_routing(0, "STK", "SMART");
+        let mut hb = HeartbeatState::new();
+        let one = crate::types::QTY_SCALE;
+        for id in [40, 41, 42] {
+            hold_order(&mut conn, &mut context, &mut hb, id, 0, one, if id == 41 { 40 } else { 0 });
+        }
+        assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty(), "nothing sent");
+        assert!(shared.orders.drain_order_updates().is_empty() && shared.orders.drain_order_errors().is_empty());
+
+        // The cancel of a held child.
+        context.pending_orders.push(OrderRequest::Cancel { order_id: 41 });
+        assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty(), "nothing sent");
+        let updates = shared.orders.drain_order_updates();
+        assert_eq!(updates.iter().map(|u| (u.order_id, u.status, u.remaining_qty_fixed, u.parent_id)).collect::<Vec<_>>(),
+            [(41, OrderStatus::Cancelled, one, 40)]);
+        let notices = shared.orders.drain_order_notices();
+        assert_eq!(notices.iter().map(|n| (n.0, n.1)).collect::<Vec<_>>(), [(41, 202), (41, 161)]);
+        assert_eq!(notices[0].2, "Order Canceled - reason:Order was discarded.");
+        context.pending_orders.push(OrderRequest::Cancel { order_id: 41 });
+        drain_frames(&mut context, &shared, &mut conn, &mut server);
+        assert_eq!(shared.orders.drain_order_errors(),
+            [(41, 10148, "OrderId 41 that needs to be cancelled cannot be cancelled, state: Cancelled.".to_string())]);
+
+        // Sent as a new order: no longer an order that was never sent.
+        context.pending_orders.push(OrderRequest::SubmitLimit { order_id: 40, instrument: 0, side: Side::Buy, qty: 1, price: px(100.0) });
+        let frames = drain_frames(&mut context, &shared, &mut conn, &mut server);
+        assert_eq!(frames.iter().filter(|f| tag(f, 35) == Some("D")).count(), 1);
+        assert!(!context.unsent.contains_key(&40));
+
+        // A held order by symbol: its lookup goes out at once; the answer
+        // names a contract the engine has, the order takes that slot and
+        // goes out on it when it is transmitted.
+        let slot = context.market.try_register_unresolved().unwrap();
+        context.set_symbol(slot, "AAPL".to_string());
+        context.market.set_routing(slot, "STK", "SMART");
+        hold_order(&mut conn, &mut context, &mut hb, 43, slot, one, 0);
+        let frames = drain_frames(&mut context, &shared, &mut conn, &mut server);
+        let lookup = tag(&frames[0], 320).unwrap().to_string();
+        assert_eq!((frames.len(), tag(&frames[0], 35), tag(&frames[0], 55)), (1, Some("c"), Some("AAPL")));
+        let reply = format!("35=d|320={lookup}|322=*|323=4|55=AAPL|167=STK|6008=265598|");
+        assert!(order_contract_reply(&mut context, &shared, &lookup, reply.replace('|', "\x01").as_bytes()));
+        assert_eq!(context.unsent.get(&43).map(|h| h.0), Some(0), "the slot of the contract found");
+        // Held again with another quantity, under the slot it first had.
+        hold_order(&mut conn, &mut context, &mut hb, 43, slot, 2 * one, 0);
+        assert_eq!(context.unsent.get(&43), Some(&(0, 2 * one, 0)));
+        assert!(drain_frames(&mut context, &shared, &mut conn, &mut server).is_empty(), "no second lookup");
+        context.pending_orders.push(OrderRequest::SubmitLimit { order_id: 43, instrument: slot, side: Side::Buy, qty: 1, price: px(100.0) });
+        let frames = drain_frames(&mut context, &shared, &mut conn, &mut server);
+        let sent: Vec<_> = frames.iter().filter(|f| tag(f, 35) == Some("D")).collect();
+        assert_eq!((sent.len(), tag(sent[0], 6121), tag(sent[0], 6008)), (1, Some("43"), Some("265598")));
+
+        // The global cancel ends the held order left.
+        shared.orders.drain_order_updates();
+        shared.orders.drain_order_notices();
+        context.pending_orders.push(OrderRequest::GlobalCancel);
+        drain_frames(&mut context, &shared, &mut conn, &mut server);
+        let ended: Vec<_> = shared.orders.drain_order_updates().into_iter()
+            .filter(|u| u.order_id == 42).map(|u| u.status).collect();
+        assert_eq!(ended, [OrderStatus::Cancelled]);
+        let notices: Vec<_> = shared.orders.drain_order_notices().into_iter().filter(|n| n.0 == 42).map(|n| n.1).collect();
+        assert_eq!(notices, [202, 161]);
+    }
+
+    // ibx#547, the reference's messages of 26/09 and 09/10/2026: the
+    // orders one placeOrder transmits leave together, after the contract
+    // of each is known; orders placed while the lookup of their contract
+    // is on its way share it.
+    #[test]
+    fn the_orders_of_a_group_leave_together_after_one_lookup() {
+        let (client, mut server) = crate::protocol::connection::mem_pair();
+        let mut conn = Some(Connection::new_mem(client));
+        let shared = Arc::new(SharedState::new());
+        let mut context = Context::new();
+        context.market.register(265598);
+        context.set_symbol(0, "AAPL".to_string());
+        context.market.set_routing(0, "STK", "SMART");
+        let by_symbol = |context: &mut Context| {
+            let slot = context.market.try_register_unresolved().unwrap();
+            context.set_symbol(slot, "AAPL".to_string());
+            context.market.set_routing(slot, "STK", "SMART");
+            slot
+        };
+        // The parent on a contract that is known, two children by symbol.
+        let (a, b) = (by_symbol(&mut context), by_symbol(&mut context));
+        let limit = |order_id, instrument| OrderRequest::SubmitLimit { order_id, instrument, side: Side::Buy, qty: 1, price: px(100.0) };
+        take_order_group(&mut context, vec![limit(50, 0), limit(51, a), limit(52, b)]);
+        let frames = drain_frames(&mut context, &shared, &mut conn, &mut server);
+        assert_eq!(frames.iter().map(|f| tag(f, 35).unwrap().to_string()).collect::<Vec<_>>(), ["c"],
+            "one lookup, and the parent waits for it too");
+        let lookup = tag(&frames[0], 320).unwrap().to_string();
+        let reply = format!("35=d|320={lookup}|322=*|323=4|55=AAPL|167=STK|6008=265598|");
+        assert!(order_contract_reply(&mut context, &shared, &lookup, reply.replace('|', "").as_bytes()));
+        let frames = drain_frames(&mut context, &shared, &mut conn, &mut server);
+        let sent: Vec<_> = frames.iter().filter(|f| tag(f, 35) == Some("D")).map(|f| tag(f, 6121).unwrap().to_string()).collect();
+        assert_eq!(sent, ["50", "51", "52"]);
+        assert!(frames.iter().filter(|f| tag(f, 35) == Some("D")).all(|f| tag(f, 6008) == Some("265598")));
+        assert!(context.order_groups.is_empty() && context.order_lookups.is_empty());
     }
 
     // ibx#263: all-or-none is refused with 10257 and nothing is sent when
@@ -5986,7 +6691,7 @@ mod tests {
 
     /// The API order a captured gateway order frame was placed from, read
     /// back from the frame; None for a type or contract ibx does not
-    /// place (PEG BEST, TRAIL MIT, TRAIL LIT, combos).
+    /// place (combos).
     fn api_order_of_frame(f: &[(u32, String)]) -> Option<crate::api::types::Order> {
         use crate::api::types::{Order as ApiOrder, TagValue};
         let get = |tag: u32| f.iter().find(|(t, _)| *t == tag).map(|(_, v)| v.as_str());
@@ -5999,6 +6704,7 @@ mod tests {
             ("J", _) => "MIT", ("LT", _) => "LIT", ("SP", _) => "STP PRT", ("TSL", _) => "TRAIL LIMIT",
             ("MIDPX", _) => "MIDPRICE", ("SMKT", _) => "SNAP MKT", ("SMID", _) => "SNAP MID",
             ("SREL", _) => "SNAP PRI", ("PB", _) => "PEG BENCH",
+            ("TMIT", _) => "TRAIL MIT", ("TLIT", _) => "TRAIL LIT", ("E2M", _) => "PEG BEST", ("RPI", _) => "RPI",
             ("P", "a") => "TRAIL", ("P", "R") => "REL", ("P", "M") => "PEG MID", ("P", "P") => "PEG MKT",
             _ => return None,
         };
@@ -6028,10 +6734,17 @@ mod tests {
             "LMT" | "LOC" | "MIDPRICE" => o.lmt_price = num(44).unwrap_or(0.0),
             "STP" | "MIT" | "STP PRT" => o.aux_price = num(99)?,
             "STP LMT" | "LIT" => { o.lmt_price = num(44)?; o.aux_price = num(99)?; }
-            "TRAIL" => {
+            "TRAIL" | "TRAIL MIT" => {
                 if get(6268) == Some("100") { o.trailing_percent = num(99)?; } else { o.aux_price = num(99)?; }
                 if let Some(v) = num(6117) { o.trail_stop_price = v; }
             }
+            "TRAIL LIT" => {
+                o.lmt_price = num(44)?;
+                o.aux_price = num(99)?;
+                if let Some(v) = num(6117) { o.trail_stop_price = v; }
+            }
+            "PEG BEST" => o.lmt_price = num(44).unwrap_or(0.0),
+            "RPI" => { o.lmt_price = num(44)?; o.aux_price = num(99).unwrap_or(0.0); }
             "TRAIL LIMIT" => {
                 o.aux_price = num(99)?;
                 match num(44) { Some(v) => o.lmt_price = v, None => o.lmt_price_offset = num(6370)? }
@@ -6147,7 +6860,7 @@ mod tests {
                     }
                 }
             }, req);
-            let trailing = matches!(get(&captured, 40).as_deref(), Some("TSL"))
+            let trailing = matches!(get(&captured, 40).as_deref(), Some("TSL" | "TMIT" | "TLIT"))
                 || get(&captured, 18).is_some_and(|v| v.starts_with('a'));
             for t in PRICE_TAGS {
                 if replace && trailing && t == 6117 { continue; }
@@ -6158,7 +6871,7 @@ mod tests {
             checked += 1;
         }
         println!("{checked} frames checked, skipped: {skipped:?}");
-        assert!(skipped.iter().all(|s| ["E2M", "TMIT", "TLIT"].iter().any(|t| s.starts_with(t)) || s.ends_with("BAG")), "{skipped:?}");
+        assert!(skipped.iter().all(|s| s.ends_with("BAG")), "{skipped:?}");
         assert!(checked >= 210, "{checked}");
     }
 

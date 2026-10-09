@@ -1,5 +1,11 @@
 # Our fork workflow
 
+> Historical record of the 2026-10-06 source and branch arrangement.
+> Current development uses main; main-upstream is the pristine mirror.
+> Shared Git rules and [the centralized ibx changelog](https://github.com/mjarvel/rust-library1/blob/main/docs/ibx-changelog.md)
+> govern current branch roles, checkpoints, contributions and later validation.
+> Earlier main/dev commands below must not be used for the migrated fork.
+
 Original project (upstream): https://github.com/deepentropy/ibx
 Our GitHub fork (origin): https://github.com/mjarvel/ibx
 Existing local clone: G:\repos\ibx

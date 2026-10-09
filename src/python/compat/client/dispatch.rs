@@ -94,8 +94,8 @@ impl EClient {
 
     /// Position rows of a running req_positions (ibx#477).
     pub(crate) fn dispatch_positions(&self, py: Python<'_>, shared: &Arc<SharedState>) -> PyResult<()> {
-        let Some(batch) = self.core.prepare_positions(shared) else { return Ok(()) };
         let account = self.account();
+        let Some(batch) = self.core.prepare_positions(shared, &account) else { return Ok(()) };
         for pi in &batch.rows {
             let ac = self.core.position_contract(pi.con_id, shared);
             let c_py = Py::new(py, Contract::from_api(py, &ac)?)?.into_any();
@@ -259,6 +259,8 @@ impl EClient {
             // The order id the reference shows for the order.
             let shown = shared.orders.api_order_id(fill.order_id);
             api_exec.order_id = shown;
+            // The contract in full, on the exchange of the execution (ibx#543).
+            let api_contract = self.core.execution_contract(shared, fill.order_id, api_contract, &api_exec.exchange);
             // A combo's report shows the combo or the leg (ibx#470).
             let mut api_contract = api_contract;
             crate::client_core::ClientCore::apply_combo_exec(&fill_exec, &mut api_contract, &mut api_exec);
@@ -305,6 +307,7 @@ impl EClient {
             // 30/09/2026 on a stock and a combo fill).
             let mut view = self.core.order_view(fill.order_id, shared, status);
             crate::client_core::ClientCore::report_client(&mut view, &fill_exec);
+            crate::client_core::ClientCore::report_filled(&mut view, cum_qty);
             let client_id = match &view {
                 Some(view) => {
                     self.send_open_order(py, shown, view)?;
@@ -337,7 +340,7 @@ impl EClient {
             let order_id = exec.order_id;
             self.core.apply_fill_exec(&mut exec, &fill_exec, order_id);
             // An execution of another client's order: nothing for this one.
-            if fill_exec.other_client {
+            if fill_exec.other_client || fill_exec.replayed {
                 self.core.push_silent_execution(contract, exec, fill_exec.time_secs);
                 continue;
             }
@@ -386,6 +389,14 @@ impl EClient {
         // reference: no error, no status; the order status that answers the
         // engine's status request sets the state (ibx#252).
         shared.orders.drain_cancel_rejects();
+
+        // The working orders the logon replay listed are followed by the
+        // end of the list, as the Rust client (ibx#487).
+        if shared.orders.take_login_orders_end()
+            && !self.core.open_orders_listing(shared, crate::client_core::OpenOrdersRequest::Open).is_empty()
+        {
+            self.wrapper.call_method0(py, "open_order_end")?;
+        }
 
         for request in released {
             if let Err(e) = self.answer_open_orders(py, shared, request) {
@@ -485,6 +496,9 @@ impl EClient {
                 self.cancel_mkt_data(py, req_id)?;
             }
         }
+        // Paper: the requests still without data after their wait (10197,
+        // ibx#444).
+        self.md_notices(py, self.core.take_md_no_data(std::time::Instant::now()))?;
 
         // Drain historical ticks -> the official tick objects (ibx#432),
         // before the tick-by-tick ticks: the past ticks of a tick-by-tick
@@ -638,6 +652,7 @@ impl EClient {
                 self.core.peek_what_if(wi.order_id)
             };
             let (contract_py, order_py) = if let Some((mut contract, mut order)) = tracked {
+                let placed_exchange = contract.exchange.clone();
                 // A preview placed without a conId shows the contract
                 // looked up (ibx#486).
                 if contract.con_id == 0 && wi.state.con_id != 0 && !contract.sec_type.eq_ignore_ascii_case("BAG") {
@@ -645,6 +660,7 @@ impl EClient {
                 }
                 // The order as the reference shows it (its unset values); a
                 // combo shows its combo (ibx#470).
+                crate::client_core::preview_view(&mut contract, &mut order, &placed_exchange, shared);
                 crate::client_core::reported_unset_values(&mut order);
                 crate::client_core::ClientCore::apply_combo_view(wi.order_id, &mut contract, &mut order, shared);
                 let c = Contract::from_api(py, &contract)?;
@@ -891,8 +907,8 @@ impl EClient {
         // Account updates (ibx#475): values, portfolio rows each followed by
         // the account time, the time after the batch, and for the first image
         // the end, once per subscription.
-        if let Some(batch) = self.core.prepare_account_updates(shared) {
-            let account_name = self.account();
+        let account_name = self.account();
+        if let Some(batch) = self.core.prepare_account_updates(shared, &account_name) {
             for field in &batch.fields {
                 call_wrapper!(self.wrapper, py, "update_account_value", (field.key.as_str(), field.value.as_str(), field.currency.as_str(), account_name.as_str()));
             }

@@ -302,6 +302,11 @@ pub const ORD_PEG_MKT: u8 = 6;   // FIX "P" + ExecInst "P" — Pegged to Market
 pub const ORD_PEG_MID: u8 = 7;   // FIX "P" + ExecInst "M" — Pegged to Midpoint
 pub const ORD_PEG_BENCH: u8 = 8; // FIX "PB" — Pegged to Benchmark
 pub const ORD_WHAT_IF: u8 = 9;   // Not a real OrdType — marker for what-if orders
+pub const ORD_TRAIL_MIT: u8 = 10; // FIX "TMIT" — Trailing Market if Touched
+pub const ORD_TRAIL_LIT: u8 = 11; // FIX "TLIT" — Trailing Limit if Touched
+pub const ORD_PEG_BEST: u8 = 12;  // FIX "E2M" — Pegged to Best
+pub const ORD_RPI: u8 = 13;       // FIX "RPI" — Retail Price Improvement
+pub const ORD_PASSV_REL: u8 = 14; // FIX "PSVR" — Passive Relative
 
 /// Convert an `ord_type` discriminant to the FIX tag 40 string.
 /// Single-char types (ASCII >= 32) are stored as-is; multi-char types use constants above.
@@ -314,6 +319,11 @@ pub fn ord_type_fix_str(t: u8) -> &'static str {
         ORD_SNAP_PRI => "SREL",
         ORD_PEG_MKT | ORD_PEG_MID => "P",
         ORD_PEG_BENCH => "PB",
+        ORD_TRAIL_MIT => "TMIT",
+        ORD_TRAIL_LIT => "TLIT",
+        ORD_PEG_BEST => "E2M",
+        ORD_RPI => "RPI",
+        ORD_PASSV_REL => "PSVR",
         b'1' => "1", b'2' => "2", b'3' => "3", b'4' => "4", b'5' => "5",
         b'B' => "B", b'E' => "E", b'J' => "J", b'K' => "K",
         b'P' => "P", b'R' => "R", b'U' => "U",
@@ -786,6 +796,24 @@ pub enum OrderKind {
         pegged_change_amount: Price,
         ref_change_amount: Price,
     },
+    /// Trailing market if touched (ibx#469): `trail` is the trailing
+    /// amount, or the percent in the price fixed point (1% = PRICE_SCALE)
+    /// when `percent`; `trail_stop_price` the optional initial trigger
+    /// (0 = not set).
+    TrailMit { trail: Price, percent: bool, trail_stop_price: Price },
+    /// Trailing limit if touched (ibx#469): the limit price, the trailing
+    /// amount (or percent, as for `TrailMit`) and the trigger price.
+    TrailLit { price: Price, trail: Price, percent: bool, trail_stop_price: Price },
+    /// Pegged to best (ibx#469): `price` is the limit price, 0 = unset.
+    PegBest { price: Price },
+    /// Retail price improvement (ibx#469): the limit price and the offset
+    /// (the API auxPrice, 0 when unset) in both offset fields.
+    Rpi { price: Price, offset: Price },
+    /// Passive relative (ibx#469): the limit price (0 = unset) and the
+    /// offset (the API auxPrice, 0 when unset) in both offset fields. Read
+    /// from the reference's code, not captured: no contract of the test
+    /// account lists the type.
+    PassvRel { price: Price, offset: Price },
     /// Adjustable stop, same fields as `OrderRequest::SubmitAdjustableStop`.
     /// On this path it also carries parent, OCA and tif, so it can be a
     /// bracket child (ibx#240).
@@ -827,6 +855,10 @@ impl OrderKind {
             OrderKind::SnapMkt { offset }
             | OrderKind::SnapMid { offset } | OrderKind::SnapPri { offset } => [0, offset],
             OrderKind::PegBench { starting_price, .. } => [0, starting_price],
+            OrderKind::TrailMit { trail, percent, .. } => [0, if percent { 0 } else { trail }],
+            OrderKind::TrailLit { price, trail, percent, .. } => [price, if percent { 0 } else { trail }],
+            OrderKind::PegBest { price } => [price, 0],
+            OrderKind::Rpi { price, offset } | OrderKind::PassvRel { price, offset } => [price, offset],
         }
     }
 }
@@ -2035,6 +2067,16 @@ pub enum ControlCommand {
     UpdateParam { key: String, value: String },
     /// Submit an order from external caller (bridge mode).
     Order(OrderRequest),
+    /// The new orders one placeOrder transmits together (ibx#547): a held
+    /// parent and its children with the order that transmits them. The
+    /// engine sends them in this order in one write, once the contract of
+    /// each is known.
+    OrderGroup(Vec<OrderRequest>),
+    /// An order placed with transmit off (ibx#509): nothing is sent for
+    /// it but the lookup of a contract given without a conId; the engine
+    /// keeps it, unlisted, for its cancel. The client sends it as a new
+    /// order when its group is transmitted.
+    HoldOrder { order_id: OrderId, instrument: InstrumentId, qty: Qty, parent_id: i64 },
     /// Register an instrument from external caller (bridge mode).
     RegisterInstrument { con_id: i64, symbol: String, sec_type: String, exchange: String, reply_tx: Option<crossbeam_channel::Sender<Result<InstrumentId, String>>> },
     /// A slot of its own for the contract of an order given without a
@@ -2090,6 +2132,9 @@ pub enum ControlCommand {
         currency: String,
         filters: SecDefFilters,
     },
+    /// Look up the conId of a display group update (ibx#424): one that is
+    /// not a contract gets error 473; a contract gives no answer.
+    DisplayGroupLookup { req_id: ReqId, con_id: i64 },
     /// Cancel a head timestamp request.
     CancelHeadTimestamp { req_id: ReqId },
     /// Search for matching symbols via auth connection.
@@ -2280,6 +2325,9 @@ pub struct PositionInfo {
     pub market_value: Price,     // position mark * PRICE_SCALE
     pub unrealized_pnl: Price,   // * PRICE_SCALE
     pub realized_pnl: Price,     // * PRICE_SCALE
+    /// The place of its first portfolio row among the contracts' (from 1; 0
+    /// before any): updatePortfolio rows go in this order (ibx#487).
+    pub portfolio_seq: u64,
 }
 
 /// Per-position midnight seed from 6040=143 P&L subscription.

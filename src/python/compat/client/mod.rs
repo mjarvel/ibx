@@ -14,7 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crossbeam_channel::{Receiver, SendError, Sender, TrySendError};
+use crate::engine::park::ControlSender;
+use crossbeam_channel::{Receiver, SendError, TrySendError};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
@@ -22,7 +23,6 @@ use crate::bridge::{Event, SharedState};
 use crate::client_core::ClientCore;
 use crate::gateway::{Gateway, GatewayConfig};
 use crate::types::*;
-use super::contract::{Contract, Order};
 
 /// ibapi-compatible EClient class.
 /// Wraps the internal engine and dispatches events to an EWrapper subclass.
@@ -49,7 +49,7 @@ pub struct EClient {
     /// Set by connect(), cleared by disconnect().
     pub(crate) shared: Mutex<Option<Arc<SharedState>>>,
     /// Set by connect(), cleared by disconnect().
-    pub(crate) control_tx: Mutex<Option<Sender<ControlCommand>>>,
+    pub(crate) control_tx: Mutex<Option<ControlSender>>,
     pub(crate) _thread: Mutex<Option<thread::JoinHandle<()>>>,
     /// Set by connect(), cleared by disconnect().
     pub(crate) account_id: Mutex<Option<String>>,
@@ -134,6 +134,11 @@ impl EClient {
     /// owns its own state, sockets, and engine thread, and ``connect()`` does
     /// not serialize across instances. If you pin engines via ``core_id``, give
     /// each a distinct value. See ibx#203 / ibx#207.
+    ///
+    /// An engine pinned with ``core_id`` polls without pause and keeps that
+    /// core busy; without it the engine thread rests while there is nothing
+    /// to do and is woken by the first byte received or the first request
+    /// (ibx#530).
     #[pyo3(signature = (host="cdc1.ibllc.com".to_string(), port=0, client_id=0, username="".to_string(), password="".to_string(), paper=true, core_id=None, ib_key_timeout_secs=None, ib_key_token_sub_type=None, code_provider=None))]
     fn connect(
         &self,
@@ -199,6 +204,10 @@ impl EClient {
         let _ = port; // unused but kept for ibapi signature compat
         // The clientId of this client's executions (ibx#474).
         self.core.client_id.store(client_id as i64, Ordering::Relaxed);
+        // The highest order id of this client id's earlier sessions (ibx#518).
+        if let Some(account) = self.account_id.lock().unwrap().as_deref() {
+            self.core.keep_order_ids(account);
+        }
         // The client id every new order carries (ibx#466).
         if let Some(shared) = self.shared.lock().unwrap().as_ref() {
             shared.reference.set_api_client_id(client_id as i64);
@@ -210,7 +219,9 @@ impl EClient {
         self.wrapper.call_method1(py, "managed_accounts", (self.managed_accounts_text().as_str(),))?;
         // nextValidId once the orders of the logon are known, as the
         // reference sends it (ibx#466).
-        let next_id = match self.shared.lock().unwrap().clone() {
+        // The lock is let go before the wait (see `req_completed_orders`).
+        let shared = self.shared.lock().unwrap().clone();
+        let next_id = match shared {
             Some(shared) => py.detach(|| {
                 ClientCore::wait_order_replay(&shared);
                 self.core.next_valid_id(&shared)
@@ -243,6 +254,7 @@ impl EClient {
         *self.event_rx.lock().unwrap() = None;
         *self.account_id.lock().unwrap() = None;
         *self.connection_time.lock().unwrap() = None;
+        self.core.stop_keeping_order_ids();
         self.core.reset();
         Ok(())
     }
@@ -321,7 +333,7 @@ impl EClient {
     }
 
     /// Clone the control channel sender, or return "Not connected".
-    pub(crate) fn tx(&self) -> PyResult<Sender<ControlCommand>> {
+    pub(crate) fn tx(&self) -> PyResult<ControlSender> {
         self.control_tx.lock().unwrap().clone()
             .ok_or_else(|| PyRuntimeError::new_err("Not connected"))
     }
@@ -344,26 +356,6 @@ impl EClient {
             Some(shared) => shared.reference.managed_accounts_text(&self.account()),
             None => self.account(),
         }
-    }
-
-    /// Find instrument ID for a contract, registering if needed. A known
-    /// contract is a lookup; a registration waits for the engine with the
-    /// interpreter lock released (ibx#271).
-    pub(crate) fn find_or_register_instrument(&self, py: Python<'_>, contract: &Contract) -> PyResult<u32> {
-        self.find_or_register_con_id(py, contract.con_id, contract)
-    }
-
-    /// `find_or_register_instrument` under another conId: a smart combo
-    /// goes out on its currency's smart combo conId (ibx#470).
-    pub(crate) fn find_or_register_con_id(&self, py: Python<'_>, con_id: i64, contract: &Contract) -> PyResult<u32> {
-        let tx = self.tx()?;
-        if let Some(&id) = self.core.con_id_to_instrument.lock().unwrap().get(&con_id) {
-            return Ok(id);
-        }
-        py.detach(|| self.core.find_or_register_instrument(
-            &tx,
-            con_id, &contract.symbol, &contract.exchange, &contract.sec_type,
-        )).map_err(|e| PyRuntimeError::new_err(e))
     }
 }
 
@@ -388,7 +380,7 @@ fn python_code_provider(callable: Py<PyAny>) -> crate::auth::session::CodeProvid
 /// with the lock released, so a slow engine stalls only this caller, not
 /// every Python thread (ibx#271). Hold no mutex guard across this call.
 #[inline]
-pub(crate) fn send_cmd(py: Python<'_>, tx: &Sender<ControlCommand>, cmd: ControlCommand) -> PyResult<()> {
+pub(crate) fn send_cmd(py: Python<'_>, tx: &ControlSender, cmd: ControlCommand) -> PyResult<()> {
     match tx.try_send(cmd) {
         Ok(()) => Ok(()),
         Err(TrySendError::Full(cmd)) => py.detach(|| tx.send(cmd)).map_err(engine_stopped),

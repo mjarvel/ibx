@@ -29,7 +29,7 @@ impl EClient {
         };
         let (event_tx, event_rx) = crossbeam_channel::bounded(256);
         *self.shared.lock().unwrap() = Some(shared);
-        *self.control_tx.lock().unwrap() = Some(tx);
+        *self.control_tx.lock().unwrap() = Some(tx.into());
         *self.event_rx.lock().unwrap() = Some(event_rx);
         *self.account_id.lock().unwrap() = Some(account_id);
         // Store event_tx so _test_push_disconnect_event can use it.
@@ -293,6 +293,25 @@ impl EClient {
             }
         }
         Ok(None)
+    }
+
+    /// The conditions of the first order sent since the last call, as the
+    /// engine got them (ibx#541, test-only); None when no order was sent.
+    /// The queued commands are taken.
+    #[doc(hidden)]
+    fn _test_take_order_conditions(&self) -> PyResult<Option<Vec<String>>> {
+        let rx = self._test_control_rx.lock().unwrap().clone()
+            .ok_or_else(|| PyRuntimeError::new_err("No test command channel"))?;
+        let mut found = None;
+        while let Ok(cmd) = rx.try_recv() {
+            if let ControlCommand::Order(req) = cmd
+                && found.is_none()
+                && let Some((_, attrs)) = req.new_order_side()
+            {
+                found = Some(attrs.map(|a| a.conditions.iter().map(|c| format!("{c:?}")).collect()).unwrap_or_default());
+            }
+        }
+        Ok(found)
     }
 
     /// Set the combo openOrder shows for an order, as the engine does when
@@ -660,6 +679,16 @@ impl EClient {
                 }
             }
         });
+        Ok(())
+    }
+
+    /// Set the API news sources of the logon: the subscribed codes and
+    /// the listed ones without a subscription (ibx#443, test-only).
+    #[doc(hidden)]
+    fn _test_set_news_sources(&self, subscribed: Vec<String>, unsubscribed: Vec<String>) -> PyResult<()> {
+        let shared = self.shared_state()?;
+        shared.reference.set_news_sources(subscribed);
+        shared.reference.set_news_sources_unsubscribed(unsubscribed);
         Ok(())
     }
 

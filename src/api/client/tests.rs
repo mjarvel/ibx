@@ -727,19 +727,136 @@ fn place_order_empty_tif_stays_plain() {
         ControlCommand::Order(OrderRequest::SubmitStop { .. })));
 }
 
-// ── ibx#226: transmit=false must be rejected, not silently ignored ──
+// ── ibx#509: an order with transmit off is held, and sent with its tree ──
 
+/// The order ids of the new orders in `rx`, in the order sent, and the
+/// ids of the held ones.
+fn sent_and_held(rx: &crossbeam_channel::Receiver<ControlCommand>) -> (Vec<i64>, Vec<i64>) {
+    let (mut sent, mut held) = (Vec::new(), Vec::new());
+    while let Ok(cmd) = rx.try_recv() {
+        match cmd {
+            ControlCommand::Order(req) => sent.push(req.order_id()),
+            ControlCommand::OrderGroup(group) => sent.extend(group.iter().map(|req| req.order_id())),
+            ControlCommand::HoldOrder { order_id, .. } => held.push(order_id),
+            _ => {}
+        }
+    }
+    (sent, held)
+}
+
+fn limit(action: &str, price: f64, transmit: bool, parent_id: i64) -> Order {
+    Order {
+        action: action.into(), total_quantity: 1.0, order_type: "LMT".into(), lmt_price: price,
+        transmit, parent_id, ..Default::default()
+    }
+}
+
+// The bracket recordings of 26/09/2026: parent and take-profit with
+// transmit off send nothing and answer nothing; the stop with transmit on
+// sends the three, in the order they were placed.
 #[test]
-fn place_order_transmit_false_is_rejected() {
+fn a_bracket_with_transmit_off_is_sent_together() {
     let (client, rx, shared) = test_client();
     shared.market.set_instrument_count(1);
-    let order = Order {
-        action: "BUY".into(), total_quantity: 1.0, order_type: "LMT".into(),
-        lmt_price: 100.0, transmit: false, ..Default::default()
+    client.place_order(3, &spy(), &limit("BUY", 100.0, false, 0)).unwrap();
+    client.place_order(4, &spy(), &limit("SELL", 400.0, false, 3)).unwrap();
+    assert_eq!(sent_and_held(&rx), (vec![], vec![3, 4]));
+    assert!(shared.orders.drain_order_errors().is_empty());
+    assert!(client.core.collect_open_orders(&shared).is_empty(), "a held order is listed nowhere");
+    assert_eq!(client.core.next_valid_id(&shared), 5, "its id is used");
+
+    let stop = Order { order_type: "STP".into(), lmt_price: 0.0, aux_price: 50.0, ..limit("SELL", 0.0, true, 3) };
+    client.place_order(5, &spy(), &stop).unwrap();
+    // One group: the engine sends the three together (ibx#547).
+    assert!(matches!(rx.try_recv(), Ok(ControlCommand::OrderGroup(group))
+        if group.iter().map(|r| r.order_id()).collect::<Vec<_>>() == [3, 4, 5]));
+    assert!(rx.try_recv().is_err());
+    assert!(client.core.held_orders.lock().unwrap().is_empty());
+    let open: Vec<i64> = client.core.collect_open_orders(&shared).into_iter().map(|(id, _)| id).collect();
+    assert_eq!(open.len(), 3, "{open:?}");
+    assert!(client.core.tracked_order(3).unwrap().transmit, "sent with transmit on");
+}
+
+// Paper 09/10/2026, the reference: a child with transmit on sends its
+// held parent; a parent placed again with transmit on goes out with its
+// new values and its held child; a held order with no link stays held,
+// also one of the same OCA group; placed again with transmit on, it is
+// sent with the new values.
+#[test]
+fn only_the_tree_of_the_placed_order_is_sent() {
+    let (client, rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    // A held parent, an unrelated held order of an OCA group.
+    client.place_order(10, &spy(), &limit("BUY", 100.0, false, 0)).unwrap();
+    client.place_order(11, &spy(), &Order { oca_group: "g".into(), ..limit("BUY", 99.0, false, 0) }).unwrap();
+    client.place_order(12, &spy(), &limit("SELL", 400.0, true, 10)).unwrap();
+    assert_eq!(sent_and_held(&rx), (vec![10, 12], vec![10, 11]));
+    client.place_order(13, &spy(), &Order { oca_group: "g".into(), ..limit("BUY", 98.0, true, 0) }).unwrap();
+    assert_eq!(sent_and_held(&rx), (vec![13], vec![]));
+    // The held order placed again: off, then on.
+    client.place_order(11, &spy(), &limit("BUY", 97.0, false, 0)).unwrap();
+    client.place_order(11, &spy(), &limit("BUY", 96.0, true, 0)).unwrap();
+    assert_eq!(sent_and_held(&rx), (vec![11], vec![11]));
+    assert_eq!(client.core.tracked_order(11).unwrap().lmt_price, 96.0);
+
+    // A parent placed again with transmit on: its held child goes with it.
+    client.place_order(20, &spy(), &limit("BUY", 100.0, false, 0)).unwrap();
+    client.place_order(21, &spy(), &limit("SELL", 400.0, false, 20)).unwrap();
+    client.place_order(20, &spy(), &limit("BUY", 101.0, true, 0)).unwrap();
+    assert_eq!(sent_and_held(&rx), (vec![20, 21], vec![20, 21]));
+    assert_eq!(client.core.tracked_order(20).unwrap().lmt_price, 101.0);
+}
+
+// ibx#547, paper 09/10/2026, the reference: an order placed with transmit
+// off is read and checked at once. One that a check refuses is not held;
+// the warnings of one that is held are given then, and not again when it
+// is sent.
+#[test]
+fn a_held_order_is_checked_when_it_is_placed() {
+    let (client, rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    // A good-till date that is no date: refused, not held.
+    let bad = Order { tif: "GTD".into(), good_till_date: "notadate".into(), ..limit("BUY", 100.0, false, 0) };
+    client.place_order(60, &spy(), &bad).unwrap();
+    assert_eq!(sent_and_held(&rx), (vec![], vec![]));
+    assert_eq!(shared.orders.drain_order_errors().len(), 1);
+    assert!(client.core.held_orders.lock().unwrap().is_empty());
+    // An id below the highest one used: 103, not held.
+    client.place_order(70, &spy(), &limit("BUY", 100.0, true, 0)).unwrap();
+    client.place_order(65, &spy(), &limit("BUY", 100.0, false, 0)).unwrap();
+    assert_eq!(sent_and_held(&rx), (vec![70], vec![]));
+    assert_eq!(shared.orders.drain_order_errors().iter().map(|e| (e.0, e.1)).collect::<Vec<_>>(), [(65, 103)]);
+    // A time condition with no zone: the warning at the hold only.
+    let timed = |transmit| Order {
+        conditions: vec![OrderCondition::Time { time: "20991231 23:59:59".into(), is_more: true }],
+        ..limit("BUY", 100.0, transmit, 0)
     };
-    let err = client.place_order(1, &spy(), &order).unwrap_err();
-    assert!(err.to_string().contains("transmit=false"), "got: {}", err);
-    assert!(rx.try_recv().is_err(), "nothing may reach the engine");
+    client.place_order(80, &spy(), &timed(false)).unwrap();
+    assert_eq!(shared.orders.drain_order_errors().iter().map(|e| (e.0, e.1)).collect::<Vec<_>>(), [(80, 2174)]);
+    client.place_order(80, &spy(), &timed(true)).unwrap();
+    assert_eq!(sent_and_held(&rx), (vec![80], vec![80]));
+    assert!(shared.orders.drain_order_errors().is_empty(), "no second warning");
+}
+
+// Paper 09/10/2026, the reference: a working order placed again with
+// transmit off stays as it is; the cancel of a held order goes to the
+// engine, which ends it, and the order is no longer held.
+#[test]
+fn a_working_order_with_transmit_off_is_left_and_a_held_order_can_be_cancelled() {
+    let (client, rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    client.place_order(30, &spy(), &limit("BUY", 100.0, true, 0)).unwrap();
+    client.place_order(30, &spy(), &limit("BUY", 101.0, false, 0)).unwrap();
+    assert_eq!(sent_and_held(&rx), (vec![30], vec![]));
+    assert_eq!(client.core.tracked_order(30).unwrap().lmt_price, 100.0);
+
+    client.place_order(31, &spy(), &limit("BUY", 100.0, false, 0)).unwrap();
+    client.cancel_order(31, "").unwrap();
+    assert_eq!(sent_and_held(&rx), (vec![31], vec![31]), "the hold, then the cancel");
+    assert!(client.core.held_orders.lock().unwrap().is_empty());
+    client.place_order(32, &spy(), &limit("BUY", 100.0, false, 0)).unwrap();
+    client.req_global_cancel().unwrap();
+    assert!(client.core.held_orders.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -938,6 +1055,49 @@ fn fa_requests_on_a_non_fa_session_are_refused() {
     assert!(!w.events.iter().any(|e| e.contains(":321:")), "{:?}", w.events);
 }
 
+// ibx#443: the WSH requests get the reference's permission error from the
+// logon's news sources: 10276 without the source, 10277 when it is listed
+// without a subscription. With the permission, the errors of a request
+// that cannot be served. The cancels answer nothing.
+#[test]
+fn wsh_requests_get_the_permission_error() {
+    use crate::api::types::WshEventData;
+    let (client, rx, shared) = test_client();
+    let answers = |client: &EClient| {
+        client.req_wsh_meta_data(1);
+        client.req_wsh_event_data(2, &WshEventData { con_id: 265598, ..Default::default() });
+        client.cancel_wsh_meta_data(1);
+        client.cancel_wsh_event_data(2);
+        let mut w = RecordingWrapper::default();
+        client.process_msgs(&mut w);
+        w.events.into_iter().filter(|e| e.starts_with("error:")).collect::<Vec<_>>()
+    };
+
+    // The captured paper logon (ibx#460): no such source.
+    shared.reference.set_news_sources("BRFG,BRFUPDN,DJ-N,DJNL".split(',').map(String::from).collect());
+    shared.reference.set_news_sources_unsubscribed("BZ,DJTOP,FLY".split(',').map(String::from).collect());
+    assert_eq!(answers(&client), [
+        "error:1:10276:News feed is not allowed.",
+        "error:2:10276:News feed is not allowed.",
+    ]);
+
+    shared.reference.set_news_sources_unsubscribed(vec!["BZ".into(), "WSHE".into()]);
+    assert_eq!(answers(&client), [
+        "error:1:10277:News Feed requires permissions. Please login to Portal to subscribe.",
+        "error:2:10277:News Feed requires permissions. Please login to Portal to subscribe.",
+    ]);
+
+    shared.reference.set_news_sources(vec!["BRFG".into(), "wshe".into()]);
+    assert_eq!(answers(&client), [
+        "error:1:10279:Failed to request WSH meta data.The request is not supported.",
+        "error:2:10282:WSH meta data not requested.",
+    ]);
+    assert!(rx.try_recv().is_err(), "nothing sent");
+
+    let unset = WshEventData::default();
+    assert_eq!((unset.con_id, unset.total_limit), (i32::MAX, i32::MAX));
+}
+
 // ibx#444: a market data request id already live gets 322, a cancel of an
 // unknown id gets 300, as the reference.
 #[test]
@@ -1119,6 +1279,63 @@ fn place_order_type_aliases() {
         assert!(matches!(rx.try_recv().unwrap(), ControlCommand::Order(OrderRequest::Modify { .. })), "{alias}");
         assert!(matches!(rx.try_recv().unwrap(), ControlCommand::Order(OrderRequest::Modify { .. })), "{alias}");
     }
+}
+
+// ibx#469: TRAIL MIT, TRAIL LIT, PEG BEST, RPI and PASSV REL are placed,
+// each as an order of its own type.
+#[test]
+fn place_order_trail_mit_trail_lit_peg_best_rpi_and_passv_rel() {
+    let (client, rx, shared) = test_client();
+    shared.market.set_instrument_count(1);
+    let order = |order_type: &str| Order {
+        action: "SELL".into(), total_quantity: 1.0, order_type: order_type.into(),
+        lmt_price: 148.0, aux_price: 2.0, trail_stop_price: 150.0, ..Default::default()
+    };
+    let p = |v: f64| crate::api::types::price_from_f64(v);
+    for (id, order_type) in [(1, "TRAIL MIT"), (2, "TRAIL LIT"), (3, "PEG BEST"), (4, "RPI"), (5, "PASSV REL")] {
+        client.place_order(id, &spy(), &order(order_type)).unwrap();
+        let kind = rx.try_iter().find_map(|c| match c {
+            ControlCommand::Order(OrderRequest::SubmitEx { kind, .. }) => Some(kind),
+            _ => None,
+        }).unwrap_or_else(|| panic!("{order_type}: no order sent"));
+        match (order_type, kind) {
+            ("TRAIL MIT", OrderKind::TrailMit { trail, percent: false, trail_stop_price }) =>
+                assert_eq!((trail, trail_stop_price), (p(2.0), p(150.0))),
+            ("TRAIL LIT", OrderKind::TrailLit { price, trail, percent: false, trail_stop_price }) =>
+                assert_eq!((price, trail, trail_stop_price), (p(148.0), p(2.0), p(150.0))),
+            ("PEG BEST", OrderKind::PegBest { price }) => assert_eq!(price, p(148.0)),
+            ("RPI", OrderKind::Rpi { price, offset }) | ("PASSV REL", OrderKind::PassvRel { price, offset }) =>
+                assert_eq!((price, offset), (p(148.0), p(2.0))),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert!(shared.orders.drain_order_errors().is_empty());
+    // A percent takes the place of the amount.
+    let pct = Order { trailing_percent: 3.0, aux_price: 0.0, ..order("TRAIL MIT") };
+    client.place_order(9, &spy(), &pct).unwrap();
+    assert!(rx.try_iter().any(|c| matches!(c, ControlCommand::Order(OrderRequest::SubmitEx {
+        kind: OrderKind::TrailMit { percent: true, trail, .. }, .. }) if trail == p(3.0))));
+    client.place_order(12, &spy(), &Order { trailing_percent: 3.0, aux_price: 0.0, ..order("TRAIL LIT") }).unwrap();
+    assert!(rx.try_iter().any(|c| matches!(c, ControlCommand::Order(OrderRequest::SubmitEx {
+        kind: OrderKind::TrailLit { percent: true, trail, .. }, .. }) if trail == p(3.0))));
+    // A TRAIL LIT without a trigger price is refused, by amount and by
+    // percent (captured 07/10/2026); a TRAIL MIT without one is sent.
+    for (id, pct) in [(13, 0.0), (14, 3.0)] {
+        let no_trigger = Order {
+            trail_stop_price: f64::MAX, trailing_percent: pct, aux_price: if pct > 0.0 { 0.0 } else { 2.0 },
+            ..order("TRAIL LIT")
+        };
+        client.place_order(id, &spy(), &no_trigger).unwrap();
+        assert!(rx.try_iter().all(|c| !matches!(c, ControlCommand::Order(_))), "nothing sent");
+        assert_eq!(shared.orders.drain_order_errors(),
+            [(id, 321, "Error validating request.-'bH' : cause - Please enter a stop price".to_string())]);
+    }
+    client.place_order(15, &spy(), &Order { trail_stop_price: f64::MAX, ..order("TRAIL MIT") }).unwrap();
+    assert!(rx.try_iter().any(|c| matches!(c, ControlCommand::Order(OrderRequest::SubmitEx {
+        kind: OrderKind::TrailMit { trail_stop_price: 0, .. }, .. }))));
+    // No trailing value at all.
+    assert!(client.place_order(10, &spy(), &Order { aux_price: 0.0, ..order("TRAIL MIT") }).is_err());
+    assert!(client.place_order(11, &spy(), &Order { aux_price: 0.0, ..order("TRAIL LIT") }).is_err());
 }
 
 // ibx#467: a goodAfterTime that is not a date and time is refused with 337
@@ -4583,6 +4800,7 @@ fn captured_fill_exec() -> crate::bridge::FillExec {
         last_liquidity: 0,
         combo: None,
         other_client: false,
+        replayed: false,
     }
 }
 
@@ -4783,6 +5001,8 @@ fn seed_account_rows(shared: &SharedState, complete: bool) {
 // the time, the time, then the end, once.
 #[test]
 fn account_updates_send_the_image_then_the_end_once() {
+    // The account time is in the machine's zone (ibx#487).
+    crate::gateway::set_machine_zone_for_test(Some("US/Eastern"));
     let (client, _rx, shared) = test_client();
     shared.portfolio.set_position_info(crate::types::PositionInfo {
         con_id: 756733, position_fixed: 18 * crate::types::QTY_SCALE, symbol: "SPY".into(),
@@ -4798,9 +5018,10 @@ fn account_updates_send_the_image_then_the_end_once() {
     let mut w = AccountRec::default();
     client.process_msgs(&mut w);
     assert_eq!(w.events, [
+        // In the order of the reference's value map: key, then currency.
         "value:AccountType:INDIVIDUAL:",
-        "value:NetLiquidation:953633.06:USD",
         "value:CashBalance:899133.4993:BASE",
+        "value:NetLiquidation:953633.06:USD",
         "portfolio:756733:18:",
         "time:08:16",
         "time:08:16",
@@ -6304,7 +6525,7 @@ fn news_refusal_after_the_lookup_is_reported() {
     client.core.req_to_instrument.lock().unwrap().insert(9583, 6);
     client.core.instrument_to_req.lock().unwrap().insert(6, vec![9583]);
     shared.market.push_md_reject(crate::bridge::MdReject::NewsRefused {
-        instrument: 6, text: "API News error:Source code unchecked in API news Settings: XYZ".into() });
+        instrument: 6, con_id: 265598, text: "API News error:Source code unchecked in API news Settings: XYZ".into() });
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
     assert!(w.events.contains(&"error:9583:10094:API News error:Source code unchecked in API news Settings: XYZ".to_string()), "{:?}", w.events);
@@ -6576,6 +6797,42 @@ fn joining_a_delayed_subscription() {
     drop(client);
     let seen = engine.join().unwrap();
     assert_eq!(seen, ["subscribe:265598"]);
+}
+
+// ibx#447 (`jextend.v.a(boolean)`, captured 07/10/2026): when the
+// contract's data is frozen its requests go on with the frozen slot,
+// marketDataType 2; a request that joins then is on the frozen slot too;
+// back on real-time data they return to the real-time slot, marketDataType
+// 1, and the frozen slot is let go.
+#[test]
+fn a_frozen_contract_moves_its_requests_to_the_frozen_slot_and_back() {
+    let (client, rx, shared) = test_client();
+    let engine = sharing_engine(rx);
+    client.req_market_data_type(2);
+    client.req_mkt_data(1, &aapl_stk(), "", false, false).unwrap();
+    shared.market.push_md_reject(crate::bridge::MdReject::Frozen { instrument: 5, frozen: 9 });
+    let mut w = RecordingWrapper::default();
+    client.process_msgs(&mut w);
+    assert_eq!(w.events, ["market_data_type:1:2"]);
+    assert_eq!(client.core.req_to_instrument.lock().unwrap().get(&1), Some(&9));
+    assert!(!client.core.instrument_to_req.lock().unwrap().contains_key(&5));
+
+    client.req_mkt_data(2, &aapl_stk(), "", false, false).unwrap();
+    assert_eq!(client.core.req_to_instrument.lock().unwrap().get(&2), Some(&9), "joins the frozen slot");
+    assert_eq!(client.core.check_mdt_needed(2, true), Some(2));
+
+    shared.market.push_md_reject(crate::bridge::MdReject::Live { instrument: 9, live: 5 });
+    let mut w = RecordingWrapper::default();
+    client.process_msgs(&mut w);
+    assert_eq!(w.events, ["market_data_type:1:1", "market_data_type:2:1"]);
+    assert_eq!(client.core.instrument_to_req.lock().unwrap().get(&5), Some(&vec![1, 2]));
+    assert!(client.core.md_frozen.lock().unwrap().is_empty());
+
+    client.cancel_mkt_data(1).unwrap();
+    client.cancel_mkt_data(2).unwrap();
+    drop(client);
+    let seen = engine.join().unwrap();
+    assert_eq!(seen, ["subscribe:265598", "unsubscribe:9", "unsubscribe:5"]);
 }
 
 // ibx#444 (`jextend.s.b(boolean,boolean)`, `jextend.ba.a(...)@280`): when
@@ -6932,4 +7189,66 @@ fn algo_time_parameters_10314_and_2174() {
     assert!(rx.try_recv().is_ok(), "sent");
     let errors = shared.orders.drain_order_errors();
     assert_eq!(errors.iter().map(|e| (e.0, e.1)).collect::<Vec<_>>(), [(41, 2174)]);
+}
+
+// ibx#424: the display group requests are answered locally as the
+// reference (capture of 07/10/2026): the fixed list, `none` at once for a
+// subscription, error 321 with id -1 for a refusal, and nothing for a
+// valid update but the lookup of a conId not seen yet.
+#[test]
+fn display_group_requests_as_the_reference() {
+    let (client, rx, shared) = test_client();
+    let refusal = |class: &str, cause: &str| format!("error:-1:321:Error validating request.-'{class}' : cause - {cause}");
+    let mut w = RecordingWrapper::default();
+
+    client.query_display_groups(1, &mut w);
+    client.subscribe_to_group_events(2, 1, &mut w);
+    for group in [9, 0, 8, -1] {
+        client.subscribe_to_group_events(3, group, &mut w);
+    }
+    client.subscribe_to_group_events(2, 1, &mut w);
+    client.subscribe_to_group_events(7, 1, &mut w);
+    assert_eq!(w.events, [
+        "display_group_list:1:1|2|3|4|5|6|7".to_string(),
+        "display_group_updated:2:none".to_string(),
+        refusal("bX", "Invalid window group ID=9"),
+        refusal("bX", "Invalid window group ID=0"),
+        refusal("bX", "Invalid window group ID=8"),
+        refusal("bX", "Invalid window group ID=-1"),
+        refusal("bX", "Request with ID=2 was already subscribed."),
+        "display_group_updated:7:none".to_string(),
+    ]);
+
+    // Updates: the refusals come with the next messages.
+    shared.reference.cache_contract(265598, Contract { con_id: 265598, symbol: "AAPL".into(), ..Default::default() });
+    client.update_display_group(8, "265598@SMART");
+    client.update_display_group(2, "none");
+    client.update_display_group(2, "abc@SMART");
+    client.update_display_group(2, "0@SMART");
+    client.update_display_group(2, "265598@SMART|foo=1");
+    client.update_display_group(2, "265598@SMART|action=Foo");
+    client.update_display_group(2, "265598@SMART");
+    client.update_display_group(2, "265598");
+    client.update_display_group(2, "265598@SMART|action=changegroupec");
+    assert!(rx.try_recv().is_err(), "a contract seen before is not looked up");
+    client.update_display_group(2, "999999999@SMART");
+    assert!(matches!(rx.try_recv(), Ok(ControlCommand::DisplayGroupLookup { req_id: 2, con_id: 999999999 })));
+    client.unsubscribe_from_group_events(9);
+    client.unsubscribe_from_group_events(2);
+    client.unsubscribe_from_group_events(2);
+    client.update_display_group(2, "265598@SMART");
+    let mut w = RecordingWrapper::default();
+    client.process_msgs(&mut w);
+    let errors: Vec<&String> = w.events.iter().filter(|e| e.starts_with("error:")).collect();
+    assert_eq!(errors, [
+        &refusal("bZ", "Request with ID=8 failed since request ID wasn't found."),
+        &refusal("bZ", "Request with ID=2 failed with invalid contract info=abc@SMART, expected format 'contractId@exchange'"),
+        &refusal("bZ", "Request with ID=2 failed with invalid contract info=0@SMART: conid or excahge are missing, expected format 'contractId@exchange'"),
+        &refusal("bZ", "Action is unknown. Please check the pattern: conid@exch|param1=value1|...|action=(action)"),
+        &refusal("bZ", "Action 'Foo' is unknown"),
+        &refusal("bY", "Subscription for Group Events with request ID=9 wasn't found."),
+        &refusal("bY", "Subscription for Group Events with request ID=2 wasn't found."),
+        &refusal("bZ", "Request with ID=2 failed since request ID wasn't found."),
+    ]);
+    assert!(!w.events.iter().any(|e| e.starts_with("display_group")), "{:?}", w.events);
 }

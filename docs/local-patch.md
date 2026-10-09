@@ -1,5 +1,11 @@
 # Local patch: bounded login, connection control and strict history
 
+> Historical record of the 2026-10-06 source and branch arrangement.
+> Current development uses main; main-upstream is the pristine mirror.
+> Shared Git rules and [the centralized ibx changelog](https://github.com/mjarvel/rust-library1/blob/main/docs/ibx-changelog.md)
+> govern current branch roles, checkpoints, contributions and later validation.
+> Earlier main/dev commands below must not be used for the migrated fork.
+
 Our fork's dev branch reconciles the local patch with upstream
 `e491575a59d9ef5d069a1e0c4afa132bce32a281`. Tested source checkpoint:
 `ba9cb81ec902e3822fd5be73e3db742aec4c6840`, following merge `cb0d10d`.

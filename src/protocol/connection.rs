@@ -1,4 +1,4 @@
-//! Non-blocking connection wrapping a TLS or raw TCP stream with read/write buffers.
+//! Connection wrapping a TLS or raw TCP stream with read/write buffers.
 //!
 //! Maintains per-connection state: buffer, seq counter,
 //! HMAC sign/read IVs (chained per message).
@@ -72,6 +72,37 @@ enum Stream {
     Raw(TcpStream),
     #[cfg(any(test, feature = "test-support"))]
     Mem(MemTransport),
+}
+
+impl Stream {
+    /// A socket of the system, not an in-memory pipe.
+    fn is_socket(&self) -> bool {
+        self.raw_handle().is_some()
+    }
+
+    #[cfg(unix)]
+    fn raw_handle(&self) -> Option<crate::engine::park::RawHandle> {
+        use std::os::fd::AsRawFd;
+        match self {
+            Self::Tls(s) => Some(s.get_ref().as_raw_fd()),
+            Self::Rustls(s) => Some(s.sock.as_raw_fd()),
+            Self::Raw(s) => Some(s.as_raw_fd()),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Mem(_) => None,
+        }
+    }
+
+    #[cfg(windows)]
+    fn raw_handle(&self) -> Option<crate::engine::park::RawHandle> {
+        use std::os::windows::io::AsRawSocket;
+        match self {
+            Self::Tls(s) => Some(s.get_ref().as_raw_socket()),
+            Self::Rustls(s) => Some(s.sock.as_raw_socket()),
+            Self::Raw(s) => Some(s.as_raw_socket()),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Mem(_) => None,
+        }
+    }
 }
 
 impl Read for Stream {
@@ -213,16 +244,21 @@ pub struct Connection {
     write_error: Option<(io::ErrorKind, String)>,
     /// The first bounded receive failure. Retire the transport after it.
     limited_read_error: Option<(io::ErrorKind, String)>,
+    /// The socket is in non-blocking mode for good (ibx#530): a read with
+    /// nothing to read returns at once. Set with the queued writes, on a
+    /// socket only.
+    nonblocking: bool,
+    /// Bytes read so far.
+    bytes_in: u64,
 }
 
 impl Connection {
     /// Create a new connection from an already-established TLS stream.
     ///
-    /// Uses a blocking socket with a 1ms read timeout — mirrors `new_raw`.
-    /// Non-blocking writes can return `WouldBlock` after a partial send,
-    /// which poisons the seq/sign_iv chain that already advanced for the
-    /// not-yet-on-the-wire message. Blocking writes either commit fully
-    /// or surface a hard error, which the hot-loop reconnect path handles.
+    /// A blocking socket with a 1ms read timeout until the engine takes it
+    /// (`set_queued_writes`), as `new_raw`: before that a write either
+    /// commits fully or fails, so the sequence and signature chains never
+    /// advance for a message that is not on the wire.
     pub fn new(stream: TlsStream<TcpStream>) -> io::Result<Self> {
         stream.get_ref().set_read_timeout(Some(std::time::Duration::from_millis(1)))?;
         Ok(Self::on(Stream::Tls(stream)))
@@ -242,6 +278,8 @@ impl Connection {
             queued_writes: false,
             write_error: None,
             limited_read_error: None,
+            nonblocking: false,
+            bytes_in: 0,
         }
     }
 
@@ -256,13 +294,12 @@ impl Connection {
     }
 
     /// Create a new connection from a raw TCP stream (for farm connections).
-    /// Sets the stream to non-blocking mode and enables TCP_NODELAY.
+    /// Enables TCP_NODELAY.
     pub fn new_raw(stream: TcpStream) -> io::Result<Self> {
         stream.set_nodelay(true)?;
-        // Use blocking socket with 1ms read timeout instead of non-blocking.
-        // Non-blocking write_all can silently fail (WouldBlock), causing HMAC-signed
-        // messages to never reach the farm — the sign_iv still advances, permanently
-        // breaking the signing chain.
+        // A blocking socket with a 1ms read timeout until the engine takes
+        // it (`set_queued_writes`): a non-blocking write_all can fail part
+        // way (WouldBlock) with the signature chain already advanced.
         stream.set_read_timeout(Some(std::time::Duration::from_millis(1)))?;
         Ok(Self::on(Stream::Raw(stream)))
     }
@@ -309,8 +346,10 @@ impl Connection {
         !self.buf.is_empty()
     }
 
-    /// Non-blocking read from the socket into the internal buffer.
-    /// Returns the number of bytes read, or 0 if no data available (WouldBlock).
+    /// Read what the socket has into the internal buffer. Returns the number
+    /// of bytes read, or 0 when there is none: at once on a connection the
+    /// engine took (`set_queued_writes`), after the 1ms read timeout before
+    /// that and on an in-memory connection.
     pub fn try_recv(&mut self) -> io::Result<usize> {
         let mut tmp = [0u8; RECV_BUF_SIZE];
         match self.stream.read(&mut tmp) {
@@ -320,6 +359,7 @@ impl Connection {
             )),
             Ok(n) => {
                 self.buf.extend_from_slice(&tmp[..n]);
+                self.bytes_in += n as u64;
                 Ok(n)
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock
@@ -601,8 +641,27 @@ impl Connection {
     /// stalls only its own link, as in the reference. There is no write
     /// timeout, as in the reference: the output waits until the peer reads
     /// or the system fails the connection.
+    ///
+    /// With it a socket goes to non-blocking mode for good (ibx#530): a read
+    /// returns at once when there is nothing, and the engine waits on all
+    /// its sockets together instead of on each in turn.
     pub fn set_queued_writes(&mut self, on: bool) {
         self.queued_writes = on;
+        if on && !self.nonblocking && self.stream.is_socket() {
+            self.nonblocking = self.stream.set_nonblocking(true).is_ok();
+        }
+    }
+
+    /// The socket to wait on for data, for a connection whose reads return
+    /// at once. `None` for one that still waits in its own read.
+    pub(crate) fn wait_handle(&self) -> Option<crate::engine::park::RawHandle> {
+        if self.nonblocking { self.stream.raw_handle() } else { None }
+    }
+
+    /// Bytes read so far: a change tells a pass that read something.
+    #[inline]
+    pub(crate) fn bytes_in(&self) -> u64 {
+        self.bytes_in
     }
 
     /// Whether accepted frames are still waiting to be written.
@@ -657,8 +716,22 @@ impl Connection {
         if !self.has_queued_output() {
             return Ok(());
         }
-        if let Err(e) = self.stream.set_nonblocking(true) {
-            return Err(self.record_write_error(e));
+        if !self.nonblocking {
+            if let Err(e) = self.stream.set_nonblocking(true) {
+                return Err(self.record_write_error(e));
+            }
+        }
+        // The frames that wait leave in one write, as the reference writes
+        // the messages it sends together (ibx#547: the orders of a bracket
+        // in one write, 26/09 and 09/10/2026), and with one system call.
+        // Not while a frame is partly written: that write is completed
+        // with the same bytes first.
+        if self.out.len() > 1 && self.out_pos == 0 {
+            let mut all = Vec::with_capacity(self.out.iter().map(Vec::len).sum());
+            for frame in self.out.drain(..) {
+                all.extend_from_slice(&frame);
+            }
+            self.out.push_back(all);
         }
         let result = loop {
             let Some(front) = self.out.front() else {
@@ -685,7 +758,7 @@ impl Connection {
                 Err(e) => break Err(e),
             }
         };
-        let restored = self.stream.set_nonblocking(false);
+        let restored = if self.nonblocking { Ok(()) } else { self.stream.set_nonblocking(false) };
         match result.and(restored) {
             Ok(()) => Ok(()),
             Err(e) => Err(self.record_write_error(e)),
@@ -1563,6 +1636,13 @@ mod tests {
                     Some(std::time::Duration::from_millis(1)));
             }
             _ => panic!("controlled TLS must not switch to legacy native-tls"),
+        }
+        // The engine must poll controlled TLS through the same raw socket.
+        assert!(connection.wait_handle().is_none());
+        connection.set_queued_writes(true);
+        assert!(connection.wait_handle().is_some());
+        if let Stream::Rustls(stream) = &mut connection.stream {
+            assert_eq!(stream.sock.read(&mut [0]).unwrap_err().kind(), io::ErrorKind::WouldBlock);
         }
         let frame = fix_build(&[(35, "0")], 1);
         connection.seed_buffer(&frame);

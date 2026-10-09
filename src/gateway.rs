@@ -8,7 +8,8 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-use crossbeam_channel::{Sender, bounded};
+use crate::engine::park::ControlSender;
+use crossbeam_channel::Sender;
 use native_tls::TlsConnector;
 use num_bigint::BigUint;
 use sha1::{Digest, Sha1};
@@ -28,7 +29,6 @@ use crate::protocol::fix::{self, fix_build, fix_parse, fix_read_deadline, SOH};
 use crate::protocol::fixcomp;
 use crate::lifecycle::{ConnectionControl, ControlledIo, LOGIN_BYTES, LOGIN_FRAME_BYTES};
 use crate::protocol::ns;
-use crate::types::ControlCommand;
 
 /// Parse the `PRIV_LAB_MISC_URLS` blob (FIX tag 6321) into a `{key: value}` map.
 ///
@@ -1035,6 +1035,14 @@ pub struct Gateway {
     pub farm_name: String,
     /// Host of the market-data farm, for the farm reconnect (ibx#295).
     pub farm_host: String,
+    /// Whether the historical data connection was up at the end of the
+    /// connect, for the connection notices of the API connect (ibx#517).
+    pub hmds_connected: bool,
+    /// Name of the contract data farm the logon routes the account to;
+    /// empty when the logon names none (ibx#517).
+    pub secdef_farm: String,
+    /// User name of the login: the submitter of the session's orders (ibx#519).
+    pub user_name: String,
     /// Rows of the routing tables of the two primary farms, when they came
     /// with the logon (#445). A table that comes later is read by the loop.
     pub md_routing: Option<String>,
@@ -2673,6 +2681,9 @@ impl Gateway {
             session_epoch,
             farm_name,
             farm_host,
+            hmds_connected: hmds_conn.is_some(),
+            secdef_farm: parse_farm_route(&secdef_route).map(|(_, farm)| farm).unwrap_or_default(),
+            user_name: config.username.clone(),
             md_routing,
             hmds_routing,
             ns_secure_refused: refused,
@@ -2707,6 +2718,9 @@ impl Gateway {
         shared.reference.set_news_sources(
             sources.iter().filter(|s| s.subscribed).map(|s| s.code.clone()).collect(),
         );
+        shared.reference.set_news_sources_unsubscribed(
+            sources.iter().filter(|s| !s.subscribed).map(|s| s.code.clone()).collect(),
+        );
         shared.reference.set_news_providers(news_providers);
 
         // Soft dollar tiers: from CCP logon tag 6522, none when it is absent
@@ -2738,6 +2752,8 @@ impl Gateway {
         // The account list of the logon: the managed accounts (ibx#420).
         shared.reference.set_managed_accounts(self.managed_accounts.clone());
         shared.reference.set_fa_session(self.fa_session);
+        // The logon's environment: a paper session (ibx#444).
+        shared.reference.set_paper_session(self.user_book);
         shared.reference.set_short_sale_flags(self.super_user, self.omnibus);
         shared.reference.set_smart_combo_con_ids(&self.raw_smart_combo_con_ids);
         shared.reference.set_tick_by_tick_limits(self.tick_by_tick_limit, self.tick_by_tick_off);
@@ -2754,6 +2770,15 @@ impl Gateway {
         shared.reference.set_ccp_session_id(self.server_session_id.clone());
         shared.reference.set_misc_urls(self.misc_urls.clone());
 
+        shared.reference.set_user_name(&self.user_name);
+
+        // The state of the data connections, as the reference tells every
+        // client after nextValidId and before the version warning (ibx#517).
+        for (code, text) in connect_farm_notices(&self.farm_name, &self.hmds_farm, self.hmds_connected, &self.secdef_farm) {
+            log::info!("Farm notice {}: {}", code, text);
+            shared.push_connection_notice(code, text);
+        }
+
         // The values of the logon reply the API sees (ibx#421).
         apply_first_logon(&self.logon, self.version_cutoff.as_deref(), self.version_cutoff_date.as_deref(),
             self.max_backfill_years, shared);
@@ -2768,7 +2793,7 @@ impl Gateway {
         ccp_conn: Connection,
         hmds_conn: Option<Connection>,
         core_id: Option<usize>,
-    ) -> (HotLoop, Sender<ControlCommand>) {
+    ) -> (HotLoop, ControlSender) {
         self.into_hot_loop_with_farms(shared, event_tx, farm_conn, ccp_conn, hmds_conn, core_id)
     }
 
@@ -2781,8 +2806,7 @@ impl Gateway {
         ccp_conn: Connection,
         hmds_conn: Option<Connection>,
         core_id: Option<usize>,
-    ) -> (HotLoop, Sender<ControlCommand>) {
-        let (tx, rx) = bounded(64);
+    ) -> (HotLoop, ControlSender) {
         let reconnect_auth = ReconnectAuth {
             host: String::new(), // Filled by caller (Python EClient or Rust API)
             username: String::new(), // Filled by caller
@@ -2809,7 +2833,7 @@ impl Gateway {
             });
         }
         let mut hot_loop = HotLoop::new(shared, event_tx, core_id);
-        hot_loop.set_control_rx(rx);
+        let tx = hot_loop.control_channel();
         hot_loop.set_account_id(self.account_id.clone());
         hot_loop.set_scale_us_lots(self.scale_us_lots);
         hot_loop.set_price_mgmt(self.price_mgmt, self.price_mgmt_exclusions.as_deref());
@@ -2817,6 +2841,7 @@ impl Gateway {
         hot_loop.set_depth_limit(self.depth_limit);
         hot_loop.set_user_book(self.user_book);
         hot_loop.set_farm_name(self.farm_name.clone());
+        hot_loop.set_secdef_farm_name(self.secdef_farm.clone());
         hot_loop.ccp.data_permissions = self.logon.data_permissions.clone();
         hot_loop.set_reconnect_auth(reconnect_auth);
         hot_loop.farm_conn = Some(farm_conn);
@@ -2852,6 +2877,33 @@ pub(crate) fn apply_logon_values(logon: &LogonValues, shared: &SharedState) {
     if let Some(features) = &logon.features {
         shared.reference.set_api_features(crate::control::logon::ApiFeatures::parse(features));
     }
+}
+
+/// The connection notices of the API connect, as the reference sends them
+/// with id -1 to a client that connects: one per data connection with its
+/// state, market data first, then historical data, then contract data
+/// (ibx#517). The market data connection is up when the connect succeeds;
+/// a historical data connection that failed is reported broken (2105), and
+/// 2106 follows when it comes up. This client reads contract data on the
+/// session's own link and opens no contract data connection: 2158 names the
+/// contract data farm of the logon, and is left out when the logon names
+/// none.
+pub(crate) fn connect_farm_notices(md_farm: &str, hmds_farm: &str, hmds_up: bool, secdef_farm: &str) -> Vec<(i64, String)> {
+    let mut notices = Vec::new();
+    if !md_farm.is_empty() {
+        notices.push((2104, format!("Market data farm connection is OK:{md_farm}")));
+    }
+    if !hmds_farm.is_empty() {
+        notices.push(if hmds_up {
+            (2106, format!("HMDS data farm connection is OK:{hmds_farm}"))
+        } else {
+            (2105, format!("HMDS data farm connection is broken:{hmds_farm}"))
+        });
+    }
+    if !secdef_farm.is_empty() {
+        notices.push((2158, format!("Sec-def data farm connection is OK:{secdef_farm}")));
+    }
+    notices
 }
 
 /// The values of the first logon reply at the API connect (ibx#421): those
@@ -3185,9 +3237,10 @@ mod tests {
     // in clear; any other refusal is an error.
     #[test]
     fn auth_login_without_tls_runs_the_key_exchange() {
-        let hello = format!("50;533;{};{};c2ln;0;", B64.encode([7u8; 32]), B64.encode([2u8]));
-        let mut wire = AuthWire::new(&[&hello, CAPTURED_AUTH_START]);
-        let mut channel = SecureChannel::new();
+        use crate::auth::certs::fixture;
+        let hello = fixture::captured_hello();
+        let mut wire = AuthWire::new(&[hello, CAPTURED_AUTH_START]);
+        let mut channel = SecureChannel::new().with_cert_time(fixture::NOW_MS);
         let (start, refused) = ccp_login_start(&mut wire, &mut channel, CAPTURED_CONNECT.as_bytes(), false).unwrap();
         assert!(!refused);
         assert!(start.password_required);
@@ -3206,6 +3259,22 @@ mod tests {
 
         let mut wire = AuthWire::new(&["50;535;no crypto;0;"]);
         assert!(ccp_login_start(&mut wire, &mut SecureChannel::new(), CAPTURED_CONNECT.as_bytes(), false).is_err());
+
+        // ibx#276: a reply whose certificates fail the reference's checks
+        // ends the login, with its login text; nothing more is sent.
+        for (now, text) in [
+            (fixture::NOW_MS + 86_400_000, crate::auth::dh::CERTIFICATE_EXPIRED),
+            (fixture::NOW_MS - 86_400_000 * 2, crate::auth::dh::CERTIFICATE_NOT_YET_VALID),
+        ] {
+            let mut wire = AuthWire::new(&[hello, CAPTURED_AUTH_START]);
+            let err = ccp_login_start(&mut wire, &mut SecureChannel::new().with_cert_time(now), CAPTURED_CONNECT.as_bytes(), false).unwrap_err();
+            assert!(err.to_string().starts_with(text), "{err}");
+            assert_eq!(wire.sent().len(), 1);
+        }
+        let no_certificate = format!("50;533;{};{};c2ln;0;", B64.encode([7u8; 32]), B64.encode([2u8]));
+        let mut wire = AuthWire::new(&[&no_certificate, CAPTURED_AUTH_START]);
+        let err = ccp_login_start(&mut wire, &mut SecureChannel::new(), CAPTURED_CONNECT.as_bytes(), false).unwrap_err();
+        assert!(err.to_string().starts_with(crate::auth::dh::SECURE_CONNECTION_FAILED), "{err}");
     }
 
     // ibx#423: the SSL and plain ports of an endpoint (`E.j()`, `E.k()`).
@@ -3331,6 +3400,23 @@ mod tests {
         assert!(shared.reference.account_pending("DUXXXXXX1"));
         apply_logon_values(&LogonValues::read(&captured_logon_tags(), 0, 0), &shared);
         assert!(!shared.reference.account_pending("DUXXXXXX1"));
+    }
+
+    // ibx#517: the notices of connect_only (26/09/2026) and of session_start
+    // (07/10/2026), in the reference's order.
+    #[test]
+    fn connect_notices_name_each_data_connection() {
+        assert_eq!(connect_farm_notices("usfarm", "ushmds", true, "secdefil"), vec![
+            (2104, "Market data farm connection is OK:usfarm".to_string()),
+            (2106, "HMDS data farm connection is OK:ushmds".to_string()),
+            (2158, "Sec-def data farm connection is OK:secdefil".to_string()),
+        ]);
+        // A historical data connection that failed; a logon that names no
+        // contract data farm.
+        assert_eq!(connect_farm_notices("eufarm", "euhmds", false, ""), vec![
+            (2104, "Market data farm connection is OK:eufarm".to_string()),
+            (2105, "HMDS data farm connection is broken:euhmds".to_string()),
+        ]);
     }
 
     // ibx#421: the first logon sets the clock, the feature tokens and the

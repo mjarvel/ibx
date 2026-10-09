@@ -7,9 +7,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use crossbeam_channel::Sender;
+use crate::engine::park::ControlSender;
 
 use crate::api::types::{
     Contract as ApiContract, CommissionAndFeesReport as ApiCommissionAndFeesReport,
@@ -25,8 +25,10 @@ use crate::types::*;
 /// ends well within a second of the logon.
 pub const ORDER_REPLAY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The only market data type the engine delivers (1 = realtime, ibx#234).
+/// The market data type of real-time data (ibx#234).
 const MDT_REALTIME: i32 = 1;
+/// The market data type of frozen data (ibx#447).
+const MDT_FROZEN: i32 = 2;
 
 // ── Tick type constants matching ibapi ──
 
@@ -406,9 +408,11 @@ pub struct AccountStream {
 /// The reference's answer to an unsubscribe from account updates (ibx#475).
 pub const ACCOUNT_UNSUBSCRIBED: (i64, &str) = (2100, "API client has been unsubscribed from account data.");
 
-/// A row time as update_account_time carries it: `HH:mm`, in US/Eastern
-/// like the execution times (UTC when the zone database has none). Empty
-/// before any row time.
+/// A row time as update_account_time carries it: `HH:mm` in the zone of
+/// the machine, as the reference reads it with a calendar of its default
+/// zone (`jfix.l.a()@25-30`, `jutils.d1.e(int)`; captured 07/10/2026 on a
+/// machine in Europe/Paris: 11:49 for a row of 09:49 UTC). Empty before any
+/// row time.
 pub fn format_account_time(unix_secs: i64) -> String {
     if unix_secs <= 0 {
         return String::new();
@@ -416,8 +420,7 @@ pub fn format_account_time(unix_secs: i64) -> String {
     let Ok(ts) = jiff::Timestamp::from_second(unix_secs) else {
         return String::new();
     };
-    let tz = jiff::tz::TimeZone::get("US/Eastern").unwrap_or(jiff::tz::TimeZone::UTC);
-    ts.to_zoned(tz).strftime("%H:%M").to_string()
+    ts.to_zoned(crate::gateway::machine_tz()).strftime("%H:%M").to_string()
 }
 
 /// The keys of a ledger row in an account summary and the tag of each
@@ -635,11 +638,59 @@ impl PositionsSubscription {
     }
 }
 
+/// The rows of a reqPositions snapshot in the reference's order (ibx#487):
+/// it collects the positions in a hash set and sends them as the set gives
+/// them (`jextend.Y.b`, a `HashSet<ia.ca>`; `Y.b()`), so the order is the
+/// set's buckets:
+/// - hash of a row: `conId ^ Objects.hash(null, spec)` = `conId ^ (961 +
+///   spec)`, the spec of a plain row being `account.hashCode()`
+///   (`ia.ca.hashCode()@0-26`, `AccountSpec.hashCode()`);
+/// - bucket: `(h ^ h >>> 16) & (capacity - 1)`, the capacity 16 doubled
+///   while the rows are more than three quarters of it;
+/// - the set also holds the rows of the account's model (`Core`), dropped
+///   when sent: they count for the capacity. They are taken as one per
+///   held position, as the logon's position frames of 07/10/2026 (four
+///   plain rows, three model rows).
+///
+/// Rows of one bucket keep their order here (by conId), where the set has
+/// its insertion order. Captured 07/10/2026: AXTI, MSFT, AAPL, SPY.
+fn java_position_set_order(rows: &mut [PositionInfo], account: &str) {
+    let spec = java_string_hash(account) as u32;
+    let entries = rows.len() + rows.iter().filter(|p| p.position_fixed != 0).count();
+    let mut capacity: usize = 16;
+    while entries * 4 > capacity * 3 {
+        capacity *= 2;
+    }
+    let bucket = |con_id: i64| {
+        let h = (con_id as u32) ^ 961u32.wrapping_add(spec);
+        ((h ^ (h >> 16)) as usize) & (capacity - 1)
+    };
+    rows.sort_by_key(|p| bucket(p.con_id));
+}
+
+#[cfg(test)]
+mod position_order_tests {
+    use super::*;
+
+    // ibx#487: the positions of the capture of 07/10/2026 (AAPL 0, MSFT,
+    // SPY, AXTI held) in the order of the reference's hash set. With the
+    // account of the capture the rule gives the captured order (AXTI, MSFT,
+    // AAPL, SPY; checked on the recording machine, the id is not kept
+    // here); with this account it gives SPY, MSFT, AAPL, AXTI.
+    #[test]
+    fn positions_go_in_the_order_of_the_reference_set() {
+        let row = |con_id: i64, qty: i64| PositionInfo { con_id, position_fixed: qty * QTY_SCALE, ..Default::default() };
+        let mut rows = vec![row(265598, 0), row(272093, -10), row(756733, 81), row(4726868, 1)];
+        java_position_set_order(&mut rows, "DU0000001");
+        assert_eq!(rows.iter().map(|p| p.con_id).collect::<Vec<_>>(), [756733, 272093, 265598, 4726868]);
+    }
+}
+
 /// The next rows of a positions subscription (ibx#477 ibx#476): the snapshot
 /// and the end once the position data is in; then one row per change of a
 /// position or its average cost. Error 2151 when the data is not in after
 /// 30 s.
-fn advance_positions(sub: &mut PositionsSubscription, shared: &SharedState) -> Option<PositionsBatch> {
+fn advance_positions(sub: &mut PositionsSubscription, shared: &SharedState, account: Option<&str>) -> Option<PositionsBatch> {
     if !sub.snapshot_sent {
         if !shared.portfolio.account_download_complete() {
             if sub.requested_at.elapsed() >= POSITIONS_WAIT {
@@ -653,6 +704,9 @@ fn advance_positions(sub: &mut PositionsSubscription, shared: &SharedState) -> O
         sub.generation = shared.portfolio.position_generation();
         let mut rows = shared.portfolio.position_infos();
         rows.sort_by_key(|p| p.con_id);
+        if let Some(account) = account {
+            java_position_set_order(&mut rows, account);
+        }
         sub.sent = rows.iter().map(|p| (p.con_id, (p.position_fixed, p.avg_cost))).collect();
         sub.snapshot_sent = true;
         return Some(PositionsBatch { rows, end: true, error: None });
@@ -737,6 +791,11 @@ pub struct PortfolioUpdateEntry {
 /// True when `status` names an IB order state that is still working on the broker.
 /// Whitelist (rather than blacklist) so non-canonical or empty strings — and
 /// any future terminal states added by IB — are treated as "not open".
+/// The status kept for an order refused before it was sent (ibx#542). Not
+/// a status of the API: it is never given to the caller, and it is not an
+/// open status.
+pub const UNSENT_STATUS: &str = "Unsent";
+
 #[inline]
 pub fn is_open_status(status: &str) -> bool {
     matches!(
@@ -912,6 +971,9 @@ fn gcd(a: u32, b: u32) -> u32 {
 /// sent (ibx#463; captured 25/09/2026).
 pub const MODIFY_OF_FINISHED_ORDER: (i64, &str) = (104, "Cannot modify a filled order.");
 
+/// A new order under the id of an order of this client that is working (ibx#538).
+pub const DUPLICATE_ORDER_ID: (i64, &str) = (103, "Duplicate order id");
+
 /// The reference's refusal of a fractional quantity (ib-agent#192 B3).
 pub const FRACTIONAL_VIA_API: (i64, &str) = (10243,
     "Fractional-sized order cannot be placed via API. Please use desktop version to place this order.");
@@ -1065,6 +1127,13 @@ pub const MD_MAX_TICKERS: (i64, &str) = (101, "Max number of tickers has been re
 pub const MD_NOT_SUBSCRIBED: &str = "Requested market data is not subscribed. Check API status by selecting the Account menu \
     then under Management choose Market Data Subscription Manager and/or availability of delayed data.";
 
+/// Error 10197 of the reference, as captured (02/10/2026, 07/10/2026): on
+/// a paper session, a streaming request that ended with a refused news
+/// tick (10094) gets it `MD_NO_DATA_WAIT` later, unless a request of its
+/// contract runs then.
+pub const MD_NO_DATA: (i64, &str) = (10197, "No market data during competing live session");
+pub const MD_NO_DATA_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// A callback for a market data request beside its ticks (ibx#444).
 #[derive(Debug, Clone, PartialEq)]
 pub enum MdNotice {
@@ -1114,6 +1183,9 @@ pub struct ClientCore {
     /// available", so a new request gets 10168 or goes delayed at once
     /// (ibx#444).
     pub md_delayed_known: Mutex<HashSet<i64>>,
+    /// The contracts whose data is frozen (ibx#447): real-time slot ->
+    /// frozen slot, where their requests are while it lasts.
+    pub md_frozen: Mutex<HashMap<InstrumentId, InstrumentId>>,
     /// The last request parameters of each instrument (minimum tick, BBO
     /// exchange, snapshot permissions): a request that joins gets them at
     /// once (ibx#444).
@@ -1124,6 +1196,14 @@ pub struct ClientCore {
     /// Requests that joined a running subscription, and whether on delayed
     /// data, to be answered at the next dispatch (ibx#444).
     pub md_joins: Mutex<Vec<(i64, bool)>>,
+    /// Requests of a paper session that ended with a refused news tick:
+    /// (reqId, when its contract is looked at, conId), oldest first
+    /// (10197, ibx#444); their count is read without the lock.
+    md_no_data: Mutex<Vec<(i64, std::time::Instant, i64)>>,
+    /// The conId the engine found for the slots of requests sent without
+    /// one (ibx#444).
+    md_slot_con_ids: Mutex<HashMap<InstrumentId, i64>>,
+    md_no_data_count: std::sync::atomic::AtomicUsize,
     /// The client's market data modes from reqMarketDataType (ibx#444).
     pub md_modes: Mutex<crate::types::MarketDataModes>,
     /// The "Legal ones" text of the generic tick list refusal: computed
@@ -1166,6 +1246,9 @@ pub struct ClientCore {
     /// (ibx#461).
     pub bulletin_replay: AtomicBool,
 
+    /// Request ids subscribed to display group events (ibx#424).
+    pub display_group_subs: Mutex<HashSet<i64>>,
+
     // Account updates subscription
     pub account_updates_subscribed: AtomicBool,
     pub account_stream: Mutex<AccountStream>,
@@ -1192,6 +1275,9 @@ pub struct ClientCore {
 
     // Open order tracking
     pub open_orders: Mutex<HashMap<OrderId, TrackedOrder>>,
+    /// The orders placed with transmit off and not sent yet, oldest first
+    /// (ibx#509).
+    pub held_orders: Mutex<Vec<(OrderId, ApiContract, ApiOrder)>>,
     /// Open-order requests made while the auth link was lost, answered at
     /// the end of the order replay; one per kind, as the reference keeps
     /// one per request kind and client (ibx#251).
@@ -1202,14 +1288,21 @@ pub struct ClientCore {
     pub what_if_orders: Mutex<HashMap<OrderId, std::collections::VecDeque<(ApiContract, ApiOrder)>>>,
     // Ids of tracked orders that were filled or cancelled: never sent again (ibx#463).
     pub finished_orders: Mutex<HashSet<OrderId>>,
+    /// Ids of tracked orders placed again under the same id (a modify):
+    /// their openOrder shows no derived trail stop price (ibx#521).
+    pub modified_orders: Mutex<HashSet<OrderId>>,
     /// Executions of other clients' orders, by execution id without its
     /// revision: their commission reports are not given.
     pub silent_executions: Mutex<HashSet<String>>,
     /// The highest order id this client placed (orders and what-ifs), as
     /// the reference records it for the client when an order goes on
     /// (`jextend.bH.Z()@78`, `jextend.H.c(int)`): a new order at or below
-    /// it is refused with 103 (ibx#462).
-    pub highest_order_id: AtomicI64,
+    /// it is refused with 103 (ibx#462). Shared with the thread that keeps
+    /// it on disk (ibx#518).
+    pub highest_order_id: Arc<AtomicI64>,
+    /// Keeps `highest_order_id` on disk while the client is connected, as
+    /// the reference keeps it in its saved settings (ibx#518).
+    pub order_id_saver: Mutex<Option<crate::order_ids::Saver>>,
     /// The next order id `take_order_id` hands out, at least the next
     /// valid id.
     pub reserved_order_id: AtomicI64,
@@ -1246,6 +1339,55 @@ pub fn delayed_tick_type(tick_type: i32) -> i32 {
     }
 }
 
+/// The news source of the WSH requests (ibx#443).
+const WSH_SOURCE: &str = "WSHE";
+
+/// A WSH request when its news source is not in the logon's list: the
+/// reference's error (ibx#443).
+pub const WSH_NOT_ALLOWED: (i64, &str) = (10276, "News feed is not allowed.");
+
+/// A WSH request when its news source is listed but not subscribed: the
+/// reference's error (ibx#443).
+pub const WSH_NOT_SUBSCRIBED: (i64, &str) =
+    (10277, "News Feed requires permissions. Please login to Portal to subscribe.");
+
+/// reqWshEventData while no meta data is held: the reference's error
+/// (ibx#443).
+pub const WSH_META_NOT_REQUESTED: (i64, &str) = (10282, "WSH meta data not requested.");
+
+/// reqWshMetaData that cannot be served: the reference's error for a
+/// failed request, with the reason after it (ibx#443).
+pub const WSH_META_FAILED: (i64, &str) =
+    (10279, "Failed to request WSH meta data.The request is not supported.");
+
+/// The permission check of the WSH requests, as the reference (ibx#443):
+/// the error of a session whose logon does not list the WSH news source,
+/// or lists it without a subscription; `None` when it is subscribed.
+pub(crate) fn wsh_refusal(subscribed: &[String], unsubscribed: &[String]) -> Option<(i64, &'static str)> {
+    let has = |codes: &[String]| codes.iter().any(|c| c.eq_ignore_ascii_case(WSH_SOURCE));
+    if has(subscribed) {
+        None
+    } else if has(unsubscribed) {
+        Some(WSH_NOT_SUBSCRIBED)
+    } else {
+        Some(WSH_NOT_ALLOWED)
+    }
+}
+
+/// The answer of reqWshMetaData (ibx#443): the permission error, as the
+/// reference; with the permission, the error of a failed request, since
+/// the data request itself is not implemented.
+pub(crate) fn wsh_meta_data_error(reference: &crate::bridge::ReferenceState) -> (i64, &'static str) {
+    wsh_refusal(&reference.news_sources(), &reference.news_sources_unsubscribed()).unwrap_or(WSH_META_FAILED)
+}
+
+/// The answer of reqWshEventData (ibx#443): the permission error, as the
+/// reference; with the permission, the error of a request made before
+/// any meta data is held, which is always the case here.
+pub(crate) fn wsh_event_data_error(reference: &crate::bridge::ReferenceState) -> (i64, &'static str) {
+    wsh_refusal(&reference.news_sources(), &reference.news_sources_unsubscribed()).unwrap_or(WSH_META_NOT_REQUESTED)
+}
+
 /// requestFA on a session that is not FA: the reference's error, with its
 /// request id for a request that has none (ibx#481).
 pub const REQUEST_FA_NOT_FA: (i64, i64, &str) =
@@ -1255,6 +1397,37 @@ pub const REQUEST_FA_NOT_FA: (i64, i64, &str) =
 /// text; the id is the request's (ibx#481).
 pub const REPLACE_FA_NOT_FA: (i64, &str) =
     (321, "Error validating request.-'b1' : cause - FA data operations ignored for non FA customers.");
+
+/// The display groups, as the reference lists them with no window open
+/// (ibx#424).
+pub const DISPLAY_GROUP_LIST: &str = "1|2|3|4|5|6|7";
+
+/// The contract of a display group: no group has one (ibx#424).
+pub const DISPLAY_GROUP_NO_CONTRACT: &str = "none";
+
+/// Id and code of a refused display group request: the reference gives
+/// the request id in the text only (ibx#424).
+pub const DISPLAY_GROUP_REFUSAL: (i64, i64) = (-1, 321);
+
+/// Error of a display group update whose conId is not a contract
+/// (ibx#424).
+pub const DISPLAY_GROUP_NO_INSTRUMENT: (i32, &str) = (473, "No Financial Instrument defined");
+
+/// What a display group update asks of the caller (ibx#424).
+#[derive(Debug, Clone, PartialEq)]
+pub enum DisplayGroupUpdate {
+    /// Accepted; the reference changes nothing and sends nothing.
+    Nothing,
+    /// Refused: the error text, for `DISPLAY_GROUP_REFUSAL`.
+    Refused(String),
+    /// Accepted, with a conId not seen yet: it is looked up, and one that
+    /// is not a contract gets `DISPLAY_GROUP_NO_INSTRUMENT`.
+    Lookup(i64),
+}
+
+fn display_group_refusal(class: &str, cause: String) -> String {
+    format!("Error validating request.-'{class}' : cause - {cause}")
+}
 
 /// The reference's other names for order types ibx supports, and the name
 /// ibx uses (ibx#469, from the reference's order-type map).
@@ -1409,13 +1582,75 @@ fn reported_price_mgmt(order: &mut ApiOrder, reported: Option<&ApiOrder>) {
 /// lmtPrice and auxPrice 0, volatilityType and referencePriceType 0,
 /// dontUseAutoPriceForHedge true, filledQuantity 0. The other unset values
 /// (minQty, trailingPercent, cashQty, triggerPrice, ...) are shown unset.
+///
+/// And the values it fills by itself, the same on all 198 openOrder and
+/// completedOrder of the recordings (ibx#519): ocaType 3 unless the order
+/// has one of its own (1 to 4), clearingIntent IB, the shareholder text,
+/// and `None` for an adjusted or delta neutral order type that is not set.
 pub fn reported_unset_values(order: &mut ApiOrder) {
+    if !(1..=4).contains(&order.oca_type) { order.oca_type = 3; }
+    if order.clearing_intent.is_empty() { order.clearing_intent = "IB".into(); }
+    if order.shareholder.is_empty() { order.shareholder = NOT_A_SHAREHOLDER.into(); }
+    if order.adjusted_order_type.is_empty() { order.adjusted_order_type = "None".into(); }
+    if order.delta_neutral_order_type.is_empty() { order.delta_neutral_order_type = "None".into(); }
     order.lmt_price = aux_or_zero(order.lmt_price);
     order.aux_price = aux_or_zero(order.aux_price);
     if order.volatility_type == i32::MAX { order.volatility_type = 0; }
     if order.reference_price_type == i32::MAX { order.reference_price_type = 0; }
     order.dont_use_auto_price_for_hedge = true;
     order.filled_quantity = aux_or_zero(order.filled_quantity);
+    // No cash quantity is unset, never 0 (ibx#543).
+    if order.cash_qty == 0.0 { order.cash_qty = f64::MAX; }
+}
+
+/// The shareholder text of every order the reference shows.
+pub const NOT_A_SHAREHOLDER: &str = "Not an insider or substantial shareholder";
+
+/// What the reference's openOrder shows for an order placed in this
+/// session, beyond the order as placed (ibx#519, the recordings of
+/// 26/09/2026 to 07/10/2026):
+/// - the submitter is the user of the session (an order of an earlier
+///   session has none);
+/// - trailStopPrice of a LMT or PEG BEST order, a combo too: the limit
+///   price + 1 from its placement, whatever the caller gave, and no value
+///   once the order was modified (ibx#521, the reference on 08/10/2026:
+///   272.34 gives 273.34, also for an order placed with 277.34; unset after
+///   a modify, on its callbacks and on a later listing). PEG BEST after a
+///   modify is not recorded and follows LMT;
+/// - trailStopPrice of a STP order: its stop price, the new one after a
+///   modify.
+fn session_order_fields(order: &mut ApiOrder, user: &str, modified: bool) {
+    if order.submitter.is_empty() {
+        order.submitter = user.to_string();
+    }
+    let unset = |v: f64| v == f64::MAX || v == 0.0;
+    let is = |t: &str| order.order_type.eq_ignore_ascii_case(t);
+    if is("LMT") || is("PEG BEST") {
+        order.trail_stop_price = if modified || unset(order.lmt_price) { f64::MAX } else { order.lmt_price + 1.0 };
+    } else if is("STP") && !unset(order.aux_price) {
+        order.trail_stop_price = order.aux_price;
+    }
+}
+
+/// The contract of an openOrder: the one the contract data gave, with the
+/// exchange the order was placed on and no primary exchange, as the
+/// reference shows it (ibx#519: SMART on every report of an order placed
+/// on SMART).
+fn placed_contract(contract: &mut ApiContract, placed_exchange: &str) {
+    if contract.sec_type.eq_ignore_ascii_case("BAG") {
+        return;
+    }
+    if !placed_exchange.is_empty() {
+        contract.exchange = placed_exchange.to_string();
+    }
+    contract.primary_exchange.clear();
+}
+
+/// The order and the contract of a preview as the reference's openOrder
+/// shows them: those of an order of the session (ibx#519).
+pub fn preview_view(contract: &mut ApiContract, order: &mut ApiOrder, placed_exchange: &str, shared: &SharedState) {
+    session_order_fields(order, &shared.reference.user_name(), false);
+    placed_contract(contract, placed_exchange);
 }
 
 fn reported_trail_limit(order: &mut ApiOrder, reported: &ApiOrder) {
@@ -1424,7 +1659,9 @@ fn reported_trail_limit(order: &mut ApiOrder, reported: &ApiOrder) {
     if order.order_type.eq_ignore_ascii_case("TRAIL") && reported.trail_stop_price != f64::MAX {
         order.trail_stop_price = reported.trail_stop_price;
     }
-    if !order.order_type.eq_ignore_ascii_case("TRAIL LIMIT") { return; }
+    // A TRAIL LIT as a TRAIL LIMIT: the server reports its limit price,
+    // offset and trigger (captured 26/09/2026, ibx#469).
+    if !["TRAIL LIMIT", "TRAIL LIT"].iter().any(|t| order.order_type.eq_ignore_ascii_case(t)) { return; }
     if reported.lmt_price != 0.0 { order.lmt_price = reported.lmt_price; }
     if reported.lmt_price_offset != f64::MAX { order.lmt_price_offset = reported.lmt_price_offset; }
     if reported.trail_stop_price != f64::MAX { order.trail_stop_price = reported.trail_stop_price; }
@@ -1459,9 +1696,13 @@ impl ClientCore {
             md_generic: Mutex::new(HashMap::new()),
             md_waiting: Mutex::new(Vec::new()),
             md_delayed_known: Mutex::new(HashSet::new()),
+            md_frozen: Mutex::new(HashMap::new()),
             instrument_params: Mutex::new(HashMap::new()),
             instrument_news: Mutex::new(HashMap::new()),
             md_joins: Mutex::new(Vec::new()),
+            md_no_data: Mutex::new(Vec::new()),
+            md_slot_con_ids: Mutex::new(HashMap::new()),
+            md_no_data_count: std::sync::atomic::AtomicUsize::new(0),
             md_modes: Mutex::new(Default::default()),
             generic_legal: Mutex::new(None),
             snapshot_reqs: Mutex::new(HashMap::new()),
@@ -1482,6 +1723,7 @@ impl ClientCore {
             next_account_summary: AtomicU64::new(1),
             bulletin_subscribed: AtomicBool::new(false),
             bulletin_replay: AtomicBool::new(false),
+            display_group_subs: Mutex::new(HashSet::new()),
             account_updates_subscribed: AtomicBool::new(false),
             account_stream: Mutex::new(AccountStream::default()),
             last_portfolio: Mutex::new(None),
@@ -1492,11 +1734,14 @@ impl ClientCore {
             last_reports: Mutex::new(HashMap::new()),
             pending_commissions: Mutex::new(PendingCommissions::default()),
             open_orders: Mutex::new(HashMap::new()),
+            held_orders: Mutex::new(Vec::new()),
             held_open_orders: Mutex::new(Vec::new()),
             what_if_orders: Mutex::new(HashMap::new()),
             finished_orders: Mutex::new(HashSet::new()),
+            modified_orders: Mutex::new(HashSet::new()),
             silent_executions: Mutex::new(HashSet::new()),
-            highest_order_id: AtomicI64::new(0),
+            highest_order_id: Arc::new(AtomicI64::new(0)),
+            order_id_saver: Mutex::new(None),
             reserved_order_id: AtomicI64::new(0),
             market_data_type: AtomicI32::new(1),
             mdt_sent: Mutex::new(HashSet::new()),
@@ -1520,7 +1765,11 @@ impl ClientCore {
         self.instrument_params.lock().unwrap().clear();
         self.instrument_news.lock().unwrap().clear();
         self.md_joins.lock().unwrap().clear();
+        self.md_no_data.lock().unwrap().clear();
+        self.md_slot_con_ids.lock().unwrap().clear();
+        self.md_no_data_count.store(0, Ordering::Release);
         *self.md_modes.lock().unwrap() = Default::default();
+        self.md_frozen.lock().unwrap().clear();
         self.snapshot_reqs.lock().unwrap().clear();
         self.snapshot_count.store(0, Ordering::Release);
         self.reg_snapshots.lock().unwrap().clear();
@@ -1537,12 +1786,14 @@ impl ClientCore {
         self.account_multi.lock().unwrap().clear();
         self.bulletin_subscribed.store(false, Ordering::Relaxed);
         self.bulletin_replay.store(false, Ordering::Relaxed);
+        self.display_group_subs.lock().unwrap().clear();
         self.account_updates_subscribed.store(false, Ordering::Relaxed);
         *self.account_stream.lock().unwrap() = AccountStream::default();
         *self.last_portfolio.lock().unwrap() = None;
         self.executions.lock().unwrap().clear();
         self.pending_commissions.lock().unwrap().clear();
         self.open_orders.lock().unwrap().clear();
+        self.held_orders.lock().unwrap().clear();
         self.what_if_orders.lock().unwrap().clear();
         // `finished_orders` and `highest_order_id` are kept: the server
         // still knows those orders after a reconnect, so their ids must not
@@ -1583,7 +1834,7 @@ impl ClientCore {
     /// keeps the slot of its order.
     #[allow(clippy::too_many_arguments)]
     pub fn order_instrument(
-        &self, control_tx: &Sender<ControlCommand>, order_id: OrderId, what_if: bool,
+        &self, control_tx: &ControlSender, order_id: OrderId, what_if: bool,
         con_id: i64, symbol: &str, exchange: &str, sec_type: &str, currency: &str,
     ) -> Result<InstrumentId, String> {
         if con_id != 0 || sec_type.eq_ignore_ascii_case("BAG") {
@@ -1604,7 +1855,7 @@ impl ClientCore {
     /// Returns `Err` if the control channel is closed.
     /// Tell the engine the currency of a contract before an order on it,
     /// when it does not have it yet (tag 15, ibx#466).
-    pub fn note_currency(&self, control_tx: &Sender<ControlCommand>, con_id: i64, currency: &str) {
+    pub fn note_currency(&self, control_tx: &ControlSender, con_id: i64, currency: &str) {
         if currency.is_empty() || con_id == 0 {
             return;
         }
@@ -1625,7 +1876,7 @@ impl ClientCore {
 
     pub fn find_or_register_instrument(
         &self,
-        control_tx: &Sender<ControlCommand>,
+        control_tx: &ControlSender,
         con_id: i64,
         symbol: &str,
         exchange: &str,
@@ -1667,7 +1918,7 @@ impl ClientCore {
     pub fn register_mkt_data(
         &self,
         shared: &SharedState,
-        control_tx: &Sender<ControlCommand>,
+        control_tx: &ControlSender,
         req_id: i64,
         con_id: i64,
         symbol: &str,
@@ -1843,7 +2094,7 @@ impl ClientCore {
     /// oldest first, as the reference's line manager subscribes the
     /// records it kept waiting once the count is under the limit
     /// (ibx#444). They get no second 101.
-    pub fn promote_waiting_md(&self, shared: &SharedState, control_tx: &Sender<ControlCommand>) {
+    pub fn promote_waiting_md(&self, shared: &SharedState, control_tx: &ControlSender) {
         loop {
             if self.md_waiting.lock().unwrap().is_empty()
                 || self.md_lines_in_use() >= shared.reference.snapshot_rate_limit() as usize
@@ -1882,6 +2133,44 @@ impl ClientCore {
             return false;
         }
         true
+    }
+
+    /// The requests ended by a refused news tick whose wait is over at
+    /// `now`: 10197 for each whose contract has no running request, as
+    /// captured (ibx#444).
+    pub fn take_md_no_data(&self, now: std::time::Instant) -> Vec<MdNotice> {
+        if self.md_no_data_count.load(Ordering::Acquire) == 0 {
+            return Vec::new();
+        }
+        let mut waits = self.md_no_data.lock().unwrap();
+        let due = waits.iter().take_while(|(_, at, _)| *at <= now).count();
+        if due == 0 {
+            return Vec::new();
+        }
+        let instruments = self.con_id_to_instrument.lock().unwrap();
+        let slots = self.md_slot_con_ids.lock().unwrap();
+        let observers = self.instrument_to_req.lock().unwrap();
+        let runs = |slot: &InstrumentId| observers.get(slot).is_some_and(|reqs| !reqs.is_empty());
+        let notices = waits.drain(..due)
+            .filter(|(_, _, con_id)| {
+                !instruments.get(con_id).is_some_and(runs) && !slots.iter().any(|(slot, c)| c == con_id && runs(slot))
+            })
+            .map(|(req_id, ..)| MdNotice::Error { req_id, code: MD_NO_DATA.0, text: MD_NO_DATA.1.to_string() })
+            .collect();
+        self.md_no_data_count.store(waits.len(), Ordering::Release);
+        notices
+    }
+
+    /// A streaming request ended with a refused news tick (10094): on a
+    /// paper session its contract (`con_id`) is looked at
+    /// `MD_NO_DATA_WAIT` later (`take_md_no_data`).
+    pub fn note_news_refused(&self, shared: &SharedState, req_id: i64, con_id: i64) {
+        if !shared.reference.paper_session() {
+            return;
+        }
+        let mut waits = self.md_no_data.lock().unwrap();
+        waits.push((req_id, std::time::Instant::now() + MD_NO_DATA_WAIT, con_id));
+        self.md_no_data_count.store(waits.len(), Ordering::Release);
     }
 
     /// Put a market data request among the requests of an instrument
@@ -1931,7 +2220,7 @@ impl ClientCore {
     /// contract being fetched gets 10169.
     #[allow(clippy::too_many_arguments)]
     pub fn start_regulatory_snapshot(
-        &self, shared: &SharedState, control_tx: &Sender<ControlCommand>, req_id: i64,
+        &self, shared: &SharedState, control_tx: &ControlSender, req_id: i64,
         con_id: i64, symbol: &str, exchange: &str, sec_type: &str,
     ) -> Result<(), String> {
         if con_id == 0 {
@@ -1960,7 +2249,7 @@ impl ClientCore {
 
     /// Stop a regulatory snapshot (cancelMktData): nothing more is sent
     /// for it. False when the request is not one.
-    pub fn cancel_regulatory_snapshot(&self, req_id: i64, control_tx: &Sender<ControlCommand>) -> bool {
+    pub fn cancel_regulatory_snapshot(&self, req_id: i64, control_tx: &ControlSender) -> bool {
         let mut fetches = self.reg_snapshots.lock().unwrap();
         let Some(pos) = fetches.iter().position(|f| f.req_id == req_id) else { return false };
         let f = fetches.remove(pos);
@@ -1973,7 +2262,7 @@ impl ClientCore {
     /// ticks or their error.
     #[allow(clippy::type_complexity)]
     pub fn poll_regulatory_snapshots(
-        &self, shared: &SharedState, control_tx: &Sender<ControlCommand>,
+        &self, shared: &SharedState, control_tx: &ControlSender,
     ) -> Vec<(i64, Result<Vec<crate::control::regsnapshot::SnapshotTick>, (i64, String)>)> {
         use crate::control::regsnapshot::{SnapshotFields, Step};
         {
@@ -2034,7 +2323,7 @@ impl ClientCore {
     /// request needs them. Never waits: a registration reply is read on a
     /// later call. Checked when positions or requests change, and every
     /// second.
-    pub fn maintain_pnl_quotes(&self, shared: &SharedState, control_tx: &Sender<ControlCommand>) {
+    pub fn maintain_pnl_quotes(&self, shared: &SharedState, control_tx: &ControlSender) {
         let n_pnl = self.pnl_reqs.lock().unwrap().len();
         let singles: Vec<i64> = self.pnl_single_reqs.lock().unwrap().values().copied().collect();
         let mut q = self.pnl_quotes.lock().unwrap();
@@ -2161,6 +2450,7 @@ impl ClientCore {
         }
         // No step of the contract is queued any more (ibx#446).
         shared.market.md_events.listen(instrument, false);
+        self.md_frozen.lock().unwrap().retain(|_, frozen| *frozen != instrument);
         self.instrument_params.lock().unwrap().remove(&instrument);
         self.instrument_news.lock().unwrap().remove(&instrument);
         // A delayed record that is let go loses its "delayed available"
@@ -2195,7 +2485,12 @@ impl ClientCore {
     pub fn take_md_rejects(&self, shared: &SharedState) -> (Vec<MdNotice>, Vec<ControlCommand>) {
         let mut notices = Vec::new();
         let mut commands = Vec::new();
+        let resolved = shared.market.drain_md_resolved();
+        if !resolved.is_empty() {
+            self.md_slot_con_ids.lock().unwrap().extend(resolved);
+        }
         for (from, into, at) in shared.market.drain_md_merges() {
+            self.md_slot_con_ids.lock().unwrap().remove(&from);
             // None left: they were cancelled, which freed the slot.
             let Some(reqs) = self.instrument_to_req.lock().unwrap().remove(&from) else { continue };
             for req_id in reqs {
@@ -2212,6 +2507,18 @@ impl ClientCore {
             commands.push(ControlCommand::Unsubscribe { instrument: from });
         }
         for reject in shared.market.drain_md_rejects() {
+            match reject {
+                crate::bridge::MdReject::Frozen { instrument, frozen } => {
+                    self.md_freeze(shared, instrument, frozen, &mut notices);
+                    continue;
+                }
+                crate::bridge::MdReject::Live { instrument, live } => {
+                    self.md_thaw(shared, instrument, live, &mut notices);
+                    commands.push(ControlCommand::Unsubscribe { instrument });
+                    continue;
+                }
+                _ => {}
+            }
             let (code, text, gone) = Self::md_reject_error(&reject);
             // The record keeps "not subscribed, delayed available" (ibx#444).
             if let crate::bridge::MdReject::NotSubscribed { instrument, delayed_available, .. } = &reject {
@@ -2243,11 +2550,75 @@ impl ClientCore {
                     notices.push(MdNotice::Error { req_id, code: MD_TOP_REJECTED.0, text: MD_TOP_REJECTED.1.to_string() });
                 } else {
                     notices.push(MdNotice::Error { req_id, code, text: text.to_string() });
+                    let streaming = !self.snapshot_reqs.lock().unwrap().contains_key(&req_id);
                     commands.extend(self.drop_mkt_data(shared, req_id, false).map(MdCancel::commands).unwrap_or_default());
+                    // A refused news tick: its contract is looked at later (10197).
+                    if let crate::bridge::MdReject::NewsRefused { con_id, .. } = &reject
+                        && streaming
+                    {
+                        self.note_news_refused(shared, req_id, *con_id);
+                    }
                 }
             }
         }
         (notices, commands)
+    }
+
+    /// The contract of slot `live` is frozen (ibx#447): its requests go on
+    /// with the frozen top of book of slot `frozen`, as the reference's
+    /// subscriber reads the record's frozen view once frozen is confirmed
+    /// (`jextend.v.a(boolean)@36-140`): marketDataType 2 (after the request
+    /// parameters the contract kept, when the request has not had them),
+    /// then every value of the frozen view as it comes, sent again from
+    /// nothing (captured 07/10/2026).
+    fn md_freeze(&self, shared: &SharedState, live: InstrumentId, frozen: InstrumentId, notices: &mut Vec<MdNotice>) {
+        let Some(reqs) = self.instrument_to_req.lock().unwrap().remove(&live) else { return };
+        shared.market.md_events.listen(live, false);
+        let params = self.instrument_params.lock().unwrap().remove(&live);
+        if let Some(p) = params.clone() {
+            self.instrument_params.lock().unwrap().insert(frozen, p);
+        }
+        for iid in self.con_id_to_instrument.lock().unwrap().values_mut() {
+            if *iid == live { *iid = frozen; }
+        }
+        self.md_frozen.lock().unwrap().insert(live, frozen);
+        for req_id in reqs {
+            self.req_to_instrument.lock().unwrap().remove(&req_id);
+            self.md_joins.lock().unwrap().retain(|(r, _)| *r != req_id);
+            if !self.join_md_observers(shared, req_id, frozen, false, None, None) {
+                continue;
+            }
+            if let Some((min_tick, bbo_exchange, permissions)) = params.clone()
+                && self.tick_req_params_sent.lock().unwrap().insert(req_id)
+            {
+                notices.push(MdNotice::TickReqParams { req_id, min_tick, bbo_exchange, permissions });
+            }
+            self.mdt_sent.lock().unwrap().insert(req_id);
+            notices.push(MdNotice::MarketDataType { req_id, market_data_type: MDT_FROZEN });
+        }
+    }
+
+    /// The contract of the frozen slot `frozen` has real-time data again
+    /// (ibx#447): its requests go back to slot `live`, marketDataType 1,
+    /// then every value of the real-time quote (`jextend.v.a(boolean)`
+    /// false: REGULAR, then `s.e(false)`).
+    fn md_thaw(&self, shared: &SharedState, frozen: InstrumentId, live: InstrumentId, notices: &mut Vec<MdNotice>) {
+        self.md_frozen.lock().unwrap().retain(|_, f| *f != frozen);
+        let reqs = self.instrument_to_req.lock().unwrap().remove(&frozen).unwrap_or_default();
+        shared.market.md_events.listen(frozen, false);
+        if let Some(p) = self.instrument_params.lock().unwrap().remove(&frozen) {
+            self.instrument_params.lock().unwrap().entry(live).or_insert(p);
+        }
+        for iid in self.con_id_to_instrument.lock().unwrap().values_mut() {
+            if *iid == frozen { *iid = live; }
+        }
+        for req_id in reqs {
+            self.req_to_instrument.lock().unwrap().remove(&req_id);
+            self.md_joins.lock().unwrap().retain(|(r, _)| *r != req_id);
+            if self.join_md_observers(shared, req_id, live, true, None, None) {
+                notices.push(MdNotice::MarketDataType { req_id, market_data_type: MDT_REALTIME });
+            }
+        }
     }
 
     /// What the requests that joined a running subscription get at once
@@ -2316,6 +2687,7 @@ impl ClientCore {
     /// contract inherits the id. A later request for that conId simply
     /// re-registers.
     pub fn forget_instrument(&self, instrument: InstrumentId) {
+        self.md_slot_con_ids.lock().unwrap().remove(&instrument);
         self.instrument_params.lock().unwrap().remove(&instrument);
         self.instrument_news.lock().unwrap().remove(&instrument);
         let mut sent = self.currency_sent.lock().unwrap();
@@ -2338,6 +2710,31 @@ impl ClientCore {
     }
 
     /// Look up a contract: merge local cache with shared reference for richest data.
+    /// The contract execDetails shows for an execution of `order_id`
+    /// (ibx#543, the order scenarios of 09/10/2026 on both sides): the
+    /// contract of the order with its conId, local symbol and trading
+    /// class, also for an order placed by symbol, on the exchange of the
+    /// execution (`venue`), not the exchange the order was routed through.
+    /// A combo is shown by its own rule (`apply_combo_exec`).
+    pub fn execution_contract(&self, shared: &SharedState, order_id: OrderId, mut contract: ApiContract, venue: &str) -> ApiContract {
+        if contract.sec_type.eq_ignore_ascii_case("BAG") {
+            return contract;
+        }
+        let reported = shared.orders.get_order_info(order_id).map(|i| i.contract);
+        if contract.con_id == 0 {
+            contract.con_id = reported.as_ref().map_or(0, |r| r.con_id);
+        }
+        let known = (contract.con_id != 0).then(|| self.get_contract(contract.con_id, shared)).flatten();
+        for full in [known, reported].into_iter().flatten().filter(|f| f.con_id == contract.con_id) {
+            if contract.local_symbol.is_empty() { contract.local_symbol = full.local_symbol; }
+            if contract.trading_class.is_empty() { contract.trading_class = full.trading_class; }
+        }
+        if !venue.is_empty() {
+            contract.exchange = venue.to_string();
+        }
+        contract
+    }
+
     pub fn get_contract(&self, con_id: i64, shared: &SharedState) -> Option<ApiContract> {
         let local = self.contract_cache.lock().unwrap().get(&con_id).cloned();
         let shared_ref = shared.reference.get_contract(con_id);
@@ -2410,7 +2807,7 @@ impl ClientCore {
     pub fn register_tbt(
         &self,
         _shared: &SharedState,
-        control_tx: &Sender<ControlCommand>,
+        control_tx: &ControlSender,
         req_id: i64,
         con_id: i64,
         symbol: &str,
@@ -2444,7 +2841,7 @@ impl ClientCore {
     /// 05/10/2026: a symbol lookup, then the query with the conId found);
     /// the request has no slot until then.
     pub fn register_tbt_by_symbol(
-        &self, control_tx: &Sender<ControlCommand>, req_id: i64, contract: &crate::api::types::Contract,
+        &self, control_tx: &ControlSender, req_id: i64, contract: &crate::api::types::Contract,
         tbt_type: TbtType, number_of_ticks: i32, ignore_size: bool,
     ) -> Result<(), String> {
         let request = ControlCommand::SubscribeTbt {
@@ -2597,10 +2994,10 @@ impl ClientCore {
     /// position data is in; then one row each time a position or its
     /// average cost changes. When the data is not in after 30 s: error 2151
     /// and no end, and the request ends.
-    pub fn prepare_positions(&self, shared: &SharedState) -> Option<PositionsBatch> {
+    pub fn prepare_positions(&self, shared: &SharedState, account: &str) -> Option<PositionsBatch> {
         let mut guard = self.positions_sub.lock().unwrap();
         let sub = guard.as_mut()?;
-        let batch = advance_positions(sub, shared);
+        let batch = advance_positions(sub, shared, Some(account));
         if batch.as_ref().is_some_and(|b| b.error.is_some()) {
             *guard = None;
         }
@@ -2630,7 +3027,7 @@ impl ClientCore {
     pub fn prepare_positions_multi(&self, shared: &SharedState) -> Vec<(i64, String, String, PositionsBatch)> {
         let mut subs = self.positions_multi.lock().unwrap();
         let mut out = Vec::new();
-        subs.retain_mut(|m| match advance_positions(&mut m.sub, shared) {
+        subs.retain_mut(|m| match advance_positions(&mut m.sub, shared, None) {
             Some(batch) => {
                 let expired = batch.error.is_some();
                 out.push((m.req_id, m.account.clone(), m.model_code.clone(), batch));
@@ -2727,14 +3124,13 @@ impl ClientCore {
     /// (ibx#447), which sets its modes as the reference does
     /// (`MarketDataModes`): with delayed on (3, 4, and 2 after them), a
     /// subscription the server rejects with delayed data available goes on
-    /// delayed. A value outside 1..=4 is refused with 321 under id -1, as
-    /// the reference, and changes nothing.
-    pub fn set_market_data_type(&self, control_tx: &Sender<ControlCommand>, mdt: i32) -> Option<(i64, String)> {
+    /// delayed; with frozen on (2, until 1), the requests made from then on
+    /// ask the contract's market data status and get its frozen data while
+    /// it is frozen (`md_freeze`). A value outside 1..=4 is refused with
+    /// 321 under id -1, as the reference, and changes nothing.
+    pub fn set_market_data_type(&self, control_tx: &ControlSender, mdt: i32) -> Option<(i64, String)> {
         if !(1..=4).contains(&mdt) {
             return Some((321, "Error validating request.-'b0' : cause - Invalid market data type".to_string()));
-        }
-        if matches!(mdt, 2 | 4) {
-            log::warn!("req_market_data_type({}): no frozen subscription is sent; the frozen mode is kept (ibx#447)", mdt);
         }
         self.market_data_type.store(mdt, Ordering::Relaxed);
         self.md_modes.lock().unwrap().apply(mdt);
@@ -2809,8 +3205,11 @@ impl ClientCore {
         let mut out = Vec::new();
         for p in params {
             let permissions = p.snapshot_permissions as i64;
-            self.instrument_params.lock().unwrap().insert(p.instrument, (p.min_tick, p.bbo_exchange.clone(), permissions));
-            for req_id in self.md_requests_of(p.instrument) {
+            // The requests of a frozen contract are on its frozen slot
+            // (ibx#447).
+            let instrument = self.md_frozen.lock().unwrap().get(&p.instrument).copied().unwrap_or(p.instrument);
+            self.instrument_params.lock().unwrap().insert(instrument, (p.min_tick, p.bbo_exchange.clone(), permissions));
+            for req_id in self.md_requests_of(instrument) {
                 if self.tick_req_params_sent.lock().unwrap().insert(req_id) {
                     out.push((req_id, self.check_mdt_needed(req_id, true), p.min_tick, p.bbo_exchange.clone(), permissions));
                 }
@@ -2887,6 +3286,8 @@ impl ClientCore {
             MdReject::NoSecurityDefinition { .. } =>
                 (200, crate::engine::hot_loop::ccp::NO_SECURITY_DEFINITION.into(), true),
             MdReject::NewsRefused { text, .. } => (10094, text.clone(), true),
+            // Not errors: `take_md_rejects` moves the requests (ibx#447).
+            MdReject::Frozen { .. } | MdReject::Live { .. } => (0, String::new(), false),
         }
     }
 
@@ -2897,10 +3298,105 @@ impl ClientCore {
     /// confirmed a state that did not exist (ibx#234).
     pub fn check_mdt_needed(&self, req_id: i64, has_data: bool) -> Option<i32> {
         if has_data && self.mdt_sent.lock().unwrap().insert(req_id) {
-            Some(MDT_REALTIME)
+            // A request on the frozen slot of a frozen contract (ibx#447).
+            let frozen = self.md_frozen.lock().unwrap();
+            let on_frozen = !frozen.is_empty()
+                && self.req_to_instrument.lock().unwrap().get(&req_id).is_some_and(|i| frozen.values().any(|f| f == i));
+            Some(if on_frozen { MDT_FROZEN } else { MDT_REALTIME })
         } else {
             None
         }
+    }
+
+    // ── Display groups ──
+
+    /// queryDisplayGroups as the reference (ibx#424): the fixed list of
+    /// groups, or the text of its refusal.
+    pub fn query_display_groups(req_id: i64) -> Result<&'static str, String> {
+        if req_id == i32::MAX as i64 {
+            return Err(display_group_refusal("bW", format!("Invalid request ID={req_id}")));
+        }
+        Ok(DISPLAY_GROUP_LIST)
+    }
+
+    /// subscribeToGroupEvents as the reference (ibx#424): the contract of
+    /// the group, sent at once, or the text of the refusal. Groups are 1
+    /// to 7; a request id subscribes once.
+    pub fn subscribe_to_group_events(&self, req_id: i64, group_id: i32) -> Result<&'static str, String> {
+        if req_id == i32::MAX as i64 {
+            return Err(display_group_refusal("bX", format!("Invalid request ID={req_id}")));
+        }
+        if !(1..=7).contains(&group_id) {
+            return Err(display_group_refusal("bX", format!("Invalid window group ID={group_id}")));
+        }
+        if !self.display_group_subs.lock().unwrap().insert(req_id) {
+            return Err(display_group_refusal("bX", format!("Request with ID={req_id} was already subscribed.")));
+        }
+        Ok(DISPLAY_GROUP_NO_CONTRACT)
+    }
+
+    /// unsubscribeFromGroupEvents as the reference (ibx#424): the text of
+    /// the refusal when the request id is not subscribed, else no answer.
+    pub fn unsubscribe_from_group_events(&self, req_id: i64) -> Option<String> {
+        if req_id == i32::MAX as i64 {
+            return Some(display_group_refusal("bY", format!("Invalid request ID={req_id}")));
+        }
+        if self.display_group_subs.lock().unwrap().remove(&req_id) {
+            return None;
+        }
+        Some(display_group_refusal("bY", format!("Subscription for Group Events with request ID={req_id} wasn't found.")))
+    }
+
+    /// updateDisplayGroup as the reference (ibx#424). `contract_info` is
+    /// `conid@exch|param1=value1|...|action=(action)`; one token is a group
+    /// change, which needs the request id of a subscription. A valid
+    /// update changes nothing there and gives no event; `known` tells
+    /// whether a conId was seen before. The parameters of the other action
+    /// are not checked.
+    pub fn update_display_group(&self, req_id: i64, contract_info: &str, known: impl Fn(i64) -> bool) -> DisplayGroupUpdate {
+        let refused = |cause: String| DisplayGroupUpdate::Refused(display_group_refusal("bZ", cause));
+        if req_id == i32::MAX as i64 {
+            return refused(format!("Invalid request ID={req_id}"));
+        }
+        let mut tokens: Vec<&str> = contract_info.split('|').collect();
+        while tokens.len() > 1 && tokens.last().is_some_and(|t| t.is_empty()) {
+            tokens.pop();
+        }
+        let mut change_group = true;
+        if tokens.len() > 1 {
+            let action = tokens.iter().find_map(|t| {
+                t.get(..7).filter(|k| k.eq_ignore_ascii_case("action=")).map(|_| t[7..].trim())
+            });
+            match action {
+                None => return refused(
+                    "Action is unknown. Please check the pattern: conid@exch|param1=value1|...|action=(action)".to_string()),
+                Some(name) if name.eq_ignore_ascii_case("ChangeGroupEc") => {}
+                Some(name) if name.eq_ignore_ascii_case("OpenTS") => change_group = false,
+                Some(name) => return refused(format!("Action '{name}' is unknown")),
+            }
+        }
+        let token = tokens[0];
+        if change_group {
+            if !self.display_group_subs.lock().unwrap().contains(&req_id) {
+                return refused(format!("Request with ID={req_id} failed since request ID wasn't found."));
+            }
+            if token.eq_ignore_ascii_case("none") {
+                return DisplayGroupUpdate::Nothing;
+            }
+        }
+        let con_id = match token.split('@').next().unwrap_or("").parse::<i32>() {
+            Ok(con_id) => con_id,
+            Err(_) => return refused(format!(
+                "Request with ID={req_id} failed with invalid contract info={token}, expected format 'contractId@exchange'")),
+        };
+        if con_id == 0 || con_id == i32::MAX {
+            return refused(format!(
+                "Request with ID={req_id} failed with invalid contract info={token}: conid or excahge are missing, expected format 'contractId@exchange'"));
+        }
+        if !change_group || known(con_id as i64) {
+            return DisplayGroupUpdate::Nothing;
+        }
+        DisplayGroupUpdate::Lookup(con_id as i64)
     }
 
     // ── Bulletin subscription management ──
@@ -3091,10 +3587,12 @@ impl ClientCore {
         order.tif = Self::held_tif(&order).to_string();
         self.note_order_id(order_id);
         let mut orders = self.open_orders.lock().unwrap();
-        if let Some(o) = orders.get_mut(&order_id) {
+        // An order that was never sent is placed as a new order.
+        if let Some(o) = orders.get_mut(&order_id).filter(|o| o.status != UNSENT_STATUS) {
             o.contract = contract;
             o.order = order;
             o.instrument = instrument;
+            self.modified_orders.lock().unwrap().insert(order_id);
             return;
         }
         let remaining = order.total_quantity;
@@ -3122,9 +3620,21 @@ impl ClientCore {
         }
     }
 
+    /// The view of an order at one of its fills shows the quantity filled
+    /// with that fill (ibx#543).
+    pub fn report_filled(view: &mut Option<OrderView>, filled: f64) {
+        if let Some(v) = view.as_mut() {
+            v.order.filled_quantity = filled;
+        }
+    }
+
     pub fn order_view(&self, order_id: OrderId, shared: &SharedState, status: &str) -> Option<OrderView> {
         let tracked = self.open_orders.lock().unwrap().get(&order_id).cloned();
         let info = shared.orders.get_order_info(order_id);
+        // The quantity filled so far, from the fills this client saw or
+        // from the server's report.
+        let tracked_fill = [tracked.as_ref().map(|t| t.filled), info.as_ref().map(|i| i.order.filled_quantity)]
+            .into_iter().flatten().filter(|q| *q != f64::MAX && *q > 0.0).reduce(f64::max);
         // The conId of the report, for an order placed without one: the
         // reference shows the contract it looked up (ibx#486).
         let reported_con_id = info.as_ref().map_or(0, |i| i.contract.con_id);
@@ -3137,6 +3647,9 @@ impl ClientCore {
                 if let Some(i) = &info {
                     if order.perm_id == 0 { order.perm_id = i.order.perm_id; }
                     if order.account.is_empty() { order.account = i.order.account.clone(); }
+                    // The OCA group the order has on the server: a child
+                    // order shows its parent's number (ibx#509).
+                    if !i.order.oca_group.is_empty() { order.oca_group = i.order.oca_group.clone(); }
                     reported_trail_limit(&mut order, &i.order);
                 }
                 reported_price_mgmt(&mut order, info.as_ref().map(|i| &i.order));
@@ -3159,12 +3672,28 @@ impl ClientCore {
                 let dropped = self.rth_dropped.lock().unwrap().contains(&order_id);
                 order.outside_rth = (order.outside_rth && !dropped)
                     || info.as_ref().is_some_and(|i| i.order.outside_rth);
+                let modified = self.modified_orders.lock().unwrap().contains(&order_id);
+                session_order_fields(&mut order, &shared.reference.user_name(), modified);
                 (t.contract, order, t.last_fill_price, client_id)
             }
-            // An order the server reported: its own client id.
-            (None, Some(i)) => { let client_id = i.order.client_id as i64; (i.contract, i.order, 0.0, client_id) }
+            // An order the server reported: its own client id, and no
+            // submitter (ibx#519).
+            (None, Some(i)) => {
+                let client_id = i.order.client_id as i64;
+                let mut order = i.order;
+                // An order this client placed and saw end is still an
+                // order of the session (the leg fills after a combo's
+                // Filled report).
+                order.submitter.clear();
+                if self.finished_orders.lock().unwrap().contains(&order_id) {
+                    let modified = self.modified_orders.lock().unwrap().contains(&order_id);
+                    session_order_fields(&mut order, &shared.reference.user_name(), modified);
+                }
+                (i.contract, order, 0.0, client_id)
+            }
             (None, None) => return None,
         };
+        let placed_exchange = contract.exchange.clone();
         let bag = contract.sec_type.eq_ignore_ascii_case("BAG");
         let mut contract = if contract.con_id != 0 && !bag {
             self.get_contract(contract.con_id, shared).unwrap_or(contract)
@@ -3173,8 +3702,29 @@ impl ClientCore {
         } else {
             contract
         };
+        placed_contract(&mut contract, &placed_exchange);
         let mut order = order;
         reported_unset_values(&mut order);
+        // What the reference's openOrder shows, read on both sides in the
+        // order scenarios of 09/10/2026 (ibx#543):
+        // - the quantity filled so far, on a working and on a filled order;
+        // - no completed status or time: those belong to completedOrder;
+        // - no commission while none is known (unset, not 0);
+        // - no auxPrice for an order that trails by a percentage.
+        if let Some(t) = &tracked_fill {
+            order.filled_quantity = order.filled_quantity.max(*t);
+        }
+        state.completed_status.clear();
+        state.completed_time.clear();
+        if state.commission_and_fees == 0.0 {
+            state.commission_and_fees = f64::MAX;
+        }
+        if order.order_type.to_ascii_uppercase().starts_with("TRAIL")
+            && order.trailing_percent != f64::MAX && order.trailing_percent != 0.0
+            && order.aux_price == 0.0
+        {
+            order.aux_price = f64::MAX;
+        }
         Self::apply_combo_view(order_id, &mut contract, &mut order, shared);
         // The API order id the reference shows (0 for an order of another
         // session whose report gave none).
@@ -3193,6 +3743,15 @@ impl ClientCore {
         // The redirect precaution discards the order (ibx#486).
         if matches!(code, 10311 | 10329) {
             self.discarded.lock().unwrap().insert(order_id);
+        }
+        // Refused with 387 before it was sent: the order is not an open
+        // order, and no open-order request lists it; its cancel ends it
+        // (ibx#542).
+        if code == 387
+            && let Some(o) = self.open_orders.lock().unwrap().get_mut(&order_id)
+            && o.status == "PendingSubmit"
+        {
+            o.status = UNSENT_STATUS.into();
         }
     }
 
@@ -3336,6 +3895,28 @@ impl ClientCore {
         None
     }
 
+    /// Start keeping this client's highest order id on disk, raised first
+    /// to the value its earlier sessions saved (ibx#518). Called at the
+    /// connect, once the client id is known; a file that cannot be used is
+    /// logged and the client goes on without it.
+    pub fn keep_order_ids(&self, account: &str) {
+        let Some(path) = crate::order_ids::default_path() else { return };
+        let client_id = self.client_id.load(Ordering::Relaxed);
+        let mut saver = self.order_id_saver.lock().unwrap();
+        // The saver of the last connect saves its value before the new one reads.
+        *saver = None;
+        match crate::order_ids::Saver::start(path, account, client_id, self.highest_order_id.clone()) {
+            Ok(s) => *saver = Some(s),
+            Err(e) => log::warn!("Order ids are not kept across sessions: {}", e),
+        }
+    }
+
+    /// Save this client's highest order id and stop keeping it (at the
+    /// disconnect).
+    pub fn stop_keeping_order_ids(&self) {
+        *self.order_id_saver.lock().unwrap() = None;
+    }
+
     /// Note an order id this client placed: the highest one bounds the
     /// ids of new orders (ibx#462).
     pub fn note_order_id(&self, order_id: OrderId) {
@@ -3455,8 +4036,14 @@ impl ClientCore {
                     let mut order = o.order.clone();
                     if let Some(info) = &info {
                         reported_trail_limit(&mut order, &info.order);
+                        // The OCA group the order has on the server, as in
+                        // the order's own openOrder (ibx#509, ibx#547).
+                        if !info.order.oca_group.is_empty() { order.oca_group = info.order.oca_group.clone(); }
                     }
                     reported_price_mgmt(&mut order, info.as_ref().map(|i| &i.order));
+                    let modified = self.modified_orders.lock().unwrap().contains(&oid);
+                    session_order_fields(&mut order, &shared.reference.user_name(), modified);
+                    placed_contract(&mut contract, &o.contract.exchange);
                     reported_unset_values(&mut order);
                     Self::apply_combo_view(oid, &mut contract, &mut order, shared);
                     result.push((oid, TrackedOrder {
@@ -3484,6 +4071,7 @@ impl ClientCore {
                     info.contract
                 };
                 let mut order = info.order;
+                order.submitter.clear();
                 reported_unset_values(&mut order);
                 result.push((oid, TrackedOrder {
                     contract,
@@ -3805,7 +4393,7 @@ impl ClientCore {
     /// the server sent, with its text and currency, then the end. Later
     /// batches carry the values that changed, and no end. `None` while not
     /// subscribed or before the image is complete.
-    pub fn prepare_account_updates(&self, shared: &SharedState) -> Option<AccountUpdateBatch> {
+    pub fn prepare_account_updates(&self, shared: &SharedState, account: &str) -> Option<AccountUpdateBatch> {
         if !self.account_updates_subscribed.load(Ordering::Acquire) {
             return None;
         }
@@ -3824,12 +4412,20 @@ impl ClientCore {
                     stream.sent.insert(id, row.value.clone());
                     fields.push(AccountFieldUpdate {
                         key: row.key.clone(),
-                        value: row.value.clone(),
+                        // The ledger's account row is the subscription's
+                        // account (`jaccount.X`, column 23).
+                        value: if row.key == "AccountOrGroup" { account.to_string() } else { row.value.clone() },
                         currency: row.currency.clone(),
                     });
                 }
             }
             stream.generation = store.generation;
+        }
+        // The image is the reference's cached values in the order of their
+        // map, keyed by key, "!" and currency (`trader.cm.G`, a TreeMap;
+        // `jextend.dK.a(String, bl)@40-88`; captured 07/10/2026).
+        if first {
+            fields.sort_by_cached_key(|f| format!("{}!{}", f.key, f.currency));
         }
         stream.image_pending = false;
         Some(AccountUpdateBatch { fields, time: format_account_time(time_secs), download_end: first })
@@ -3844,7 +4440,11 @@ impl ClientCore {
             return Vec::new();
         }
 
-        let current = shared.portfolio.position_infos();
+        // In the order the server's portfolio rows first came, as the
+        // reference's image (captured 07/10/2026: the rows of the portfolio
+        // frame, AAPL, AXTI, MSFT, SPY); a position with no row yet last.
+        let mut current = shared.portfolio.position_infos();
+        current.sort_by_key(|p| (p.portfolio_seq == 0, p.portfolio_seq, p.con_id));
         let mut prev_guard = self.last_portfolio.lock().unwrap();
         let is_first = prev_guard.is_none();
 
@@ -4001,24 +4601,6 @@ impl ClientCore {
             order.side()?;
         }
 
-        // transmit=false cannot be honoured: every order is sent to the
-        // broker immediately when place_order is called; there is no
-        // staging concept. Accepting it would send a "staged" bracket
-        // parent live on its own, so reject loudly at the call instead.
-        // See: https://github.com/deepentropy/ibx/issues/226
-        // A what-if with transmit off gets the reference's refusal 321
-        // instead (ibx#462).
-        if !order.transmit && !order.what_if {
-            return Err(
-                "transmit=false is not supported: orders are transmitted \
-                 immediately on place_order; there is no staging concept, so \
-                 the order would go live despite transmit=false. Place child \
-                 orders with parent_id/oca_group set and keep transmit=true \
-                 (the engine links them server-side)."
-                    .into(),
-            );
-        }
-
         // An unrecognized tif would otherwise be sent as DAY silently.
         match order.tif.as_str() {
             "" | "DAY" | "GTC" | "IOC" | "FOK" | "OPG" | "GTD" | "DTC" | "AUC"
@@ -4042,7 +4624,8 @@ impl ClientCore {
             | "MOC" | "LOC" | "MIT" | "LIT" | "MTL" | "MKT PRT" | "STP PRT"
             | "REL" | "PEG MKT" | "PEG MID" | "PEG MIDPT" | "MIDPX" | "MIDPRICE"
             | "SNAP MKT" | "SNAP MID" | "SNAP MIDPT" | "SNAP PRI" | "SNAP PRIM"
-            | "BOX TOP" | "PEG BENCH" => {}
+            | "BOX TOP" | "PEG BENCH"
+            | "TRAIL MIT" | "TRAIL LIT" | "PEG BEST" | "RPI" | "PASSV REL" => {}
             _ => return Err(format!("Unsupported order type: '{}'", order.order_type)),
         }
 
@@ -4071,6 +4654,18 @@ impl ClientCore {
             "TRAIL LIMIT" if !is_given(order.aux_price) => {
                 return Err(
                     "TRAIL LIMIT order requires aux_price (trail amount) but got 0.0".into()
+                );
+            }
+            "TRAIL MIT" if !is_given(order.trailing_percent) && !is_given(order.aux_price) => {
+                return Err(
+                    "TRAIL MIT order requires either trailing_percent or aux_price (trail amount) \
+                     but both are 0.0".into()
+                );
+            }
+            "TRAIL LIT" if !is_given(order.trailing_percent) && !is_given(order.aux_price) => {
+                return Err(
+                    "TRAIL LIT order requires either trailing_percent or aux_price (trail amount) \
+                     but both are 0.0".into()
                 );
             }
             _ => {}
@@ -4824,10 +5419,13 @@ impl ClientCore {
         // A stop type without its stop price, the API's unset value
         // (`jextend.bH.S()@1690-1750`, ibx#485): the auxPrice of STP,
         // STP LMT and STP PRT, the trailStopPrice of a TRAIL LIMIT
-        // (ib-agent#194, no final period; ibx takes 0 as unset there too).
+        // (ib-agent#194, no final period; ibx takes 0 as unset there too)
+        // and of a TRAIL LIT (ibx#469, captured 07/10/2026 by amount and
+        // by percent; a TRAIL MIT without one is sent).
         let stop_type = matches!(order_type.as_str(), "STP" | "STP LMT" | "STP PRT");
         if (stop_type && order.aux_price == f64::MAX)
-            || (order_type == "TRAIL LIMIT" && (order.trail_stop_price == f64::MAX || order.trail_stop_price == 0.0))
+            || (matches!(order_type.as_str(), "TRAIL LIMIT" | "TRAIL LIT")
+                && (order.trail_stop_price == f64::MAX || order.trail_stop_price == 0.0))
         {
             return refuse("Please enter a stop price");
         }
@@ -4850,7 +5448,7 @@ impl ClientCore {
         }
         // A trailing percent below 0 or above 100 (ibx#263).
         let pct = order.trailing_percent;
-        if matches!(order_type.as_str(), "TRAIL" | "TRAIL LIMIT") && pct != 0.0 && pct != f64::MAX
+        if matches!(order_type.as_str(), "TRAIL" | "TRAIL LIMIT" | "TRAIL MIT" | "TRAIL LIT") && pct != 0.0 && pct != f64::MAX
             && (pct < 0.0 || pct > 100.0)
         {
             return refuse("Invalid Trailing Percent value. Valid values are greater than 0 and less than 100.");
@@ -5010,6 +5608,137 @@ impl ClientCore {
         self.open_orders.lock().unwrap().get(&order_id).map(|t| t.order.clone())
     }
 
+    /// The working order a `placeOrder` of `order_id` modifies: the order
+    /// this session placed, or this client's own working order of an
+    /// earlier session, which the server reported at the logon (ibx#538:
+    /// the reference finds an order by its client id and order id, so that
+    /// order is the order, and a placeOrder of its id changes it).
+    pub fn working_order(&self, shared: &SharedState, order_id: OrderId) -> Option<ApiOrder> {
+        // An order that was never sent (held with transmit off, ibx#509,
+        // or refused before it left) is not a working order: placed again,
+        // it is a new order.
+        let tracked = self.open_orders.lock().unwrap().get(&order_id)
+            .map(|t| (t.status != UNSENT_STATUS).then(|| t.order.clone()));
+        if let Some(tracked) = tracked {
+            return tracked;
+        }
+        None.or_else(|| {
+            let me = self.client_id.load(Ordering::Relaxed);
+            shared.orders.get_order_info(order_id)
+                .filter(|info| is_open_status(&info.order_state.status) && i64::from(info.order.client_id) == me)
+                .map(|info| info.order)
+        })
+    }
+
+    /// Keep an order placed with transmit off (ibx#509). The reference
+    /// (the bracket recordings of 26/09/2026; paper run of 09/10/2026)
+    /// sends nothing for it, answers nothing and lists it in no open-order
+    /// request; its id counts as used. Placed again with transmit off, it
+    /// takes the new values and keeps its place.
+    pub fn hold_order(&self, order_id: OrderId, contract: ApiContract, order: ApiOrder, instrument: InstrumentId) {
+        self.note_order_id(order_id);
+        let remaining = order.total_quantity;
+        self.open_orders.lock().unwrap().insert(order_id, TrackedOrder {
+            contract: contract.clone(), order: order.clone(), status: UNSENT_STATUS.into(), filled: 0.0, remaining,
+            instrument, last_fill_price: 0.0,
+        });
+        let mut held = self.held_orders.lock().unwrap();
+        match held.iter_mut().find(|h| h.0 == order_id) {
+            Some(h) => *h = (order_id, contract, order),
+            None => held.push((order_id, contract, order)),
+        }
+    }
+
+    /// What the reference answers while it reads an order, before
+    /// anything is sent: the warnings, in their order, and the refusal if
+    /// one of its checks refuses the order (ibx#416, ibx#263, ibx#421,
+    /// ibx#335, ibx#462). Made at the placeOrder, also for an order placed
+    /// with transmit off, which is then not held (ibx#547, paper
+    /// 09/10/2026: 2174, 391, 439, 321 and 103 at the placeOrder with
+    /// transmit off).
+    pub fn order_read_checks(
+        &self, order_id: OrderId, con_id: i64, exchange: &str, order: &ApiOrder, shared: &SharedState, account: &str,
+    ) -> (Vec<(i64, String)>, Option<(i64, String)>) {
+        let mut notices = Self::implied_zone_warnings(order);
+        let contract_zone = shared.reference.time_zone_id(con_id);
+        let account_pending = Self::order_account_pending(order, &shared.reference, account);
+        // The algo check's warnings come before its refusal (ibx#263).
+        let mut algo_warnings = Vec::new();
+        let refusal = Self::refusal_before_sending_for(order, exchange, account_pending)
+            .or_else(|| Self::algo_definition_refusal(order, exchange, &shared.reference, &mut algo_warnings))
+            .or_else(|| Self::account_config_refusal(order, shared.reference.account_features().as_deref(), account))
+            .or_else(|| Self::good_till_date_refusal(order, contract_zone.as_deref()))
+            .or_else(|| Self::condition_time_zone_refusal(order, contract_zone.as_deref()))
+            .or_else(|| Self::price_refusal(order))
+            .or_else(|| Self::order_id_refusal(order_id))
+            .or_else(|| self.refusal_for_order_id(order_id, order, shared));
+        notices.extend(algo_warnings);
+        (notices, refusal)
+    }
+
+    /// The commands of the orders one placeOrder transmits, as one group
+    /// the engine sends together (ibx#547).
+    pub fn order_group(built: Vec<ControlCommand>) -> ControlCommand {
+        ControlCommand::OrderGroup(built.into_iter().filter_map(|cmd| match cmd {
+            ControlCommand::Order(request) => Some(request),
+            _ => None,
+        }).collect())
+    }
+
+    /// Forget an order held with transmit off (at its cancel).
+    pub fn drop_held_order(&self, order_id: OrderId) {
+        self.held_orders.lock().unwrap().retain(|h| h.0 != order_id);
+    }
+
+    /// Forget every order held with transmit off (at a global cancel).
+    pub fn drop_held_orders(&self) {
+        self.held_orders.lock().unwrap().clear();
+    }
+
+    /// The orders a `placeOrder` with transmit on sends, in the order to
+    /// send them (ibx#509): the order itself and, with it, the held orders
+    /// of its tree of parent and children, as the reference sends them
+    /// together (26/09/2026: parent and take-profit held, the stop sends
+    /// the three; paper 09/10/2026: a child sends its held parent, a parent
+    /// its held children). The orders keep the place of their first
+    /// placeOrder, the placed order taking the place of its held version.
+    /// A held order with no link to the placed order stays held, also one
+    /// of the same OCA group.
+    ///
+    /// With each order, whether it was held: the reference gave the
+    /// warnings of such an order when it was placed with transmit off, and
+    /// does not give them again (ibx#547, paper 09/10/2026).
+    pub fn orders_to_transmit(&self, order_id: OrderId, contract: &ApiContract, order: &ApiOrder) -> Vec<(OrderId, ApiContract, ApiOrder, bool)> {
+        let mut held = self.held_orders.lock().unwrap();
+        let mut all: Vec<(OrderId, ApiContract, ApiOrder, bool)> = std::mem::take(&mut *held).into_iter()
+            .map(|(id, contract, order)| (id, contract, order, true)).collect();
+        match all.iter_mut().find(|h| h.0 == order_id) {
+            Some(h) => *h = (order_id, contract.clone(), order.clone(), true),
+            None => all.push((order_id, contract.clone(), order.clone(), false)),
+        }
+        // The top of the tree: up the parents, as far as they are here.
+        let parent_of = |id: OrderId| all.iter().find(|h| h.0 == id).map(|h| h.2.parent_id).filter(|p| *p != 0);
+        let mut top = order_id;
+        for _ in 0..all.len() {
+            match parent_of(top) {
+                Some(parent) => top = parent,
+                None => break,
+            }
+        }
+        let mut tree: HashSet<OrderId> = HashSet::from([top]);
+        while let Some(id) = all.iter().find(|h| tree.contains(&h.2.parent_id) && !tree.contains(&h.0)).map(|h| h.0) {
+            tree.insert(id);
+        }
+        // The placed order is in its own tree unless its parents loop.
+        tree.insert(order_id);
+        let (mut group, rest): (Vec<_>, Vec<_>) = all.into_iter().partition(|h| tree.contains(&h.0));
+        *held = rest.into_iter().map(|(id, contract, order, _)| (id, contract, order)).collect();
+        for h in &mut group {
+            h.2.transmit = true;
+        }
+        group
+    }
+
     /// The contract a tracked order was placed with.
     pub fn tracked_contract(&self, order_id: OrderId) -> Option<ApiContract> {
         self.open_orders.lock().unwrap().get(&order_id).map(|t| t.contract.clone())
@@ -5095,8 +5824,29 @@ impl ClientCore {
             "SNAP MID" | "SNAP MIDPT" => OrderKind::SnapMid { offset: scale(aux_or_zero(order.aux_price)) },
             "SNAP PRI" | "SNAP PRIM" => OrderKind::SnapPri { offset: scale(aux_or_zero(order.aux_price)) },
             "PEG BENCH" => Self::peg_bench_kind(order),
+            "TRAIL MIT" | "TRAIL LIT" | "PEG BEST" | "RPI" | "PASSV REL" => Self::new_type_kind(order),
             _ => return Err(format!("Unsupported order type: '{}'", order.order_type)),
         })
+    }
+
+    /// A TRAIL MIT, TRAIL LIT, PEG BEST, RPI or PASSV REL order from the
+    /// API fields (ibx#469). TRAIL MIT and TRAIL LIT trail by the percent
+    /// when one is given, else by the amount (the auxPrice). The RPI and
+    /// PASSV REL offset is the auxPrice, 0 when unset.
+    fn new_type_kind(order: &ApiOrder) -> OrderKind {
+        let scale = price_or_zero;
+        let trail_stop_price = scale(order.trail_stop_price);
+        let percent = is_given(order.trailing_percent) && order.trailing_percent > 0.0;
+        let trail = if percent { crate::api::types::price_from_f64(order.trailing_percent) } else { scale(order.aux_price) };
+        match order.order_type.to_uppercase().as_str() {
+            "TRAIL MIT" => OrderKind::TrailMit { trail, percent, trail_stop_price },
+            "TRAIL LIT" => OrderKind::TrailLit { price: scale(order.lmt_price), trail, percent, trail_stop_price },
+            "PEG BEST" => OrderKind::PegBest { price: scale(aux_or_zero(order.lmt_price)) },
+            "PASSV REL" => OrderKind::PassvRel {
+                price: scale(aux_or_zero(order.lmt_price)), offset: scale(aux_or_zero(order.aux_price)),
+            },
+            _ => OrderKind::Rpi { price: scale(order.lmt_price), offset: scale(aux_or_zero(order.aux_price)) },
+        }
     }
 
     /// A pegged-to-benchmark order from the API fields (ibx#415): the
@@ -5445,6 +6195,8 @@ impl ClientCore {
             // One encoder for every pegged-to-benchmark order: its
             // reference exchange rides the attributes (ibx#415).
             "PEG BENCH" => ex(Self::peg_bench_kind(order)),
+            // One encoder for each of these types too (ibx#469).
+            "TRAIL MIT" | "TRAIL LIT" | "PEG BEST" | "RPI" | "PASSV REL" => ex(Self::new_type_kind(order)),
             // The offset is the API auxPrice, 0.00 when unset (ibx#413).
             "SNAP MKT" => {
                 let offset = price_or_zero(order.aux_price);
@@ -6110,6 +6862,7 @@ mod tests {
 
         let core = ClientCore::new();
         let (tx, rx) = crossbeam_channel::unbounded();
+        let tx = crate::engine::park::ControlSender::from(tx);
         core.note_currency(&tx, 1, "EUR");
         core.note_currency(&tx, 1, "EUR");
         core.note_currency(&tx, 1, "");
@@ -6250,6 +7003,7 @@ mod tests {
     fn currency_noted_and_pnl_quotes_idle() {
         let core = ClientCore::new();
         let (tx, _rx) = crossbeam_channel::unbounded();
+        let tx = crate::engine::park::ControlSender::from(tx);
         assert!(core.currency_noted(1, ""));
         assert!(core.currency_noted(0, "EUR"));
         assert!(!core.currency_noted(1, "EUR"));
@@ -6551,6 +7305,28 @@ mod tests {
 #[cfg(test)]
 mod session_tests {
     use super::*;
+
+    // ibx#543, the order scenarios of 09/10/2026 on both sides: execDetails
+    // shows the contract in full, also for an order placed by symbol, on
+    // the exchange of the execution.
+    #[test]
+    fn the_contract_of_an_execution_is_complete_and_on_the_exchange_of_the_fill() {
+        let (core, shared) = (ClientCore::new(), SharedState::new());
+        core.cache_contract(265598, ApiContract {
+            con_id: 265598, symbol: "AAPL".into(), sec_type: "STK".into(), exchange: "SMART".into(),
+            currency: "USD".into(), local_symbol: "AAPL".into(), trading_class: "NMS".into(), ..Default::default()
+        });
+        let placed = ApiContract { con_id: 265598, symbol: "AAPL".into(), sec_type: "STK".into(), exchange: "SMART".into(), currency: "USD".into(), ..Default::default() };
+        let shown = core.execution_contract(&shared, 7, placed.clone(), "IBKRATS");
+        assert_eq!((shown.con_id, shown.local_symbol.as_str(), shown.trading_class.as_str(), shown.exchange.as_str()),
+            (265598, "AAPL", "NMS", "IBKRATS"));
+        // No exchange on the execution: the contract keeps its own.
+        assert_eq!(core.execution_contract(&shared, 7, placed, "").exchange, "SMART");
+        // A combo is shown by its own rule.
+        let bag = ApiContract { sec_type: "BAG".into(), exchange: "SMART".into(), ..Default::default() };
+        assert_eq!(core.execution_contract(&shared, 7, bag, "ARCA").exchange, "SMART");
+    }
+
 
     // ibx#426: the level the reference answers a current client.
     #[test]

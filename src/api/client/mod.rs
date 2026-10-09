@@ -48,6 +48,7 @@ use std::io;
 use std::time::{Duration, Instant};
 use crate::lifecycle::ConnectionControl;
 
+use crate::engine::park::ControlSender;
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::api::types::{
@@ -98,6 +99,11 @@ pub struct EClientConfig {
     pub paper: bool,
     /// CPU core to pin this engine's hot loop to. `None` = no pinning. When
     /// running multiple engines, use a **distinct** core per engine.
+    ///
+    /// A pinned engine polls its connections and its commands without
+    /// pause and keeps that core busy. Without pinning the engine thread
+    /// rests while there is nothing to do and is woken by the first byte
+    /// received or the first command sent (ibx#530).
     pub core_id: Option<usize>,
 }
 
@@ -146,7 +152,7 @@ fn cache_reconnect_credentials(hot_loop: &mut crate::engine::hot_loop::HotLoop, 
 /// with a log line and no error, as the reference drops it (ibx#285).
 pub struct EClient {
     pub(crate) shared: Arc<SharedState>,
-    pub(crate) control_tx: Sender<ControlCommand>,
+    pub(crate) control_tx: ControlSender,
     pub(crate) thread: Mutex<Option<thread::JoinHandle<()>>>,
     connection_control: Option<ConnectionControl>,
     shutdown_failure: Mutex<Option<String>>,
@@ -282,6 +288,10 @@ impl EClient {
             .name("ib-engine-hotloop".into())
             .spawn(move || { hot_loop.run_with_panic_recovery(); })?;
 
+        // The highest order id of this client's earlier sessions (ibx#518).
+        let core = ClientCore::new();
+        core.keep_order_ids(&account_id);
+
         let client = Self {
             shared,
             control_tx,
@@ -291,7 +301,7 @@ impl EClient {
             account_id,
             connected: AtomicBool::new(true),
             close_notified: AtomicBool::new(false),
-            core: ClientCore::new(),
+            core,
             session_token_bytes,
             token_type,
             connection_time: crate::client_core::connection_time_now(),
@@ -307,13 +317,13 @@ impl EClient {
     #[doc(hidden)]
     pub fn from_parts(
         shared: Arc<SharedState>,
-        control_tx: Sender<ControlCommand>,
+        control_tx: impl Into<ControlSender>,
         handle: thread::JoinHandle<()>,
         account_id: String,
     ) -> Self {
         Self {
             shared,
-            control_tx,
+            control_tx: control_tx.into(),
             thread: Mutex::new(Some(handle)),
             connection_control: None,
             shutdown_failure: Mutex::new(None),
@@ -465,6 +475,7 @@ impl EClient {
             let _ = h.join();
         }
         self.connected.store(false, Ordering::Release);
+        self.core.stop_keeping_order_ids();
         self.core.reset();
     }
 }

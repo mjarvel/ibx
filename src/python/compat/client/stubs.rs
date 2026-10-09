@@ -3,7 +3,7 @@
 use pyo3::prelude::*;
 
 use super::EClient;
-use super::super::contract::{Contract, NewsProviderPy, SmartComponentPy, SoftDollarTierPy};
+use super::super::contract::{Contract, NewsProviderPy, SoftDollarTierPy, WshEventDataPy};
 
 impl EClient {
     /// The smart_components callback, or the error of the request.
@@ -20,16 +20,20 @@ impl EClient {
                 return Ok(());
             }
         };
+        // The map of the official client library: bit number to the pair
+        // (exchange, exchange letter) (ibx#524).
         let map = pyo3::types::PyDict::new(py);
         for c in sc.iter() {
-            let obj = SmartComponentPy {
-                bit_number: c.bit_number,
-                exchange: c.exchange.clone(),
-                exchange_letter: c.exchange_letter.clone(),
-            };
-            map.set_item(c.bit_number, Py::new(py, obj)?)?;
+            map.set_item(c.bit_number, (c.exchange.as_str(), c.exchange_letter.as_str()))?;
         }
         self.wrapper.call_method1(py, "smart_components", (req_id, map.as_any()))?;
+        Ok(())
+    }
+
+    /// The error of a refused display group request (ibx#424).
+    fn display_group_refused(&self, py: Python<'_>, text: &str) -> PyResult<()> {
+        let (id, code) = crate::client_core::DISPLAY_GROUP_REFUSAL;
+        self.wrapper.call_method1(py, "error", (id, code, text, ""))?;
         Ok(())
     }
 
@@ -164,25 +168,55 @@ impl EClient {
     fn query_display_groups(&self, py: Python<'_>, req_id: i64) -> PyResult<()> {
         if let Some(r) = self.not_connected(-1) { return r; }
         if !crate::client_core::ClientCore::ids_fit("query_display_groups", &[req_id]) { return Ok(()); }
-        self.wrapper.call_method1(py, "display_group_list", (req_id, ""))?;
+        // The fixed list of groups, as the reference (ibx#424).
+        match crate::client_core::ClientCore::query_display_groups(req_id) {
+            Ok(groups) => { self.wrapper.call_method1(py, "display_group_list", (req_id, groups))?; }
+            Err(text) => self.display_group_refused(py, &text)?,
+        }
         Ok(())
     }
 
-    fn subscribe_to_group_events(&self, req_id: i64, group_id: i32) -> PyResult<()> {
+    /// As the reference (ibx#424): the contract of the group at once,
+    /// `none` since no group has one; error 321 for a group outside 1 to 7
+    /// or a request id already subscribed.
+    fn subscribe_to_group_events(&self, py: Python<'_>, req_id: i64, group_id: i32) -> PyResult<()> {
         if let Some(r) = self.not_connected(-1) { return r; }
-        let _ = (req_id, group_id);
+        if !crate::client_core::ClientCore::ids_fit("subscribe_to_group_events", &[req_id]) { return Ok(()); }
+        match self.core.subscribe_to_group_events(req_id, group_id) {
+            Ok(contract_info) => { self.wrapper.call_method1(py, "display_group_updated", (req_id, contract_info))?; }
+            Err(text) => self.display_group_refused(py, &text)?,
+        }
         Ok(())
     }
 
-    fn unsubscribe_from_group_events(&self, req_id: i64) -> PyResult<()> {
+    /// No answer, but error 321 for a request id that is not subscribed,
+    /// as the reference (ibx#424).
+    fn unsubscribe_from_group_events(&self, py: Python<'_>, req_id: i64) -> PyResult<()> {
         if let Some(r) = self.not_connected(-1) { return r; }
-        let _ = req_id;
+        if !crate::client_core::ClientCore::ids_fit("unsubscribe_from_group_events", &[req_id]) { return Ok(()); }
+        if let Some(text) = self.core.unsubscribe_from_group_events(req_id) {
+            self.display_group_refused(py, &text)?;
+        }
         Ok(())
     }
 
-    fn update_display_group(&self, req_id: i64, contract_info: &str) -> PyResult<()> {
+    /// As the reference (ibx#424): error 321 for bad input or a request id
+    /// that is not subscribed, error 473 for a conId that is not a
+    /// contract, and no answer for a valid update, which changes no group.
+    fn update_display_group(&self, py: Python<'_>, req_id: i64, contract_info: &str) -> PyResult<()> {
+        use crate::client_core::DisplayGroupUpdate;
         if let Some(r) = self.not_connected(-1) { return r; }
-        let _ = (req_id, contract_info);
+        if !crate::client_core::ClientCore::ids_fit("update_display_group", &[req_id]) { return Ok(()); }
+        let shared = self.shared_state()?;
+        let known = |con_id| shared.reference.get_contract(con_id).is_some();
+        match self.core.update_display_group(req_id, contract_info, known) {
+            DisplayGroupUpdate::Nothing => {}
+            DisplayGroupUpdate::Refused(text) => self.display_group_refused(py, &text)?,
+            DisplayGroupUpdate::Lookup(con_id) => {
+                let tx = self.tx()?;
+                super::send_cmd(py, &tx, crate::types::ControlCommand::DisplayGroupLookup { req_id, con_id })?;
+            }
+        }
         Ok(())
     }
 
@@ -284,17 +318,42 @@ impl EClient {
 
     // ── WSH ──
 
-    fn req_wsh_meta_data(&self, req_id: i64) -> PyResult<()> {
+    /// The permission check of the reference (ibx#443): error 10276 when
+    /// the session has no WSH news source, 10277 when it is not
+    /// subscribed. The data request itself is not implemented: with the
+    /// permission, error 10279.
+    fn req_wsh_meta_data(&self, py: Python<'_>, req_id: i64) -> PyResult<()> {
         if let Some(r) = self.not_connected(-1) { return r; }
-        let _ = req_id;
-        log::warn!("req_wsh_meta_data: not yet implemented — needs FIX capture");
+        if !crate::client_core::ClientCore::ids_fit("req_wsh_meta_data", &[req_id]) { return Ok(()); }
+        let (code, text) = crate::client_core::wsh_meta_data_error(&self.shared_state()?.reference);
+        self.wrapper.call_method1(py, "error", (req_id, code, text, ""))?;
         Ok(())
     }
 
+    /// No answer, as the reference (ibx#443).
+    fn cancel_wsh_meta_data(&self, req_id: i64) -> PyResult<()> {
+        let _ = req_id;
+        if let Some(r) = self.not_connected(-1) { return r; }
+        Ok(())
+    }
+
+    /// The permission check of the reference (ibx#443), as
+    /// `req_wsh_meta_data`. The data request itself is not implemented:
+    /// with the permission, error 10282, since no meta data is held.
     #[pyo3(signature = (req_id, wsh_event_data=None))]
-    fn req_wsh_event_data(&self, req_id: i64, wsh_event_data: Option<Py<PyAny>>) -> PyResult<()> {
-        let _ = (req_id, wsh_event_data);
-        log::warn!("req_wsh_event_data: not yet implemented — needs FIX capture");
+    fn req_wsh_event_data(&self, py: Python<'_>, req_id: i64, wsh_event_data: Option<WshEventDataPy>) -> PyResult<()> {
+        if let Some(r) = self.not_connected(-1) { return r; }
+        if !crate::client_core::ClientCore::ids_fit("req_wsh_event_data", &[req_id]) { return Ok(()); }
+        let _ = wsh_event_data;
+        let (code, text) = crate::client_core::wsh_event_data_error(&self.shared_state()?.reference);
+        self.wrapper.call_method1(py, "error", (req_id, code, text, ""))?;
+        Ok(())
+    }
+
+    /// No answer, as the reference (ibx#443).
+    fn cancel_wsh_event_data(&self, req_id: i64) -> PyResult<()> {
+        let _ = req_id;
+        if let Some(r) = self.not_connected(-1) { return r; }
         Ok(())
     }
 }

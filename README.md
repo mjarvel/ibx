@@ -30,8 +30,12 @@ IBX connects directly to Interactive Brokers servers — without requiring the o
 
 This local branch carries our bounded paper/live mobile-push login/lifecycle and opt-in strict
 history patch. See [the contract, limits and offline validation](docs/local-patch.md).
-Direct backend production adoption remains gated. Our fork uses `dev` for work and
-keeps `main` aligned with upstream; see [the fork workflow](docs/fork-workflow.md).
+Direct backend production adoption remains gated. Our fork uses `main` for
+development/integration and `main-upstream` as a pristine upstream mirror.
+Our checkpoint and contribution history is maintained centrally in
+[rust-library1/docs/ibx-changelog.md](https://github.com/mjarvel/rust-library1/blob/main/docs/ibx-changelog.md).
+The existing fork workflow/validation notes describe earlier dated arrangements;
+current shared Git rules govern new work.
 
 ## Benchmarks
 
@@ -200,11 +204,11 @@ client.disconnect()
 | **News** | `req_news_providers`, `req_news_article`, `req_historical_news`, `req_news_bulletins`, `cancel_news_bulletins` |
 | **Fundamental** | `req_fundamental_data`, `cancel_fundamental_data` |
 | **Options** | `calculate_implied_volatility`, `cancel_calculate_implied_volatility`, `calculate_option_price`, `cancel_calculate_option_price`, `exercise_options` |
-| **Other** | `req_current_time`, `req_user_info`, `req_family_codes`, `req_soft_dollar_tiers`, `set_server_log_level`, `req_wsh_meta_data`, `req_wsh_event_data` |
+| **Other** | `req_current_time`, `req_user_info`, `req_family_codes`, `req_soft_dollar_tiers`, `set_server_log_level`, `req_wsh_meta_data`, `cancel_wsh_meta_data`, `req_wsh_event_data`, `cancel_wsh_event_data` |
 
 ### Supported Order Types
 
-MKT, LMT, STP, STP LMT, TRAIL, TRAIL LIMIT, MOC, LOC, MTL, MIT, LIT, MKT PRT, STP PRT, REL, PEG MKT, PEG MID, MIDPRICE, SNAP MKT, SNAP MID, SNAP PRI, PEG BENCH, BOX TOP. Algo orders: VWAP, TWAP, Arrival Price, Close Price, Dark Ice, PctVol.
+MKT, LMT, STP, STP LMT, TRAIL, TRAIL LIMIT, MOC, LOC, MTL, MIT, LIT, MKT PRT, STP PRT, REL, PEG MKT, PEG MID, MIDPRICE, SNAP MKT, SNAP MID, SNAP PRI, PEG BENCH, BOX TOP, TRAIL MIT, TRAIL LIT, PEG BEST, RPI, PASSV REL. Algo orders: VWAP, TWAP, Arrival Price, Close Price, Dark Ice, PctVol.
 
 ## Notebooks
 

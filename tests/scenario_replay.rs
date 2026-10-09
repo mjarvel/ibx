@@ -17,7 +17,7 @@ use ibx::test_support::scenario::{load_scenario, replay, Options, Outcome};
 use ibx::test_support::Fields;
 
 /// Known differences the order scenarios mask on both sides, each with its
-/// own ignored test in src/golden/orders.rs (ibx#486): the first openOrder
+/// own ignored test in src/golden/orders.rs (ibx#510): the first openOrder
 /// of a STP order shows a limit price the wire does not carry
 /// (`stp_first_open_order_limit_price`).
 fn known(line: &str) -> String {
@@ -139,18 +139,12 @@ fn overnight_time_in_force() {
 // (ibx#486). Left out as in src/golden/orders.rs: TRAIL MIT, TRAIL LIT,
 // PASSV REL, RPI and PEG BEST (ibx#469). The commission reports (no order
 // id) are those of the fills of the orders left out.
-#[test]
-fn rth_order_types() {
-    check("20260928/rth_order_types", Options::default().mask(known).skip_orders(&[1, 2, 3, 4, 5, 6, 7]).until(6581)
-        .keep(|l| !l.starts_with("commissionAndFeesReport")));
-}
-
 // The exchange map cancel of QQQ (seq 5489) has no 6088: the QQQ request
 // was cancelled before the map came; those of AAPL and SPY in other
 // recordings have 6088=Socket, their requests still running (02/10/2026
 // seq 2461 and 2590, 28/09/2026 seq 5292 and 22088) (ibx#487).
 #[test]
-fn exchange_map_cancel_source() {
+fn rth_order_types() {
     let o = check("20260928/rth_order_types", Options::default().mask(known).skip_orders(&[1, 2, 3, 4, 5, 6, 7]).until(6581)
         .keep(|l| !l.starts_with("commissionAndFeesReport")));
     assert!(o.frames_compared > 10, "{}", o.frames_compared);
@@ -210,7 +204,6 @@ fn directed_combo_without_definition_then_cancel() {
 // A bracket in the client library's form (26/09/2026): parent and
 // take-profit with transmit off, the stop with transmit on.
 #[test]
-#[ignore = "ibx#226: transmit=false orders are refused instead of held for the group"]
 fn bracket() {
     check("20260926/bracket", orders());
     check("20260926b/bracket", orders());
@@ -235,29 +228,12 @@ fn account_summary_whole_answer() {
     check("20260926/account_summary", Options::default());
 }
 
-// reqAccountUpdates and accountDownloadEnd (26/09/2026, ibx#475, ibx#476):
-// the reference answers from the account it keeps since its logon, with
-// no frame; the recording does not hold that session start.
-#[test]
-#[ignore = "ibx#487: needs a recording with the session start (the account values come from the logon subscription)"]
-fn account_updates_and_download_end() {
-    check("20260926/account_updates", Options::default());
-}
-
 // reqPnL and reqPnLSingle (26/09/2026, ibx#478): the reference subscribes
 // the market data of its positions, known since its logon.
 #[test]
-#[ignore = "ibx#487: needs a recording with the session start (positions)"]
+#[ignore = "ibx#511: the P&L of the reference: its quotes, the account request of its partition, its first values (see session_start_first_client)"]
 fn pnl_and_pnl_single() {
     check("20260926b/pnl", Options::default());
-}
-
-// reqAllOpenOrders and reqPositions (02/10/2026, ibx#477): both answered
-// from the reference's state (orders and positions of the session start).
-#[test]
-#[ignore = "ibx#487: needs a recording with the session start (open orders, positions)"]
-fn open_orders_and_positions() {
-    check("20261002/b1_cleanup", Options::default());
 }
 
 // Orders of earlier sessions known from the logon replay (01/10/2026,
@@ -300,7 +276,7 @@ fn keep_up_to_date_bars_and_first_updates() {
 // 9531; ibx in request order. The rule of the reference's order is not
 // read yet.
 #[test]
-#[ignore = "ibx#429: the order of the updates of keepUpToDate requests that share a live bar stream"]
+#[ignore = "ibx#512: the order of the updates of keepUpToDate requests that share a live bar stream"]
 fn keep_up_to_date_update_order() {
     check("20261002/b1_429_keep_up_to_date", Options::default());
 }
@@ -329,7 +305,7 @@ fn historical_ticks() {
 // parameters in the reverse order of the requests, each with an XML
 // declaration; ibx sends them in request order with none.
 #[test]
-#[ignore = "ibx#457: scanner subscriptions in reverse order, XML declaration"]
+#[ignore = "ibx#513: scanner subscriptions in reverse order, XML declaration"]
 fn two_scanner_subscriptions() {
     check("20260926b/scanner_two", Options::default().compare(&[SCANNER, LOOKUP]));
 }
@@ -337,7 +313,7 @@ fn two_scanner_subscriptions() {
 // News ticks on a contract asked twice (02/10/2026, ibx#458): the
 // reference's subscription of tick 292 lists the news providers (6472).
 #[test]
-#[ignore = "ibx#458: 292 subscription without the provider list 6472"]
+#[ignore = "ibx#514: 292 subscription without the provider list 6472"]
 fn news_ticks_twice() {
     check("20261002/b1_458_news_dup", Options::default().compare(&[MARKET_DATA, HISTORICAL]));
 }
@@ -445,4 +421,113 @@ fn real_time_bars_shared() {
 fn plain_trail_follows_the_server() {
     let listings: Vec<u64> = [15585u64, 15768, 15964, 16182, 16349, 16522].iter().flat_map(|&s| s..=s + 5).collect();
     check("20261005/b2_trail", orders().skip_seqs(&listings));
+}
+
+// Session start (07/10/2026, ibx#487): the server frames of the logon
+// burst (the account config, the execution replay of two fills of the
+// morning, the working order, the account and portfolio frames), then the
+// first API client: the working order with the end of the list (no
+// execution and no commission report of the replayed fills), reqPositions,
+// reqAccountUpdates (the values in the order of the reference's map, the
+// ledger keys, the portfolio rows, the time in the machine's zone, the
+// end), reqOpenOrders, reqAllOpenOrders, reqExecutions and the cancel of
+// the working order.
+// Left out: the version notice 2172 (from the logon frame, which the replay
+// has not); the P&L callbacks and the account request of the P&L partition
+// (the test below); the order of the position rows, which is the order of a
+// hash set over the real account id: the rows are compared sorted.
+#[test]
+fn session_start_first_client() {
+    let core = |f: &Fields| f.iter().any(|(t, v)| *t == 6700 && v == "Core");
+    let keep = |l: &str| !(l.starts_with("error|-1|2172|") || l.starts_with("pnl|") || l.starts_with("pnlSingle|")
+        || l.starts_with("error|9831|2150|"));
+    let o = replay(&load_scenario("20261007/session_start"),
+        &Options::default().compare(&[ORDER, SUBSCRIPTION]).skip_frame(core).keep(keep));
+    if std::env::var_os("IBX_SCENARIO_DUMP").is_some() {
+        dump("20261007/session_start", &o);
+    }
+    assert_eq!(o.frame_error, None);
+    let sorted = |lines: Vec<String>| {
+        let mut lines = lines;
+        if let (Some(a), Some(b)) = (lines.iter().position(|l| l.starts_with("position|")), lines.iter().position(|l| l == "positionEnd")) {
+            lines[a..b].sort();
+        }
+        lines
+    };
+    let theirs = sorted(o.theirs.iter().map(|(_, l)| l.clone()).collect());
+    ibx::test_support::scenario::assert_same_callbacks(&sorted(o.ours.clone()), &theirs);
+}
+
+// One request per generic tick on AAPL before the open (07/10/2026): 162
+// refused with 321; 221 and 232 as the mark price entry (tick 37); the
+// fundamentals on their own exchange (tick 47); the short-term volumes
+// after the acknowledgement (ticks 63 to 65); the slow mark price (tick
+// 79); 460, 577, 587, 614 and 623 not sent for this stock.
+#[test]
+fn generic_ticks_one_by_one() {
+    // Compared: the errors and the ticks of the generic entries. The top of
+    // book is left out: a request on a contract asked just before gets the
+    // quote the reference kept (ibx#508). The version notice comes from the
+    // logon frame, which the replay has not.
+    fn generic(l: &str) -> bool {
+        let f: Vec<&str> = l.split('|').collect();
+        match f[0] {
+            "error" => f[2] != "2172",
+            "tickPrice" => matches!(f[2], "37" | "78" | "79" | "96" | "97" | "98" | "99"),
+            "tickSize" => matches!(f[2], "63" | "64" | "65"),
+            "tickString" => f[2] == "47",
+            "tickGeneric" => true,
+            _ => false,
+        }
+    }
+    // The option chain request of the recording is not made by the replay.
+    let o = replay(&load_scenario("20261007/b4_generic_rest"), &Options::default().keep(generic));
+    assert_eq!((o.frame_error.as_deref(), o.frames_compared), (None, 36));
+    let theirs: Vec<String> = o.theirs.iter().map(|(_, l)| l.clone()).collect();
+    ibx::test_support::scenario::assert_same_callbacks(&o.ours, &theirs);
+    assert_eq!(o.ours.len(), 22);
+}
+
+// The same ticks in one list on AAPL (07/10/2026): the mark price and the
+// slow mark price with the request, the IPO prices and the short-term
+// volumes after the acknowledgement, each message in request code order.
+// The reference had AAPL's ratios from a request of the minute before: it
+// sent no fundamentals entry and gave tick 47 from what it kept; both are
+// left out, and so is tick 79: ibx's fundamentals entry takes the place of
+// the slow mark price entry among the recorded acknowledgements (its tick
+// is checked in `generic_ticks_one_by_one`). The rest of the recording (an
+// ETF, an option, a future) is not replayed.
+#[test]
+fn generic_ticks_in_one_list() {
+    fn generic(l: &str) -> bool {
+        let f: Vec<&str> = l.split('|').collect();
+        match f[0] {
+            "error" => f[2] != "2172",
+            "tickPrice" => f[2] == "37",
+            "tickSize" => matches!(f[2], "63" | "64" | "65"),
+            _ => false,
+        }
+    }
+    // Without the fundamentals entry and the exchange map entry (the
+    // reference had the map from earlier in its session): their groups of
+    // fields, and as many less in the entry count.
+    fn kept_before(f: &mut Fields) {
+        while let Some(at) = f.iter().position(|(t, v)| *t == 264 && (v == "258" || v == "626")) {
+            let start = f[..at].iter().rposition(|(t, _)| *t == 262).unwrap_or(at);
+            let end = f[at + 1..].iter().position(|(t, _)| *t == 262).map_or(f.len(), |n| at + 1 + n);
+            f.drain(start..end);
+            if let Some(count) = f.iter_mut().find(|(t, _)| *t == 146) {
+                count.1 = (count.1.parse::<usize>().unwrap_or(1) - 1).to_string();
+            }
+        }
+    }
+    let o = replay(&load_scenario("20261007/b4_generic_rest2"),
+        &Options::default().until(9363).keep(generic).frame_mask(kept_before));
+    if std::env::var_os("IBX_SCENARIO_DUMP").is_some() {
+        dump("20261007/b4_generic_rest2", &o);
+    }
+    assert_eq!(o.frame_error, None);
+    let theirs: Vec<String> = o.theirs.iter().map(|(_, l)| l.clone()).collect();
+    ibx::test_support::scenario::assert_same_callbacks(&o.ours, &theirs);
+    assert!(o.ours.len() >= 5, "{:?}", o.ours);
 }

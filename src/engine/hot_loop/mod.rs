@@ -13,6 +13,7 @@ use std::io;
 
 use crate::bridge::{Event, SharedState};
 use crate::engine::context::Context;
+use crate::engine::park::{ControlSender, Parker, RawHandle, Waker};
 use crate::config::chrono_free_timestamp;
 use crate::gateway::{ccp_reconnect_host, reconnect_ccp_via, CcpReconnect, ReconnectAuth};
 use crate::protocol::connection::Connection;
@@ -74,8 +75,14 @@ pub struct HotLoop {
     /// Connection states last reported to the clients; `None` until the
     /// first observation (ibx#399).
     links: Option<Links>,
+    /// What the clients were last told about each data connection
+    /// (ibx#520); set with `links`.
+    told: DataLinks,
     /// Market-data farm name, for the farm status messages.
     farm_name: String,
+    /// Contract data farm of the logon, for its status messages; empty
+    /// when the logon names none (ibx#520).
+    secdef_farm_name: String,
     // ── Subsystems ──
     pub(crate) farm: FarmState,
     pub(crate) ccp: CcpState,
@@ -106,7 +113,31 @@ pub struct HotLoop {
     /// The timing of the market data resubscription after a data
     /// permission change (ibx#421).
     permission_change: crate::control::logon::PermissionChange,
+    // ── Rest between passes (ibx#530) ──
+    /// The wait of the thread while there is nothing to do.
+    parker: Parker,
+    /// The sockets to wait on, rebuilt for each wait.
+    wait_handles: Vec<RawHandle>,
+    /// The pass handled a command.
+    pass_active: bool,
+    /// Bytes read on all connections up to the last pass.
+    bytes_seen: u64,
+    /// Passes in a row that read nothing and handled no command.
+    idle_passes: u32,
+    /// Last wake of the consumers.
+    notified_at: Instant,
 }
+
+/// Passes with nothing to do before the thread waits (ibx#530): what one
+/// pass leaves for the next is done first.
+const IDLE_PASSES_BEFORE_WAIT: u32 = 4;
+
+/// Longest wait of the thread: the timers of the loop run at least this
+/// often. The system may round it up to its timer tick.
+const WAIT_TIMEOUT_MS: i32 = 1;
+
+/// The consumers are woken at least this often while nothing comes.
+const NOTIFY_PERIOD: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// Maximum HMDS reconnect attempts before giving up (ibx#187).
 /// Total wait at cap: 3+6+12+24+48 = 93s before final attempt fires.
@@ -114,6 +145,9 @@ const HMDS_MAX_RECONNECT_ATTEMPTS: u32 = 6;
 
 impl HotLoop {
     pub fn new(shared: Arc<SharedState>, event_tx: Option<Sender<Event>>, core_id: Option<usize>) -> Self {
+        if let Some(tx) = &event_tx {
+            shared.attach_event_channel(tx);
+        }
         Self {
             shared,
             event_tx,
@@ -147,8 +181,16 @@ impl HotLoop {
             hmds_reconnect_attempt: 0,
             hmds_next_attempt_at: None,
             links: None,
+            told: DataLinks::default(),
             farm_name: "usfarm".to_string(),
+            secdef_farm_name: String::new(),
             permission_change: Default::default(),
+            parker: Parker::new(None),
+            wait_handles: Vec::with_capacity(8),
+            pass_active: false,
+            bytes_seen: 0,
+            idle_passes: 0,
+            notified_at: Instant::now(),
         }
     }
 
@@ -178,9 +220,27 @@ impl HotLoop {
         }
         false
     }
-    /// Set the control channel receiver. The caller keeps the sender.
+    /// Set the control channel receiver. The caller keeps the sender. A
+    /// command sent on it does not wake a waiting engine: it is read at the
+    /// end of the wait (`control_channel` gives a sender that wakes).
     pub fn set_control_rx(&mut self, rx: Receiver<ControlCommand>) {
         self.control_rx = Some(rx);
+    }
+
+    /// Create the control channel of this engine and give its sender: a
+    /// command sent while the engine waits wakes it (ibx#530).
+    pub fn control_channel(&mut self) -> ControlSender {
+        let (tx, rx) = bounded(64);
+        let waker = match Waker::new() {
+            Ok(waker) => Some(Arc::new(waker)),
+            Err(e) => {
+                log::warn!("No wake socket ({}): commands wait for the end of the rest of the engine", e);
+                None
+            }
+        };
+        self.parker = Parker::new(waker.clone());
+        self.set_control_rx(rx);
+        ControlSender::new(tx, waker, Some(self.shared.command_clock().clone()))
     }
 
     /// Set the account ID for order submission.
@@ -254,10 +314,9 @@ impl HotLoop {
         ccp_conn: Connection,
         hmds_conn: Option<Connection>,
         core_id: Option<usize>,
-    ) -> (Self, Sender<ControlCommand>) {
-        let (tx, rx) = bounded(64);
+    ) -> (Self, ControlSender) {
         let mut hl = Self::new(shared, event_tx, core_id);
-        hl.set_control_rx(rx);
+        let tx = hl.control_channel();
         hl.set_account_id(account_id);
         hl.farm_conn = Some(farm_conn);
         hl.ccp_conn = Some(ccp_conn);
@@ -560,7 +619,7 @@ impl HotLoop {
     fn route_md_subscribe(&mut self, sub: &farm::MdSubscribe) {
         let news = self.take_waiting_news(sub.instrument);
         if let Some(text) = news.iter().find_map(|(_, refusal)| refusal.clone()) {
-            self.shared.market.push_md_reject(crate::bridge::MdReject::NewsRefused { instrument: sub.instrument, text });
+            self.shared.market.push_md_reject(crate::bridge::MdReject::NewsRefused { instrument: sub.instrument, con_id: sub.con_id, text });
             return;
         }
         // A NEWS contract has no top of book.
@@ -646,7 +705,7 @@ impl HotLoop {
             return;
         }
         if let Some(text) = refusal {
-            self.shared.market.push_md_reject(crate::bridge::MdReject::NewsRefused { instrument, text });
+            self.shared.market.push_md_reject(crate::bridge::MdReject::NewsRefused { instrument, con_id, text });
             return;
         }
         let sub = farm::MdSubscribe {
@@ -682,6 +741,17 @@ impl HotLoop {
         self.send_farm_messages(msgs);
         let msgs = self.farm.stop_news(instrument);
         self.send_farm_messages(msgs);
+        // Its market data status entry last (ibx#447).
+        let msgs = self.farm.stop_status(instrument);
+        self.send_farm_messages(msgs);
+    }
+
+    /// The frozen slots whose farm was lost (ibx#447): their requests go
+    /// back to the real-time slot.
+    fn flush_thawed(&mut self) {
+        for (twin, live) in self.farm.take_thawed() {
+            self.shared.market.push_md_reject(crate::bridge::MdReject::Live { instrument: twin, live });
+        }
     }
 
     /// The server tag cleaner (#292), as the reference runs it every 60 s:
@@ -1104,16 +1174,23 @@ impl HotLoop {
     /// the round-lot step as any other. A contract another request already
     /// has a top of book for is not asked again: the request joins that
     /// subscription, as the reference attaches it to the contract's record
-    /// (ibx#444, captured 02/10/2026), and its own slot goes.
+    /// (ibx#444, captured 02/10/2026), and its own slot goes. Every slot
+    /// of the contract is looked at, not only the one found by its conId:
+    /// that one can be a slot an order made, with no market data, while
+    /// the top of book runs on the slot of an earlier request like this
+    /// one (ibx#533).
     fn send_md_resolved(&mut self) {
         if self.context.md_resolved.is_empty() { return; }
         for sub in std::mem::take(&mut self.context.md_resolved) {
-            let into = self.context.market.instrument_by_con_id(sub.con_id)
-                .filter(|&into| into != sub.instrument && sub.mode_9887 == 0 && self.joins_top(into, sub.snapshot));
+            let into = if sub.mode_9887 == 0 {
+                self.running_top_slot(sub.con_id, Some(sub.instrument), sub.snapshot)
+            } else {
+                None
+            };
             if let Some(into) = into {
                 let news = self.take_waiting_news(sub.instrument);
                 if let Some(text) = news.iter().find_map(|(_, refusal)| refusal.clone()) {
-                    self.shared.market.push_md_reject(crate::bridge::MdReject::NewsRefused { instrument: sub.instrument, text });
+                    self.shared.market.push_md_reject(crate::bridge::MdReject::NewsRefused { instrument: sub.instrument, con_id: sub.con_id, text });
                     continue;
                 }
                 log::info!("Market data for {} {}: conId {} joins the subscription of instrument {}",
@@ -1128,6 +1205,17 @@ impl HotLoop {
                 self.route_md_subscribe(&sub);
             }
         }
+    }
+
+    /// The slot of contract `con_id`, other than `except`, whose top of book
+    /// a new request can share (`joins_top`). A contract can have several
+    /// slots: the one found by its conId (an order's, or the first request's)
+    /// and the slots of requests made by symbol (ibx#533, ibx#534).
+    fn running_top_slot(&self, con_id: i64, except: Option<InstrumentId>, snapshot: bool) -> Option<InstrumentId> {
+        self.context.market.active_instruments()
+            .filter(|&(slot, c)| c == con_id && Some(slot) != except)
+            .map(|(slot, _)| slot)
+            .find(|&slot| self.joins_top(slot, snapshot))
     }
 
     /// A new top-of-book request of an instrument shares the one already
@@ -1214,20 +1302,32 @@ impl HotLoop {
 
         self.running = true;
         self.has_run = true;
+        // From here to the end of the loop, also by a panic, the answers
+        // written by the callers wait for the commands before them (ibx#529).
+        struct Running(Arc<SharedState>);
+        impl Drop for Running {
+            fn drop(&mut self) {
+                self.0.command_clock().set_running(false);
+            }
+        }
+        self.shared.command_clock().set_running(true);
+        let _running = Running(self.shared.clone());
         for conn in [&mut self.farm_conn, &mut self.ccp_conn, &mut self.hmds_conn].into_iter().flatten() {
             conn.set_queued_writes(true);
         }
         // The links are known from the start: one lost in the first pass
         // is reported too (ibx#488: the first look took it as the start).
         if self.links.is_none() {
-            self.links = Some(self.current_links());
+            let now = self.current_links();
+            self.links = Some(now);
+            self.told = DataLinks::of(now);
         }
 
         while self.running {
             if self.stop_if_cancelled() { break; }
             self.context.loop_iterations += 1;
 
-            // 1. Busy-poll market data farm socket (non-blocking recv)
+            // 1. Read the market data farm socket (returns at once)
             let farm_was_ok = !self.farm.disconnected;
             self.farm.poll_market_data(
                 &mut self.farm_conn, &mut self.context, &self.shared,
@@ -1235,7 +1335,7 @@ impl HotLoop {
             );
             let _ = farm_was_ok; // reconnects are scheduled below (ibx#218)
 
-            // 1b. Busy-poll historical socket for tick-by-tick data
+            // 1b. Read the historical socket for tick-by-tick data
             if self.stop_if_cancelled() { break; }
             self.hmds.poll(
                 &mut self.hmds_conn, &self.shared,
@@ -1246,6 +1346,7 @@ impl HotLoop {
             //       tick-by-tick cancels that are due (ibx#404).
             let now = Instant::now();
             self.clean_server_tags(now);
+            self.flush_thawed();
             self.send_due_tbt_cancels(now);
 
             // 1b'. Farms opened on demand (#445): read, then connect,
@@ -1277,7 +1378,7 @@ impl HotLoop {
                 self.ccp.disconnected, &self.shared,
             );
 
-            // 3. Busy-poll auth socket for execution reports
+            // 3. Read the auth socket for execution reports
             let ccp_was_ok = !self.ccp.disconnected;
             if self.stop_if_cancelled() { break; }
             self.poll_auth();
@@ -1305,15 +1406,28 @@ impl HotLoop {
             self.report_link_changes();
             self.maybe_report_restored();
 
-            // 6. Wake any waiting consumers (e.g. Python event loop)
-            self.shared.notify();
+            // 6. Wake any waiting consumers (e.g. Python event loop): after
+            //    a pass that did something and the passes behind it, and
+            //    once per period while nothing comes (ibx#530).
+            let bytes = self.bytes_read();
+            let active = std::mem::take(&mut self.pass_active) || bytes != self.bytes_seen;
+            self.bytes_seen = bytes;
+            self.idle_passes = if active { 0 } else { self.idle_passes.saturating_add(1) };
+            if self.idle_passes <= IDLE_PASSES_BEFORE_WAIT || now.duration_since(self.notified_at) >= NOTIFY_PERIOD {
+                self.shared.notify();
+                self.notified_at = now;
+            }
 
             // 7. With every transport down there is nothing to poll, and the
             //    spin pinned a core for the whole outage (ibx#399). Park 1ms in
-            //    that state only; reconnects run on a seconds-scale backoff and
-            //    the connected path is unchanged.
+            //    that state only; reconnects run on a seconds-scale backoff.
             if self.all_transports_down() {
                 std::thread::sleep(std::time::Duration::from_millis(1));
+            } else if self.idle_passes >= IDLE_PASSES_BEFORE_WAIT && self.core_id.is_none() {
+                // 8. Nothing to do: wait for data on a connection or for a
+                //    command, whichever comes first (ibx#530). A pinned
+                //    engine keeps polling its core instead.
+                self.wait_for_work();
             }
         }
         if let Some(control) = &self.connection_control {
@@ -1327,6 +1441,35 @@ impl HotLoop {
             self.shared.set_connection_lost();
             self.shared.notify();
         }
+    }
+
+    /// Bytes read so far on the connections of the loop.
+    fn bytes_read(&self) -> u64 {
+        let primary = [&self.farm_conn, &self.ccp_conn, &self.hmds_conn].into_iter().flatten().map(Connection::bytes_in);
+        let pool = self.pool.farms.iter().filter_map(|f| f.conn.as_ref()).map(Connection::bytes_in);
+        primary.chain(pool).fold(0u64, u64::wrapping_add)
+    }
+
+    /// Wait until a connection the loop reads has data, a command is sent,
+    /// or the timeout passed. Not while output waits for a slow peer, nor
+    /// with a connection that waits in its own read (in-memory, tests).
+    fn wait_for_work(&mut self) {
+        self.wait_handles.clear();
+        let primary = [
+            (&self.farm_conn, self.farm.disconnected),
+            (&self.ccp_conn, self.ccp.disconnected),
+            (&self.hmds_conn, self.hmds.disconnected),
+        ];
+        let read = primary.into_iter().filter(|(_, down)| !down).filter_map(|(conn, _)| conn.as_ref())
+            .chain(self.pool.farms.iter().filter_map(|f| f.conn.as_ref()));
+        for conn in read {
+            match conn.wait_handle() {
+                Some(handle) if !conn.has_queued_output() => self.wait_handles.push(handle),
+                _ => return,
+            }
+        }
+        let rx = self.control_rx.as_ref();
+        self.parker.park(&self.wait_handles, WAIT_TIMEOUT_MS, || rx.is_some_and(|rx| !rx.is_empty()));
     }
 
     /// True when the farm and auth connections are down and no historical
@@ -1353,14 +1496,30 @@ impl HotLoop {
     }
 
     /// A lost link is reported to every client at once, as the reference
-    /// does (ibx#399): 1100 for the auth connection, 2103 / 2105 for the
-    /// market-data and historical farms. The clients stay connected. A farm
-    /// that is up again after its logon gives 2104 / 2106 with its name, as
-    /// in the reference; the auth link gives 1102 after its replay instead
+    /// does (ibx#399): 1100 for the auth connection, 2103 / 2105 / 2157 for
+    /// the market data, historical data and contract data connections. The
+    /// clients stay connected. A connection that is up again gives 2104 /
+    /// 2106 / 2158 with its name; the auth link gives 1102 after its replay
     /// (`maybe_report_restored`).
+    ///
+    /// The reference reports its data connections broken when the auth
+    /// link is lost, also when only that link was closed, and OK again
+    /// after the new logon (recorded 25/09/2026 and 30/09/2026): a data
+    /// connection is told OK only while it is up and the auth link is up
+    /// (ibx#520). The connections themselves are left as they are. Contract
+    /// data is read on the auth link: its notices follow that link.
+    ///
+    /// Order, as recorded: 1100, 2103, 2105, 2157 at the loss; 2106, 2158,
+    /// 2104 at the return (there the reference's order is the order in
+    /// which its connections come back).
     fn report_link_changes(&mut self) {
         let now = self.current_links();
-        let Some(before) = self.links.replace(now) else { return };
+        let ok = DataLinks::of(now);
+        let Some(before) = self.links.replace(now) else {
+            self.told = ok;
+            return;
+        };
+        let told = std::mem::replace(&mut self.told, ok);
         if before == now {
             return;
         }
@@ -1370,23 +1529,32 @@ impl HotLoop {
             self.shared.orders.set_open_orders_held(true);
             self.shared.push_connection_notice(1100, LINK_LOST.to_string());
         }
-        if before.farm && !now.farm {
-            self.shared.push_connection_notice(2103, format!("Market data farm connection is broken:{}", self.farm_name));
-        }
-        if !before.farm && now.farm {
-            self.shared.push_connection_notice(2104, format!("Market data farm connection is OK:{}", self.farm_name));
-        }
+        // The scanner follows the historical data connection itself.
         if before.hmds && !now.hmds {
-            let name = self.hmds_farm_name().to_string();
-            self.shared.push_connection_notice(2105, format!("HMDS data farm connection is broken:{}", name));
             self.hmds.scanner_link_lost(&self.shared);
         }
         if !before.hmds && now.hmds {
             self.hmds.scanner_link_restored(&mut self.hmds_conn, &mut self.hb, &self.shared);
         }
-        if !before.hmds && now.hmds {
-            let name = self.hmds_farm_name().to_string();
-            self.shared.push_connection_notice(2106, format!("HMDS data farm connection is OK:{}", name));
+        let hmds_name = self.hmds_farm_name().to_string();
+        let secdef = !self.secdef_farm_name.is_empty();
+        if told.farm && !ok.farm {
+            self.shared.push_connection_notice(2103, format!("Market data farm connection is broken:{}", self.farm_name));
+        }
+        if told.hmds && !ok.hmds {
+            self.shared.push_connection_notice(2105, format!("HMDS data farm connection is broken:{}", hmds_name));
+        }
+        if secdef && told.secdef && !ok.secdef {
+            self.shared.push_connection_notice(2157, format!("Sec-def data farm connection is broken:{}", self.secdef_farm_name));
+        }
+        if !told.hmds && ok.hmds {
+            self.shared.push_connection_notice(2106, format!("HMDS data farm connection is OK:{}", hmds_name));
+        }
+        if secdef && !told.secdef && ok.secdef {
+            self.shared.push_connection_notice(2158, format!("Sec-def data farm connection is OK:{}", self.secdef_farm_name));
+        }
+        if !told.farm && ok.farm {
+            self.shared.push_connection_notice(2104, format!("Market data farm connection is OK:{}", self.farm_name));
         }
     }
 
@@ -1412,6 +1580,11 @@ impl HotLoop {
         let mut farms = vec![(self.farm_name.clone(), links.farm)];
         if hmds_expected {
             farms.push((self.hmds_farm_name().to_string(), links.hmds));
+        }
+        // The contract data farm is the third name of the reference's list
+        // (recorded 30/09/2026); here it is up with the auth link (ibx#520).
+        if !self.secdef_farm_name.is_empty() {
+            farms.push((self.secdef_farm_name.clone(), links.ccp));
         }
         let names = |up: bool| farms.iter().filter(|f| f.1 == up).map(|f| f.0.as_str()).collect::<Vec<_>>().join("; ");
         let message = if all_up {
@@ -1442,12 +1615,14 @@ impl HotLoop {
         } else {
             self.cmd_buf.extend(rx.try_iter());
         }
+        // Told once their answers are written (ibx#529).
+        let mut taken = self.cmd_buf.len() as u64;
 
         // try_iter() stops on both Empty and Disconnected — do one extra
         // try_recv() to distinguish.  If a straggler command arrived between
         // try_iter() finishing and this call, push it into the batch.
         let sender_dropped = match rx.try_recv() {
-            Ok(cmd)  => { self.cmd_buf.push(cmd); false }
+            Ok(cmd)  => { self.cmd_buf.push(cmd); taken += 1; false }
             Err(crossbeam_channel::TryRecvError::Empty)        => false,
             Err(crossbeam_channel::TryRecvError::Disconnected) => true,
         };
@@ -1457,10 +1632,25 @@ impl HotLoop {
         let cmds: Vec<ControlCommand> = self.ccp.resolved_requests.drain(..)
             .chain(self.cmd_buf.drain(..))
             .collect();
+        self.pass_active |= !cmds.is_empty();
         for cmd in cmds {
             if self.stop_if_cancelled() { break; }
             match cmd {
                 ControlCommand::Subscribe { con_id, symbol, exchange, sec_type, last_trade_date, strike, right, multiplier, mode_9887, snapshot, reply_tx } => {
+                    // The top of book of the contract runs on another slot
+                    // than the one its conId finds (a request made by
+                    // symbol after an order on the contract): the request
+                    // shares it there, nothing is sent (ibx#534).
+                    let found = self.context.market.instrument_by_con_id(con_id);
+                    if con_id != 0 && mode_9887 == 0 && !found.is_some_and(|slot| self.joins_top(slot, snapshot))
+                        && let Some(slot) = self.running_top_slot(con_id, found, snapshot)
+                    {
+                        log::info!("Market data for con_id {} joins the subscription of instrument {}", con_id, slot);
+                        if let Some(tx) = &reply_tx {
+                            let _ = tx.send(Ok(slot));
+                        }
+                        continue;
+                    }
                     // No conId: resolved first, as the reference (ibx#278).
                     let key = (con_id != 0).then_some(con_id);
                     if let Some(id) = self.register_slot_or_reject(key, symbol.clone(), &sec_type, &exchange, &reply_tx) {
@@ -1524,8 +1714,23 @@ impl HotLoop {
                     self.context.lot_ready.retain(|s| s.instrument != instrument);
                     self.context.md_lookups.retain(|(_, s, _)| s.instrument != instrument);
                     self.context.md_resolved.retain(|s| s.instrument != instrument);
+                    // The frozen slot of a frozen contract (ibx#447): the
+                    // frozen pair is cancelled first, then the real-time
+                    // pair and the status entry, as the reference (captured
+                    // 07/10/2026).
+                    let live = self.farm.frozen_live(instrument);
+                    // A real-time slot let go while its requests had not
+                    // moved yet: its frozen slot goes with it.
+                    if let Some(frozen) = self.farm.frozen_slot(instrument) {
+                        self.route_md_cancel(frozen);
+                        self.try_reclaim_instrument(frozen);
+                    }
                     self.route_md_cancel(instrument);
                     self.try_reclaim_instrument(instrument);
+                    if let Some(live) = live {
+                        self.route_md_cancel(live);
+                        self.try_reclaim_instrument(live);
+                    }
                 }
                 ControlCommand::SubscribeTbt { req_id, con_id, symbol, exchange, sec_type, tbt_type, number_of_ticks, ignore_size, reply_tx } => {
                     if let Some(id) = self.register_or_reject(con_id, symbol.clone(), &sec_type, &exchange, &reply_tx) {
@@ -1588,6 +1793,12 @@ impl HotLoop {
                 }
                 ControlCommand::Order(req) => {
                     self.context.pending_orders.push(req);
+                }
+                ControlCommand::OrderGroup(requests) => {
+                    order_builder::take_order_group(&mut self.context, requests);
+                }
+                ControlCommand::HoldOrder { order_id, instrument, qty, parent_id } => {
+                    order_builder::hold_order(&mut self.ccp_conn, &mut self.context, &mut self.hb, order_id, instrument, qty, parent_id);
                 }
                 ControlCommand::RegisterInstrument { con_id, symbol, sec_type, exchange, reply_tx } => {
                     self.register_or_reject(con_id, symbol, &sec_type, &exchange, &reply_tx);
@@ -1669,6 +1880,9 @@ impl HotLoop {
                     } else {
                         self.ccp.send_secdef_request_by_symbol(req_id, &symbol, &sec_type, &exchange, &currency, &filters, &mut self.ccp_conn, &mut self.hb);
                     }
+                }
+                ControlCommand::DisplayGroupLookup { req_id, con_id } => {
+                    self.ccp.start_display_group_lookup(req_id, con_id, &mut self.ccp_conn, &mut self.hb);
                 }
                 ControlCommand::CancelHeadTimestamp { req_id } => {
                     if let Some(pos) = self.hmds.pending_head_ts.iter().position(|(_, rid, _)| *rid == req_id) {
@@ -1890,6 +2104,7 @@ impl HotLoop {
                 }
             }
         }
+        self.shared.command_clock().note_handled(taken);
 
         // All senders dropped — treat as implicit shutdown.
         if sender_dropped && self.running {
@@ -2250,6 +2465,11 @@ impl HotLoop {
         if !name.is_empty() {
             self.farm_name = name;
         }
+    }
+
+    /// Set the contract data farm name used in the farm status messages.
+    pub fn set_secdef_farm_name(&mut self, name: String) {
+        self.secdef_farm_name = name;
     }
 
     /// Set cached auth credentials for farm auto-reconnect.
@@ -2841,6 +3061,22 @@ struct Links {
     ccp: bool,
     farm: bool,
     hmds: bool,
+}
+
+/// Whether the clients were told each data connection is OK (ibx#520).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct DataLinks {
+    farm: bool,
+    hmds: bool,
+    secdef: bool,
+}
+
+impl DataLinks {
+    /// A data connection is told OK while it is up and the auth link is
+    /// up; contract data is read on the auth link.
+    fn of(links: Links) -> Self {
+        Self { farm: links.farm && links.ccp, hmds: links.hmds && links.ccp, secdef: links.ccp }
+    }
 }
 
 /// Period of the server tag cleaner, how long a market data record stays
@@ -3508,7 +3744,8 @@ mod tests {
         assert!(engine.ccp.disconnected, "reset at 62 s");
         engine.report_link_changes();
         let notices = shared.drain_connection_notices();
-        assert_eq!(notices.iter().map(|n| n.0).collect::<Vec<_>>(), vec![1100]);
+        // 1100, and the data connections told broken with it (ibx#520).
+        assert_eq!(notices.iter().map(|n| n.0).collect::<Vec<_>>(), vec![1100, 2103, 2105]);
         assert!(!shared.take_connection_lost(), "the clients stay connected");
     }
 
@@ -3603,7 +3840,8 @@ mod tests {
         assert!(!engine.farm.disconnected);
         assert!(!shared.orders.open_orders_held());
         engine.report_link_changes();
-        assert_eq!(shared.drain_connection_notices().iter().map(|n| n.0).collect::<Vec<_>>(), vec![1100]);
+        // 1100, and the data connections told broken with it (ibx#520).
+        assert_eq!(shared.drain_connection_notices().iter().map(|n| n.0).collect::<Vec<_>>(), vec![1100, 2103, 2105]);
         assert!(shared.orders.open_orders_held(), "open-order requests wait from the 1100 (ibx#251)");
     }
 
@@ -3721,20 +3959,74 @@ mod tests {
         engine.farm.disconnected = false;
         engine.hmds.disconnected = false;
         engine.report_link_changes();
+        // In the order of the reference's return (recorded 30/09/2026).
         assert_eq!(shared.drain_connection_notices(), vec![
-            (2104, "Market data farm connection is OK:eufarm".to_string()),
             (2106, "HMDS data farm connection is OK:ushmds".to_string()),
+            (2104, "Market data farm connection is OK:eufarm".to_string()),
         ]);
         engine.report_link_changes();
         assert!(shared.drain_connection_notices().is_empty(), "reported once");
 
-        // The auth link coming back gives no farm notice.
+    }
+
+    // ibx#520: the loss of the auth link alone is told for every data
+    // connection, and its return too, as the reference (25/09/2026: 1100
+    // then the three broken notices; 30/09/2026: 2106, 2158, 2104 and then
+    // 1102 with three names).
+    #[test]
+    fn auth_link_loss_and_return_are_told_for_every_data_connection() {
+        let (mut engine, shared, _servers) = engine_with_links();
+        engine.set_secdef_farm_name("secdefil".into());
+        engine.report_link_changes();
+        assert!(shared.drain_connection_notices().is_empty(), "first look: nothing to report");
+
         engine.ccp.disconnected = true;
+        engine.report_link_changes();
+        assert_eq!(shared.drain_connection_notices(), vec![
+            (1100, LINK_LOST.to_string()),
+            (2103, "Market data farm connection is broken:usfarm".to_string()),
+            (2105, "HMDS data farm connection is broken:ushmds".to_string()),
+            (2157, "Sec-def data farm connection is broken:secdefil".to_string()),
+        ]);
+        assert!(!engine.farm.disconnected && !engine.hmds.disconnected, "the data connections are left as they are");
+
+        // A data connection really lost during the outage, and back before
+        // the auth link: already told broken, nothing more.
+        engine.farm.disconnected = true;
+        engine.report_link_changes();
+        engine.farm.disconnected = false;
+        engine.report_link_changes();
+        assert!(shared.drain_connection_notices().is_empty());
+
+        engine.ccp.disconnected = false;
+        engine.report_link_changes();
+        assert_eq!(shared.drain_connection_notices(), vec![
+            (2106, "HMDS data farm connection is OK:ushmds".to_string()),
+            (2158, "Sec-def data farm connection is OK:secdefil".to_string()),
+            (2104, "Market data farm connection is OK:usfarm".to_string()),
+        ]);
+        engine.ccp.status_replay_end_at = Some(Instant::now());
+        engine.maybe_report_restored();
+        assert_eq!(shared.drain_connection_notices(), vec![(1102,
+            format!("{LINK_RESTORED} All data farms are connected: usfarm; ushmds; secdefil."))]);
+    }
+
+    // A data connection still down when the auth link returns is told OK
+    // when it comes up itself.
+    #[test]
+    fn a_data_connection_down_at_the_return_is_told_when_it_is_up() {
+        let (mut engine, shared, _servers) = engine_with_links();
+        engine.report_link_changes();
+        engine.ccp.disconnected = true;
+        engine.hmds.disconnected = true;
         engine.report_link_changes();
         let _ = shared.drain_connection_notices();
         engine.ccp.disconnected = false;
         engine.report_link_changes();
-        assert!(shared.drain_connection_notices().is_empty(), "1102 comes after the replay, not here");
+        assert_eq!(shared.drain_connection_notices().iter().map(|n| n.0).collect::<Vec<_>>(), vec![2104]);
+        engine.hmds.disconnected = false;
+        engine.report_link_changes();
+        assert_eq!(shared.drain_connection_notices().iter().map(|n| n.0).collect::<Vec<_>>(), vec![2106]);
     }
 
     // ibx#399: with every transport down the loop spun at ~1M passes/s and
@@ -3915,11 +4207,12 @@ mod tests {
         out
     }
 
-    fn scanner_engine(shared: &Arc<SharedState>) -> (HotLoop, crate::protocol::connection::MemTransport, Sender<ControlCommand>) {
+    fn scanner_engine(shared: &Arc<SharedState>) -> (HotLoop, crate::protocol::connection::MemTransport, ControlSender) {
         let mut engine = HotLoop::new(shared.clone(), None, None);
         let (c, server) = socket_pair();
         engine.hmds_conn = Some(Connection::new_mem(c));
         let (tx, rx) = crossbeam_channel::unbounded();
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         (engine, server, tx)
     }
@@ -5147,17 +5440,18 @@ mod news_tests {
         out
     }
 
-    pub(super) fn engine() -> (HotLoop, Arc<SharedState>, crate::protocol::connection::MemTransport, Sender<ControlCommand>) {
+    pub(super) fn engine() -> (HotLoop, Arc<SharedState>, crate::protocol::connection::MemTransport, ControlSender) {
         let shared = Arc::new(SharedState::new());
         let mut engine = HotLoop::new(shared.clone(), None, None);
         let (c, server) = socket_pair();
         engine.farm_conn = Some(Connection::new_mem(c));
         let (tx, rx) = crossbeam_channel::unbounded();
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         (engine, shared, server, tx)
     }
 
-    pub(super) fn aapl(tx: &Sender<ControlCommand>, engine: &mut HotLoop, providers: &str) -> InstrumentId {
+    pub(super) fn aapl(tx: &ControlSender, engine: &mut HotLoop, providers: &str) -> InstrumentId {
         tx.send(ControlCommand::Subscribe {
             con_id: 265598, symbol: "AAPL".into(), exchange: "SMART".into(), sec_type: "STK".into(),
             last_trade_date: String::new(), strike: 0.0, right: String::new(), multiplier: String::new(),
@@ -5315,7 +5609,7 @@ mod news_tests {
         engine.context = context;
         engine.send_md_resolved();
         assert_eq!(shared.market.drain_md_rejects(), [crate::bridge::MdReject::NewsRefused {
-            instrument: ids[0], text: "API News error:Source code unchecked in API news Settings: XYZ".into() }]);
+            instrument: ids[0], con_id: 4815747, text: "API News error:Source code unchecked in API news Settings: XYZ".into() }]);
         let out = sent(&mut farm_side);
         assert_eq!(out.len(), 2, "only MSFT: {out:?}");
         assert!(out[0].contains("|6008=272093|") && out[0].contains("|264=442|"), "{}", out[0]);
@@ -5443,6 +5737,57 @@ mod sharing_tests {
         assert_eq!(engine.context.market.con_id(second), None, "the slot is freed");
         assert_eq!(engine.context.market.instrument_by_con_id(265598), Some(first));
     }
+
+    // ibx#533, paper 09/10/2026: an order made a slot for the contract, with
+    // no market data. Two symbol-only requests follow: the first runs on its
+    // own slot, and the second joins it, although the slot found by the
+    // conId is the order's.
+    #[test]
+    fn a_looked_up_contract_joins_the_request_before_it_past_the_slot_of_an_order() {
+        use crate::control::contracts::tests::pipe_msg;
+        let (mut engine, shared, mut farm_side, tx) = engine();
+        let (c2, _ccp_side) = socket_pair();
+        engine.ccp_conn = Some(Connection::new_mem(c2));
+        let order_slot = engine.context.market.register(265598);
+        let mut by_symbol = |engine: &mut HotLoop| {
+            let (reply, answer) = crossbeam_channel::bounded(1);
+            tx.send(ControlCommand::SubscribeBySymbol {
+                symbol: "AAPL".into(), sec_type: "STK".into(), exchange: "SMART".into(), currency: "USD".into(),
+                filters: Default::default(), mode_9887: 0, snapshot: false, reply_tx: Some(reply),
+            }).unwrap();
+            engine.poll_once();
+            let slot = answer.recv().unwrap().unwrap();
+            let lookup = format!("{}", engine.context.md_lookups[0].0);
+            let mut context = std::mem::replace(&mut engine.context, Context::new());
+            let body = format!("35=d|43=N|320={lookup}|322=*|323=4|55=AAPL|167=STK|207=BEST|6008=265598|15=USD|");
+            assert!(farm::md_contract_reply(&mut context, &shared, &lookup, &pipe_msg(&body)));
+            engine.context = context;
+            engine.send_md_resolved();
+            engine.send_lot_ready();
+            slot
+        };
+        let first = by_symbol(&mut engine);
+        assert_ne!(first, order_slot);
+        assert!(shared.market.drain_md_merges().is_empty(), "the slot of the order has no market data to join");
+        assert!(engine.joins_top(first, false), "the first request runs or waits on its own slot");
+        let _ = sent(&mut farm_side);
+        let second = by_symbol(&mut engine);
+        assert_eq!(shared.market.drain_md_merges(), [(second, first, 0)]);
+        assert!(sent(&mut farm_side).is_empty(), "no second subscription of the contract");
+        assert_eq!(engine.context.market.instrument_by_con_id(265598), Some(order_slot));
+
+        // ibx#534, paper 09/10/2026: a request with the conId then shares
+        // the running one too, where the conId alone finds the order's slot.
+        let (reply, answer) = crossbeam_channel::bounded(1);
+        tx.send(ControlCommand::Subscribe {
+            con_id: 265598, symbol: "AAPL".into(), exchange: "SMART".into(), sec_type: "STK".into(),
+            last_trade_date: String::new(), strike: 0.0, right: String::new(), multiplier: String::new(),
+            mode_9887: 0, snapshot: false, reply_tx: Some(reply),
+        }).unwrap();
+        engine.poll_once();
+        assert_eq!(answer.recv().unwrap().unwrap(), first, "the slot of the running request");
+        assert!(sent(&mut farm_side).is_empty(), "no second subscription of the contract");
+    }
 }
 
 #[cfg(test)]
@@ -5508,7 +5853,7 @@ mod tbt_tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn subscribe_with(engine: &mut HotLoop, tx: &crossbeam_channel::Sender<ControlCommand>, req_id: ReqId, con_id: i64, symbol: &str, exchange: &str, sec_type: &str,
+    fn subscribe_with(engine: &mut HotLoop, tx: &ControlSender, req_id: ReqId, con_id: i64, symbol: &str, exchange: &str, sec_type: &str,
         tbt_type: crate::types::TbtType, number_of_ticks: i32, ignore_size: bool) {
         tx.send(ControlCommand::SubscribeTbt {
             req_id, con_id, symbol: symbol.into(), exchange: exchange.into(), sec_type: sec_type.into(),
@@ -5518,7 +5863,7 @@ mod tbt_tests {
     }
 
     /// Subscribe with the next request id of the test; the request id.
-    fn subscribe(engine: &mut HotLoop, tx: &crossbeam_channel::Sender<ControlCommand>, con_id: i64, symbol: &str, exchange: &str, sec_type: &str, tbt_type: crate::types::TbtType) -> ReqId {
+    fn subscribe(engine: &mut HotLoop, tx: &ControlSender, con_id: i64, symbol: &str, exchange: &str, sec_type: &str, tbt_type: crate::types::TbtType) -> ReqId {
         static NEXT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(100);
         let req_id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         subscribe_with(engine, tx, req_id, con_id, symbol, exchange, sec_type, tbt_type, 0, false);
@@ -5538,6 +5883,7 @@ mod tbt_tests {
         let (conn, mut side) = loopback();
         engine.hmds_conn = Some(conn);
         let (tx, rx) = crossbeam_channel::bounded(8);
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         subscribe(&mut engine, &tx, 12087792, "EUR", "IDEALPRO", "CASH", crate::types::TbtType::BidAsk);
         subscribe(&mut engine, &tx, 815824267, "MNQ", "CME", "FUT", crate::types::TbtType::AllLast);
@@ -5560,6 +5906,7 @@ mod tbt_tests {
         let (conn, _side) = loopback();
         engine.hmds_conn = Some(conn);
         let (tx, rx) = crossbeam_channel::bounded(8);
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         let quotes_req = subscribe(&mut engine, &tx, 815824267, "MNQ", "CME", "FUT", crate::types::TbtType::BidAsk);
         let trades_req = subscribe(&mut engine, &tx, 815824267, "MNQ", "CME", "FUT", crate::types::TbtType::AllLast);
@@ -5611,6 +5958,7 @@ mod tbt_tests {
         let (conn, _side) = loopback();
         engine.hmds_conn = Some(conn);
         let (tx, rx) = crossbeam_channel::bounded(8);
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         let last = subscribe(&mut engine, &tx, 692196414, "ALAB", "SMART", "STK", crate::types::TbtType::AllLast);
         let quotes = subscribe(&mut engine, &tx, 12087792, "EUR", "IDEALPRO", "CASH", crate::types::TbtType::BidAsk);
@@ -5659,6 +6007,7 @@ mod tbt_tests {
         let (conn, mut side) = loopback();
         engine.hmds_conn = Some(conn);
         let (tx, rx) = crossbeam_channel::bounded(8);
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         use crate::types::TbtType::Last;
         subscribe_with(&mut engine, &tx, 1, 265598, "AAPL", "SMART", "STK", Last, 0, false);
@@ -5703,6 +6052,7 @@ mod tbt_tests {
         let (conn, mut side) = loopback();
         engine.hmds_conn = Some(conn);
         let (tx, rx) = crossbeam_channel::bounded(8);
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         use crate::types::TbtType::BidAsk;
         subscribe_with(&mut engine, &tx, 1, 265598, "AAPL", "SMART", "STK", BidAsk, 0, false);
@@ -5737,6 +6087,7 @@ mod tbt_tests {
         let (conn, mut side) = loopback();
         engine.hmds_conn = Some(conn);
         let (tx, rx) = crossbeam_channel::bounded(8);
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         use crate::types::TbtType::Last;
         subscribe_with(&mut engine, &tx, 1, 265598, "AAPL", "SMART", "STK", Last, 2, false);
@@ -5775,6 +6126,7 @@ mod tbt_tests {
         let (conn, _side) = loopback();
         engine.hmds_conn = Some(conn);
         let (tx, rx) = crossbeam_channel::bounded(8);
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         let gone = subscribe(&mut engine, &tx, 272093, "MSFT", "SMART", "STK", crate::types::TbtType::Last);
         let live = subscribe(&mut engine, &tx, 265598, "AAPL", "SMART", "STK", crate::types::TbtType::Last);
@@ -5806,6 +6158,7 @@ mod tbt_tests {
         let (conn, mut side) = loopback();
         engine.hmds_conn = Some(conn);
         let (tx, rx) = crossbeam_channel::bounded(8);
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         shared.reference.set_tick_by_tick_limits(3, false);
         use crate::types::TbtType::{Last, BidAsk};
@@ -5843,6 +6196,7 @@ mod tbt_tests {
         let (conn, mut side) = loopback();
         engine.hmds_conn = Some(conn);
         let (tx, rx) = crossbeam_channel::bounded(8);
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         let mnq = subscribe(&mut engine, &tx, 815824267, "MNQ", "CME", "FUT", crate::types::TbtType::AllLast);
         let eur = subscribe(&mut engine, &tx, 12087792, "EUR", "IDEALPRO", "CASH", crate::types::TbtType::BidAsk);
@@ -5882,6 +6236,7 @@ mod tbt_tests {
         let (conn, mut side) = loopback();
         engine.hmds_conn = Some(conn);
         let (tx, rx) = crossbeam_channel::bounded(8);
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         let r = subscribe(&mut engine, &tx, 265598, "AAPL", "SMART", "STK", crate::types::TbtType::Last);
         let _ = plain_sent(&mut side);
@@ -5919,6 +6274,7 @@ mod tbt_tests {
             IDEALPRO,CASH,TickByTick,4,*,ndc1.example,4000,cashhmds;\
             CME,FUT,DayChart|EODChart|Bar5Sec,-1,*,cdc1.example,4000,ushmds");
         let (tx, rx) = crossbeam_channel::bounded(8);
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         subscribe(&mut engine, &tx, 12087792, "EUR", "IDEALPRO", "CASH", crate::types::TbtType::BidAsk);
         let cash = engine.pool.find("cashhmds").expect("cashhmds opened on demand");
@@ -6040,7 +6396,7 @@ mod depth_tests {
 
     /// An engine with the table, and the definitions of the contracts
     /// known (group and components).
-    fn engine() -> (HotLoop, Arc<SharedState>, crate::protocol::connection::MemTransport, crossbeam_channel::Sender<ControlCommand>) {
+    fn engine() -> (HotLoop, Arc<SharedState>, crate::protocol::connection::MemTransport, ControlSender) {
         let shared = Arc::new(SharedState::new());
         let mut engine = HotLoop::new(shared.clone(), None, None);
         engine.set_farm_name("usfarm".into());
@@ -6053,6 +6409,7 @@ mod depth_tests {
         engine.context.valid_exchanges.insert(265598, ["SMART", "NASDAQ", "MEMX", "IEX", "ZZZ", "TPLUS0", "PSX", "IBEOS"]
             .into_iter().map(String::from).collect());
         let (tx, rx) = crossbeam_channel::bounded(16);
+        let tx = crate::engine::park::ControlSender::from(tx);
         engine.set_control_rx(rx);
         (engine, shared, side, tx)
     }
@@ -6789,6 +7146,162 @@ mod depth_tests {
             let (ours, theirs) = replay_depth(path);
             eprintln!("{path}: {} callbacks of the reference, {} of the engine", theirs.len(), ours.len());
             assert_same_callbacks(&ours, &theirs);
+        }
+    }
+}
+
+#[cfg(test)]
+mod frozen_tests {
+    use super::*;
+    use super::news_tests::{engine, sent};
+    use crate::bridge::MdReject;
+    use crate::types::PRICE_SCALE;
+
+    const OPT: i64 = 929914886;
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    /// The captured status frame of the option (b4_447_frozen_option, frame
+    /// 112: server tag 128617, value 1), with another value when asked.
+    fn status_frame(value: u8) -> Vec<u8> {
+        hex(&format!("383d4f01393d303033310133353d470100480001f66904000000{value:02x}01383334393d393039314246453701"))
+    }
+
+    /// reqMarketDataType(2), then the option of the capture.
+    fn frozen_option(engine: &mut HotLoop, tx: &ControlSender) -> InstrumentId {
+        tx.send(ControlCommand::SetMarketDataType { market_data_type: 2 }).unwrap();
+        tx.send(ControlCommand::Subscribe {
+            con_id: OPT, symbol: "AAPL".into(), exchange: "SMART".into(), sec_type: "OPT".into(),
+            last_trade_date: "20261014".into(), strike: 332.5, right: "C".into(), multiplier: "100".into(),
+            mode_9887: 0, snapshot: false, reply_tx: None,
+        }).unwrap();
+        engine.poll_once();
+        engine.context.market.instrument_by_con_id(OPT).unwrap()
+    }
+
+    const PAIR: &str = "|6008=929914886|207=BEST|167=OPT|264=";
+
+    // ibx#447 (captured 07/10/2026, b4_447_frozen_option): in frozen mode
+    // the market data status entry goes first, without the API source, then
+    // the pair. Status 1: the frozen pair is asked with mode 2 and without
+    // the API source, on a slot of its own, and the requests are told. The
+    // captured frames give the frozen quote the client got (close 5.0, bid
+    // 4.75 x 597, ask 5.35 x 675) and leave the real-time slot with the
+    // empty quote. A cancel: the frozen pair, the real-time pair, the status
+    // entry.
+    #[test]
+    fn frozen_status_asks_the_frozen_pair_on_its_own_slot() {
+        let (mut engine, shared, mut farm_side, tx) = engine();
+        let live = frozen_option(&mut engine, &tx);
+        assert_eq!(sent(&mut farm_side), [
+            format!("35=V|263=1|146=1|262=1{PAIR}398|"),
+            format!("35=V|263=1|146=2|262=2{PAIR}442|6088=Socket|9830=1|262=3{PAIR}443|6088=Socket|9830=1|"),
+        ]);
+
+        // Frame 183: the status ack; frame 185: status 1, before the pair's acks.
+        engine.inject_farm_message(b"8=O\x019=0046\x0135=Q\x01128617,1,0.01,0,0,c7,,0,1\x018349=928EC0B4\x01");
+        assert!(shared.market.drain_tick_req_params().is_empty(), "a status ack gives no request parameters");
+        engine.inject_farm_message(&status_frame(1));
+        let frozen = engine.farm.frozen_slot(live).expect("a frozen slot");
+        assert_ne!(frozen, live);
+        assert_eq!(shared.market.drain_md_rejects(), [MdReject::Frozen { instrument: live, frozen }]);
+        assert_eq!(sent(&mut farm_side), [
+            format!("35=V|263=1|146=2|262=4{PAIR}442|9887=2|9830=1|262=5{PAIR}443|9887=2|9830=1|"),
+        ]);
+        // The same status again changes nothing.
+        engine.inject_farm_message(&status_frame(1));
+        assert!(shared.market.drain_md_rejects().is_empty() && sent(&mut farm_side).is_empty());
+
+        // Frames 194-197: the real-time pair's acks, its trade tag, its quote.
+        engine.inject_farm_message(b"8=O\x019=0046\x0135=Q\x01128612,2,0.01,0,3,c7,,1,1\x018349=36A7B14D\x01");
+        engine.inject_farm_message(b"8=O\x019=0046\x0135=Q\x01128612,3,0.01,0,3,c7,,1,1\x018349=3FCCD8EC\x01");
+        engine.inject_farm_message(b"8=O\x019=0044\x0135=L\x01929914886,0.01,128613,,1\x018349=E35764CA\x01");
+        engine.inject_farm_message(&hex("383d4f01393d303034320133353d500100a00001f66404e424000ce42c003c0c84008c00580001383334393d384133324244353101"));
+        // Frames 209-212: the frozen pair's acks (mode 2 in the fourth field), then its quote.
+        engine.inject_farm_message(b"8=O\x019=0046\x0135=Q\x01128622,4,0.01,2,3,c7,,0,1\x018349=FBF56653\x01");
+        engine.inject_farm_message(b"8=O\x019=0046\x0135=Q\x01128622,5,0.01,2,3,c7,,0,1\x018349=7335175A\x01");
+        engine.inject_farm_message(&hex("383d4f01393d303037340133353d500101a00001f66e140034006c00a400a8000001f66e1d01f4a70135288e44004c00540060000001f66e0501db2502550d02172d02a3580001383334393d314334373734313101"));
+        let q = *engine.context.market.quote(frozen);
+        assert_eq!((q.bid, q.ask, q.close), (475 * PRICE_SCALE / 100, 535 * PRICE_SCALE / 100, 5 * PRICE_SCALE));
+        assert_eq!((q.bid_size, q.ask_size), (597 * crate::types::QTY_SCALE, 675 * crate::types::QTY_SCALE));
+        let q = *engine.context.market.quote(live);
+        assert_ne!(q.bid, 475 * PRICE_SCALE / 100, "the real-time slot keeps its own quote");
+
+        // The exchange map of the pair's BBO exchange is asked at its ack
+        // (ibx#441), as for any request.
+        assert_eq!(sent(&mut farm_side), [format!("35=V|263=1|146=1|262=6{PAIR}626|6088=Socket|")]);
+
+        // The requests are on the frozen slot: its cancel ends the whole
+        // subscription (frames 239, 240 and the status entry of 242).
+        tx.send(ControlCommand::Unsubscribe { instrument: frozen }).unwrap();
+        engine.poll_once();
+        assert_eq!(sent(&mut farm_side), [
+            format!("35=V|263=2|146=2|262=4{PAIR}442|9887=2|9830=1|262=5{PAIR}443|9887=2|9830=1|"),
+            format!("35=V|263=2|146=2|262=2{PAIR}442|9830=1|262=3{PAIR}443|9830=1|"),
+            format!("35=V|263=2|146=1|262=1{PAIR}398|"),
+        ]);
+        assert!(engine.farm.status.is_empty());
+        assert_eq!(engine.context.market.con_id(live), None, "the real-time slot is freed");
+        assert_eq!(engine.context.market.con_id(frozen), None, "the frozen slot is freed");
+    }
+
+    // ibx#447: a status other than 1 is not frozen (captured 07/10/2026: 2
+    // for AAPL in the pre-market, marketDataType 1 and no frozen pair).
+    // After frozen, it sends the requests back to the real-time slot; the
+    // frozen pair is cancelled when they left its slot, and the real-time
+    // pair and the status entry stay.
+    #[test]
+    fn a_status_other_than_one_is_not_frozen() {
+        let (mut engine, shared, mut farm_side, tx) = engine();
+        let live = frozen_option(&mut engine, &tx);
+        sent(&mut farm_side);
+        engine.inject_farm_message(b"8=O\x0135=Q\x01128617,1,0.01,0,0,c7,,0,1\x01");
+        engine.inject_farm_message(&status_frame(2));
+        assert!(shared.market.drain_md_rejects().is_empty() && sent(&mut farm_side).is_empty());
+        assert_eq!(engine.farm.frozen_slot(live), None);
+
+        engine.inject_farm_message(&status_frame(1));
+        let frozen = engine.farm.frozen_slot(live).unwrap();
+        shared.market.drain_md_rejects();
+        sent(&mut farm_side);
+        engine.inject_farm_message(&status_frame(2));
+        assert_eq!(shared.market.drain_md_rejects(), [MdReject::Live { instrument: frozen, live }]);
+        assert!(sent(&mut farm_side).is_empty(), "nothing is sent until the requests left the frozen slot");
+        tx.send(ControlCommand::Unsubscribe { instrument: frozen }).unwrap();
+        engine.poll_once();
+        assert_eq!(sent(&mut farm_side), [
+            format!("35=V|263=2|146=2|262=4{PAIR}442|9887=2|9830=1|262=5{PAIR}443|9887=2|9830=1|"),
+        ]);
+        assert_eq!(engine.farm.status.len(), 1);
+        assert_eq!(engine.context.market.con_id(live), Some(OPT));
+
+        // The end of the request: the pair, then the status entry.
+        tx.send(ControlCommand::Unsubscribe { instrument: live }).unwrap();
+        engine.poll_once();
+        assert_eq!(sent(&mut farm_side), [
+            format!("35=V|263=2|146=2|262=2{PAIR}442|9830=1|262=3{PAIR}443|9830=1|"),
+            format!("35=V|263=2|146=1|262=1{PAIR}398|"),
+        ]);
+    }
+
+    // ibx#447: outside frozen mode no status entry is asked (type 1, and
+    // type 3 or 4 alone, which do not set the frozen flag).
+    #[test]
+    fn no_status_entry_outside_frozen_mode() {
+        for market_data_type in [1, 3, 4] {
+            let (mut engine, _shared, mut farm_side, tx) = engine();
+            tx.send(ControlCommand::SetMarketDataType { market_data_type }).unwrap();
+            tx.send(ControlCommand::Subscribe {
+                con_id: 265598, symbol: "AAPL".into(), exchange: "SMART".into(), sec_type: "STK".into(),
+                last_trade_date: String::new(), strike: 0.0, right: String::new(), multiplier: String::new(),
+                mode_9887: 0, snapshot: false, reply_tx: None,
+            }).unwrap();
+            engine.poll_once();
+            let out = sent(&mut farm_side);
+            assert_eq!(out.len(), 1, "{out:?}");
+            assert!(!out[0].contains("264=398"), "{}", out[0]);
         }
     }
 }

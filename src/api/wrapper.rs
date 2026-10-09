@@ -207,6 +207,12 @@ pub trait Wrapper {
 
     fn news_providers(&mut self, providers: &[crate::types::NewsProvider]) {}
 
+    // ── Display Groups ──
+
+    fn display_group_list(&mut self, req_id: i64, groups: &str) {}
+
+    fn display_group_updated(&mut self, req_id: i64, contract_info: &str) {}
+
     // ── Soft Dollar Tiers ──
 
     fn soft_dollar_tiers(&mut self, req_id: i64, tiers: &[crate::types::SoftDollarTier]) {}
@@ -226,6 +232,14 @@ pub trait Wrapper {
     // ── User Info ──
 
     fn user_info(&mut self, req_id: i64, white_branding_id: &str) {}
+
+    // ── WSH ──
+
+    /// WSH meta data, as `wshMetaData` (ibx#443).
+    fn wsh_meta_data(&mut self, req_id: i64, data_json: &str) {}
+
+    /// WSH event data, as `wshEventData` (ibx#443).
+    fn wsh_event_data(&mut self, req_id: i64, data_json: &str) {}
 }
 
 /// Test helpers for Wrapper-based testing. Hidden from docs; built only
@@ -445,6 +459,12 @@ pub mod tests {
         }
         fn soft_dollar_tiers(&mut self, req_id: i64, tiers: &[crate::types::SoftDollarTier]) {
             self.events.push(format!("soft_dollar_tiers:{req_id}:{}", tiers.len()));
+        }
+        fn display_group_list(&mut self, req_id: i64, groups: &str) {
+            self.events.push(format!("display_group_list:{req_id}:{groups}"));
+        }
+        fn display_group_updated(&mut self, req_id: i64, contract_info: &str) {
+            self.events.push(format!("display_group_updated:{req_id}:{contract_info}"));
         }
         fn family_codes(&mut self, codes: &[crate::types::FamilyCode]) {
             self.events.push(format!("family_codes:{}", codes.len()));

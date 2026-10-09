@@ -22,6 +22,8 @@ const TESTED_CONTROL_COMMANDS: &[&str] = &[
     "Order",
     "RegisterInstrument",
     "RegisterOrderContract", // order_paths_paper order_by_symbol (ibx#486)
+    "HoldOrder", // order_paths_paper bracket_with_transmit_off (ibx#509)
+    "OrderGroup", // order_paths_paper bracket_with_transmit_off (ibx#547)
     "FetchHistorical",
     "CancelHistorical",
     "FetchHeadTimestamp",
@@ -50,6 +52,10 @@ const TESTED_CONTROL_COMMANDS: &[&str] = &[
 ];
 
 const KNOWN_CONTROL_COMMAND_GAPS: &[(&str, &str)] = &[
+    (
+        "DisplayGroupLookup",
+        "Checked on the paper account by examples/ex424_display_groups (ibx#424), not by a phase of this suite",
+    ),
     (
         "FetchNewsProviders",
         "Gateway-local response path, no CCP round-trip in hot loop yet",
@@ -108,7 +114,8 @@ const KNOWN_RUST_API_GAPS: &[(&str, &str)] = &[
     ),
     (
         "WSH endpoints",
-        "Not implemented in Rust endpoint layer yet",
+        "Only the permission check is implemented (answered locally, no control command); \
+         the data request is not",
     ),
 ];
 

@@ -99,6 +99,9 @@ impl EClient {
         // The news tick of a known contract is checked first (ibx#458).
         if let Some((code, text)) = self.core.news_tick_refusal(&self.shared, generic_tick_list, contract.con_id, &contract.sec_type) {
             self.shared.orders.push_order_error(req_id, code, text);
+            if !snapshot {
+                self.core.note_news_refused(&self.shared, req_id, contract.con_id);
+            }
             return Ok(());
         }
         let filters = SecDefFilters {
@@ -308,9 +311,11 @@ impl EClient {
     /// on (2 keeps the delayed modes, 3 keeps frozen). With delayed on, a
     /// subscription the server rejects goes on with delayed data when the
     /// server has it: `market_data_type(reqId, 3)` then error 10167, as the
-    /// reference. The frozen modes are kept but no frozen subscription is
-    /// sent: when the reference asks for frozen data is not known. A value
-    /// outside 1..=4 gives error 321 with id -1.
+    /// reference. With frozen on (2, until 1), a streaming request also
+    /// asks the contract's market data status; while it says frozen, the
+    /// request gets the frozen top of book: `market_data_type(reqId, 2)`,
+    /// then the kept values; back on real-time data, type 1 and the
+    /// real-time values. A value outside 1..=4 gives error 321 with id -1.
     pub fn req_market_data_type(&self, market_data_type: i32) {
         if let Some((code, text)) = self.core.set_market_data_type(&self.control_tx, market_data_type) {
             self.shared.orders.push_order_error(-1, code, text);

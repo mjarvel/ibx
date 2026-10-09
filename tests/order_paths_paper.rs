@@ -592,6 +592,99 @@ fn order_by_symbol_checks_read_the_logged_frames() {
     assert!(!ok(vec![lookup.into(), answer.into(), order.replace(&format!("6121={id}"), "6121=5")]));
 }
 
+/// ibx#509: a bracket in the client library's usual form, on a contract
+/// given by symbol: the parent and the take-profit with transmit off send
+/// no order and get no answer; the stop with transmit on sends the three
+/// together, the parent first, and the server takes them (the children
+/// name their parent).
+fn bracket_with_transmit_off(paper: &mut Paper, id: i64) {
+    println!("  bracket with transmit off (orders {}..{})", id, id + 2);
+    let by_symbol = Contract { con_id: 0, ..aapl() };
+    let order = |action: &str, order_type: &str, lmt: f64, aux: f64, transmit: bool, parent_id: i64| Order {
+        action: action.into(), order_type: order_type.into(), total_quantity: 1.0, lmt_price: lmt, aux_price: aux,
+        tif: "DAY".into(), transmit, parent_id, ..Default::default()
+    };
+    let new_orders = |from: usize| -> Vec<i64> {
+        wire().lines.lock().unwrap()[from..].iter().filter(|l| l.starts_with("WIRE>")).map(|l| parse_frame(l))
+            .filter(|f| field(f, 35) == Some("D"))
+            .filter_map(|f| field(&f, 6121).and_then(|v| v.parse().ok())).collect()
+    };
+    let start = wire().lines.lock().unwrap().len();
+    for (oid, held) in [(id, order("BUY", "LMT", 100.0, 0.0, false, 0)), (id + 1, order("SELL", "LMT", 400.0, 0.0, false, id))] {
+        paper.placed.push(oid);
+        if let Err(e) = paper.client.place_order(oid, &by_symbol, &held) {
+            paper.fail(&format!("order {}: place_order returned {}", oid, e));
+        }
+    }
+    paper.pump(4, |_| false);
+    let answered = {
+        let s = paper.state.lock().unwrap();
+        s.statuses.iter().any(|(i, _)| (id..id + 2).contains(i)) || s.errors.iter().any(|(i, ..)| (id..id + 2).contains(i))
+    };
+    paper.check(new_orders(start).is_empty(), "bracket with transmit off: the held orders are not sent");
+    paper.check(!answered, "bracket with transmit off: the held orders get no answer");
+    paper.placed.push(id + 2);
+    if let Err(e) = paper.client.place_order(id + 2, &by_symbol, &order("SELL", "STP", 0.0, 50.0, true, id)) {
+        paper.fail(&format!("order {}: place_order returned {}", id + 2, e));
+    }
+    let all = paper.wait_working(&[id, id + 1, id + 2]);
+    paper.check(all, "bracket with transmit off: the three orders are working");
+    paper.check(new_orders(start) == [id, id + 1, id + 2], "bracket with transmit off: sent together, the parent first");
+    // The parent's cancel ends the three.
+    let _ = paper.client.cancel_order(id, "");
+    let ended = paper.pump(15, |s| (id..id + 3).all(|i| last_status(s, i).as_deref() == Some("Cancelled")));
+    paper.check(ended, "bracket with transmit off: the parent's cancel ends the three");
+}
+
+/// ibx#545 (the reference on paper, 09/10/2026): a global cancel answers
+/// 161 for an order cancelled a few seconds before, and for an order that
+/// was never sent each time; once its time in the reference's book is
+/// over, the cancelled order gets none.
+fn global_cancel_after_ended_orders(paper: &mut Paper, id: i64) {
+    println!("  global cancel after ended orders (orders {}, {})", id, id + 1);
+    // An order id below the highest one used is refused: the held order first.
+    let (held, sent) = (id, id + 1);
+    let order = |transmit: bool| Order {
+        action: "BUY".into(), order_type: "LMT".into(), total_quantity: 1.0, lmt_price: 100.0,
+        tif: "DAY".into(), transmit, ..Default::default()
+    };
+    let refusals = |s: &State, from: usize| -> Vec<i64> {
+        // The orders of this step only: the global cancel also ends the
+        // orders the steps before left working.
+        s.errors[from..].iter().filter(|(i, c, _)| *c == 161 && (id..id + 2).contains(i)).map(|(i, ..)| *i).collect()
+    };
+    // Held, then cancelled: an order that was never sent.
+    paper.place(held, &order(false));
+    paper.pump(2, |_| false);
+    let _ = paper.client.cancel_order(held, "");
+    paper.pump(10, |s| refusals(s, 0).contains(&held));
+    // Sent, working, cancelled.
+    paper.place(sent, &order(true));
+    let is_working = paper.wait_working(&[sent]);
+    paper.check(is_working, "global cancel after ended orders: the order is working");
+    let _ = paper.client.cancel_order(sent, "");
+    let cancelled = paper.pump(15, |s| last_status(s, sent).as_deref() == Some("Cancelled"));
+    let at = Instant::now();
+    paper.check(cancelled, "global cancel after ended orders: the order is cancelled");
+
+    paper.pump(3, |_| false);
+    let from = paper.state.lock().unwrap().errors.len();
+    let _ = paper.client.req_global_cancel();
+    paper.pump(3, |_| false);
+    let mut got = refusals(&paper.state.lock().unwrap(), from);
+    got.sort_unstable();
+    paper.check(got == [held, sent], &format!("global cancel 3 s after: 161 for both ended orders ({:?})", got));
+
+    while at.elapsed() < Duration::from_secs(12) {
+        paper.pump(1, |_| false);
+    }
+    let from = paper.state.lock().unwrap().errors.len();
+    let _ = paper.client.req_global_cancel();
+    paper.pump(3, |_| false);
+    let got = refusals(&paper.state.lock().unwrap(), from);
+    paper.check(got == [held], &format!("global cancel 12 s after: 161 for the order that was never sent only ({:?})", got));
+}
+
 /// ibx#328: every new order carries the contract id after the secondary
 /// routing field, as the reference does (ib-agent#192 B4).
 fn contract_id_on_new_orders(paper: &mut Paper) {
@@ -635,6 +728,8 @@ fn order_paths_paper() {
     server_reject(&mut paper, base + 500);
     contract_id_on_new_orders(&mut paper);
     order_by_symbol(&mut paper, base + 600);
+    bracket_with_transmit_off(&mut paper, base + 700);
+    global_cancel_after_ended_orders(&mut paper, base + 800);
 
     println!("  cleanup: cancelling every order still working");
     // A modified order is placed twice under one id: cancel it once.

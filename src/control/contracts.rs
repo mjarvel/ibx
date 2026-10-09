@@ -769,6 +769,8 @@ pub const SECDEF_BY_CONID_NAME: &str = "socket-reqContractDetailsReqByConid";
 /// Name of the lookup of the preferred contract of a conId, the API lookup
 /// by conId without an exchange (ibx#438).
 pub const SECDEF_PREFERRED_NAME: &str = "PreferredReqByConid";
+/// Name of the lookup of a contract not seen yet, by conId (ibx#424).
+pub const SECDEF_MSG_NAME: &str = "SecDefReqMsgReqByConid";
 /// Name of the lookup of a record's market rule on one of its valid
 /// exchanges, as the reference names it (ibx#435, ibx#436).
 pub const SECDEF_EXCHANGE_RULE_NAME: &str = "getECsForConidExchangePairsReqByConid";
@@ -792,6 +794,7 @@ pub fn secdef_request_number(req_id: &str) -> Option<crate::types::ReqId> {
         .or_else(|| req_id.strip_prefix(SECDEF_BY_SYMBOL_NAME))
         .or_else(|| req_id.strip_prefix(SECDEF_BY_CONID_NAME))
         .or_else(|| req_id.strip_prefix(SECDEF_PREFERRED_NAME))
+        .or_else(|| req_id.strip_prefix(SECDEF_MSG_NAME))
         .unwrap_or(req_id)
         .parse()
         .ok()
@@ -1483,7 +1486,9 @@ pub const TAG_MATCH_ALT_SECURITY_TYPE: u32 = 310;
 /// A single matching symbol result (ibx#439).
 #[derive(Debug, Clone)]
 pub struct SymbolMatch {
-    /// -1 when the row has no conId, as the reference.
+    /// 0 when the row has no conId: the reference leaves the id out of its
+    /// answer for such a row, and the official client library then shows 0
+    /// (ibx#527; -1 is the value of the older text form of the answer).
     pub con_id: i64,
     pub symbol: String,
     /// The API text ("STK", "BOND", ...); a type the engine does not know
@@ -1521,6 +1526,20 @@ pub fn build_matching_symbols_request(pattern: &str, req_id: &str, seq: u32) -> 
 /// Parse a matching symbols response.
 ///
 /// Uses sequential tag parsing since matches are a repeating group.
+/// The derivative types of a matching symbol in the reference's order. The
+/// server lists them by name (BAG, CFD, IOPT, OPT, WAR); the reference
+/// keeps them in a set and gives them in that set's order, which is the same
+/// on every answer recorded (ibx#524, 140 answers with types of 02/10/2026
+/// and 08/10/2026, no pair seen in both orders): CFD, OPT, IOPT, WAR, FUT,
+/// BAG, and FOP before FUT. FOP was only seen with FUT and BAG: its place
+/// against the first four is not known. A type not in this list keeps the
+/// server's order, after the others.
+pub fn derivative_types_as_reference(mut types: Vec<String>) -> Vec<String> {
+    const ORDER: [&str; 7] = ["CFD", "OPT", "IOPT", "WAR", "FOP", "FUT", "BAG"];
+    types.sort_by_key(|t| ORDER.iter().position(|o| o == t).unwrap_or(ORDER.len()));
+    types
+}
+
 pub fn parse_matching_symbols_response(data: &[u8]) -> Option<Vec<SymbolMatch>> {
     use crate::protocol::fix::SOH;
 
@@ -1542,7 +1561,7 @@ pub fn parse_matching_symbols_response(data: &[u8]) -> Option<Vec<SymbolMatch>> 
     if sub_protocol != "186" { return None; }
 
     // Each row starts at its symbol, as the reference: rows without a
-    // conId are kept with -1, the security type is the first type field
+    // conId are kept with 0 (ibx#527), the security type is the first type field
     // else the alternative one (ibx#439). A row whose conId is not a number
     // is skipped, as the reference skips a row it cannot convert.
     struct Row<'a> {
@@ -1555,7 +1574,7 @@ pub fn parse_matching_symbols_response(data: &[u8]) -> Option<Vec<SymbolMatch>> 
         let mut m = row.m;
         m.sec_type = api_sec_type(row.sec_type.or(row.alt_sec_type).unwrap_or(""));
         m.con_id = match row.con_id {
-            None => -1,
+            None => 0,
             Some(v) => match v.parse() {
                 Ok(id) => id,
                 Err(_) => {
@@ -1576,7 +1595,7 @@ pub fn parse_matching_symbols_response(data: &[u8]) -> Option<Vec<SymbolMatch>> 
             }
             current = Some(Row {
                 m: SymbolMatch {
-                    con_id: -1,
+                    con_id: 0,
                     symbol: val.clone(),
                     sec_type: String::new(),
                     currency: String::new(),
@@ -1601,7 +1620,9 @@ pub fn parse_matching_symbols_response(data: &[u8]) -> Option<Vec<SymbolMatch>> 
             TAG_MATCH_DESCRIPTION => row.m.description = val.clone(),
             TAG_MATCH_ISSUER_ID => row.m.issuer_id = val.clone(),
             TAG_MATCH_DERIVATIVE_TYPES => {
-                row.m.derivative_types = val.split(',').map(|s| s.to_string()).collect();
+                // An empty value is no type, not one empty type.
+                row.m.derivative_types = derivative_types_as_reference(
+                    val.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect());
             }
             _ => {}
         }
@@ -2172,12 +2193,19 @@ pub(crate) mod tests {
         assert_eq!((m[0].con_id, m[0].symbol.as_str(), m[0].sec_type.as_str()), (272093, "MSFT", "STK"));
         assert_eq!((m[0].primary_exchange.as_str(), m[0].currency.as_str()), ("NASDAQ", "USD"));
         assert_eq!(m[0].description, "MICROSOFT CORP");
-        assert_eq!(m[0].derivative_types, ["BAG", "CFD", "IOPT", "OPT", "WAR"]);
+        // The server's BAG,CFD,IOPT,OPT,WAR in the reference's order (ibx#524).
+        assert_eq!(m[0].derivative_types, ["CFD", "OPT", "IOPT", "WAR", "BAG"]);
+        let order = |t: &[&str]| derivative_types_as_reference(t.iter().map(|s| s.to_string()).collect());
+        assert_eq!(order(&["BAG", "FOP", "FUT"]), ["FOP", "FUT", "BAG"]);
+        assert_eq!(order(&["BAG", "CFD", "FUT", "IOPT"]), ["CFD", "IOPT", "FUT", "BAG"]);
+        assert_eq!(order(&["BAG", "XYZ", "ABC", "OPT"]), ["OPT", "BAG", "XYZ", "ABC"]);
+        assert!(order(&[]).is_empty());
         assert_eq!(m[0].issuer_id, "");
         // A bond row: empty symbol, type from the alternative field, issuer id.
         assert_eq!((m[1].symbol.as_str(), m[1].sec_type.as_str(), m[1].issuer_id.as_str()), ("", "BOND", "e1393444"));
-        // No conId: kept with -1.
-        assert_eq!((m[2].con_id, m[2].sec_type.as_str()), (-1, "CASH"));
+        // No conId: 0, as a client of the reference reads it (ibx#527: the
+        // nine bond issuer rows of "IBM", recorded 02/10/2026, have no id).
+        assert_eq!((m[2].con_id, m[2].sec_type.as_str()), (0, "CASH"));
         // A type the engine does not know is kept as received.
         assert_eq!(m[3].sec_type, "FUND");
         // The wire stock code is given in its API form.

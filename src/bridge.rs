@@ -11,7 +11,8 @@
 //! - External callers read snapshots and poll events without blocking the hot loop.
 
 use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
 
 use std::collections::HashMap;
 use crate::control::historical::{HistoricalBar, HistoricalResponse, HeadTimestampResponse};
@@ -59,6 +60,12 @@ pub struct FillExec {
     /// `req_executions`, with no live callback and no commission report
     /// (`jextend.ba.a(dq, aQ)`: the reports go to the order's client).
     pub other_client: bool,
+    /// An execution the server gave again (97=Y: the replay of the day at
+    /// the logon, the fill-up after a reconnect): kept for
+    /// `req_executions`, with no live callback and no commission report,
+    /// as the reference's API clients get none for them (ibx#487, captured
+    /// 07/10/2026 and 30/09/2026).
+    pub replayed: bool,
 }
 
 /// The execution of a combo report (ibx#470): the reference shows the
@@ -90,8 +97,168 @@ pub struct ComboView {
     pub leg_prices: Vec<f64>,
 }
 
+/// The event channel as the error queues see it (ibx#498): unset, and
+/// free, until a channel is attached.
+#[derive(Default)]
+struct ErrorTap {
+    events: std::sync::OnceLock<crossbeam_channel::Sender<Event>>,
+    /// Wakes the consumer that waits for data: an error is written by the
+    /// engine or by the thread of the caller (a request refused locally),
+    /// and the second has no pass of the engine behind it (ibx#530).
+    notifier: std::sync::OnceLock<Arc<Notifier>>,
+    /// Keeps an error written by the thread of the caller behind the
+    /// answers to the requests made before it (ibx#529).
+    clock: std::sync::OnceLock<Arc<CommandClock>>,
+}
+
+impl ErrorTap {
+    /// The event of an error, built only when a channel is attached. Called
+    /// before the error goes to its queue: an error written by the thread
+    /// of the caller first lets the engine answer the requests sent before
+    /// it, so the answers come in the order of the requests (ibx#529).
+    #[inline]
+    fn event(&self, req_id: i64, code: i64, message: &str) -> Option<Event> {
+        if let Some(clock) = self.clock.get() {
+            clock.wait_for_earlier_commands();
+        }
+        self.events.get().map(|_| Event::Error { req_id, code, message: message.to_string() })
+    }
+
+    /// Send it once the error is in its queue, so the event never shows
+    /// before the queue has it. Non-blocking, as every event: dropped when
+    /// the channel is full. The waiting consumer is woken.
+    #[inline]
+    fn send(&self, event: Option<Event>) {
+        if let (Some(tx), Some(event)) = (self.events.get(), event) {
+            let _ = tx.try_send(event);
+        }
+        if let Some(notifier) = self.notifier.get() {
+            notifier.notify();
+        }
+    }
+
+    fn attach(&self, tx: &crossbeam_channel::Sender<Event>) {
+        let _ = self.events.set(tx.clone());
+    }
+
+    fn wakes(&self, notifier: &Arc<Notifier>) {
+        let _ = self.notifier.set(notifier.clone());
+    }
+
+    fn follows(&self, clock: &Arc<CommandClock>) {
+        let _ = self.clock.set(clock.clone());
+    }
+}
+
+thread_local! {
+    /// This thread runs the loop of an engine.
+    static ON_ENGINE_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The commands sent to the engine and those it has handled, counted
+/// (ibx#529). The reference answers the requests of a client in the order
+/// they were made. Here a request refused locally is answered by the thread
+/// of the caller and the others by the engine: the first waits until the
+/// engine has handled every command sent before it.
+#[derive(Default)]
+pub struct CommandClock {
+    sent: AtomicU64,
+    handled: AtomicU64,
+    /// The loop of the engine runs on its thread.
+    running: AtomicBool,
+}
+
+impl CommandClock {
+    /// Longest wait for the engine. Past it the error is written anyway: an
+    /// answer late is better than a caller held.
+    const LIMIT: std::time::Duration = std::time::Duration::from_millis(20);
+
+    /// A command went to the engine.
+    #[inline]
+    pub(crate) fn note_sent(&self) {
+        self.sent.fetch_add(1, Ordering::Release);
+    }
+
+    /// The engine handled `count` commands, their answers written.
+    #[inline]
+    pub(crate) fn note_handled(&self, count: u64) {
+        if count > 0 {
+            self.handled.fetch_add(count, Ordering::Release);
+        }
+    }
+
+    /// The calling thread starts (`true`) or ends (`false`) the loop of the
+    /// engine.
+    pub(crate) fn set_running(&self, on: bool) {
+        ON_ENGINE_THREAD.with(|flag| flag.set(on));
+        self.running.store(on, Ordering::Release);
+    }
+
+    /// Wait until the engine has handled the commands sent so far. At once
+    /// on the thread of the engine, with no engine running, and with
+    /// nothing waiting, which is the usual case.
+    #[inline]
+    fn wait_for_earlier_commands(&self) {
+        let target = self.sent.load(Ordering::Acquire);
+        if self.handled.load(Ordering::Acquire) >= target || !self.running.load(Ordering::Acquire) {
+            return;
+        }
+        self.wait_until_handled(target);
+    }
+
+    #[cold]
+    fn wait_until_handled(&self, target: u64) {
+        if ON_ENGINE_THREAD.with(|flag| flag.get()) {
+            return;
+        }
+        let deadline = Instant::now() + Self::LIMIT;
+        loop {
+            for _ in 0..64 {
+                if self.handled.load(Ordering::Acquire) >= target || !self.running.load(Ordering::Acquire) {
+                    return;
+                }
+                std::hint::spin_loop();
+            }
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::yield_now();
+        }
+    }
+}
+
+/// The wake of a consumer that waits for data (e.g. the Python event loop).
+#[derive(Default)]
+struct Notifier {
+    pending: Mutex<bool>,
+    condvar: Condvar,
+}
+
+impl Notifier {
+    fn notify(&self) {
+        let mut pending = self.pending.lock().unwrap();
+        *pending = true;
+        self.condvar.notify_one();
+    }
+
+    /// Returns true if notified, false if timed out.
+    fn wait(&self, timeout: std::time::Duration) -> bool {
+        let mut pending = self.pending.lock().unwrap();
+        if *pending {
+            *pending = false;
+            return true;
+        }
+        let (mut pending, result) = self.condvar.wait_timeout(pending, timeout).unwrap();
+        let had_data = std::mem::take(&mut *pending);
+        had_data || !result.timed_out()
+    }
+}
+
 /// Events emitted by the IB engine.
+///
+/// New variants may be added: match with a wildcard arm.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Event {
     /// Market data tick received. Read the latest quote via `Client::quote()`.
     Tick(InstrumentId),
@@ -119,6 +286,16 @@ pub enum Event {
     ContractDetails { req_id: ReqId, details: ContractDefinition },
     /// End of contract details for a request.
     ContractDetailsEnd(ReqId),
+    /// Matching symbols answer (ibx#387): one per answered request, an empty
+    /// list when nothing matches. A refused or failed request comes as an
+    /// error and a replaced or lost one gets no answer, so none of them
+    /// shows here.
+    SymbolSamples { req_id: ReqId, matches: Vec<SymbolMatch> },
+    /// An error or a notice, as the wrapper's `error` gets it (ibx#498):
+    /// `req_id` is the request id, the order id (as in `OrderUpdate`) for
+    /// an order, and -1 for a link status message. A refused market data
+    /// request is not given here.
+    Error { req_id: i64, code: i64, message: String },
     /// Position update.
     /// `position` is fixed-point (QTY_SCALE).
     PositionUpdate { instrument: InstrumentId, con_id: i64, position_fixed: Qty, avg_cost: Price },
@@ -279,12 +456,16 @@ pub struct MarketDataState {
     /// Requests given without a conId whose contract another request had
     /// subscribed: (their own slot, the slot they joined) (ibx#444).
     md_merges: Mutex<Vec<(InstrumentId, InstrumentId, u64)>>,
+    /// Slots of requests without a conId whose contract was found, with
+    /// its conId (ibx#444).
+    md_resolved: Mutex<Vec<(InstrumentId, i64)>>,
     /// The request parameters of acked subscriptions (ibx#449).
     tick_req_params: Mutex<Vec<TickReqParams>>,
     snapshot_acks: Mutex<Vec<TickReqParams>>,
     /// Tick-by-tick requests that ended with an error: the request, the
     /// code and the whole text (ibx#455).
     tbt_errors: Mutex<Vec<(ReqId, i32, String)>>,
+    error_tap: ErrorTap,
 }
 
 /// What a client reports as tickReqParams for a subscription, from its
@@ -322,8 +503,16 @@ pub enum MdReject {
     /// contract: error 200, the subscription is gone (ibx#278).
     NoSecurityDefinition { instrument: InstrumentId },
     /// A request with the news tick refused once its contract was known:
-    /// error 10094 with this text, nothing was sent (ibx#458).
-    NewsRefused { instrument: InstrumentId, text: String },
+    /// error 10094 with this text, nothing was sent (ibx#458). `con_id`:
+    /// its contract.
+    NewsRefused { instrument: InstrumentId, con_id: i64, text: String },
+    /// The contract's data is frozen (ibx#447): its requests go on with
+    /// the frozen top of book of slot `frozen` (marketDataType 2).
+    Frozen { instrument: InstrumentId, frozen: InstrumentId },
+    /// The contract of the frozen slot `instrument` has real-time data
+    /// again (ibx#447): its requests go back to slot `live`
+    /// (marketDataType 1) and the frozen slot is let go.
+    Live { instrument: InstrumentId, live: InstrumentId },
 }
 
 impl MdReject {
@@ -333,7 +522,9 @@ impl MdReject {
             MdReject::Delayed { instrument }
             | MdReject::NotSubscribed { instrument, .. }
             | MdReject::NoSecurityDefinition { instrument }
-            | MdReject::NewsRefused { instrument, .. } => instrument,
+            | MdReject::NewsRefused { instrument, .. }
+            | MdReject::Frozen { instrument, .. }
+            | MdReject::Live { instrument, .. } => instrument,
         }
     }
 }
@@ -354,14 +545,18 @@ impl MarketDataState {
             news_bulletins: Mutex::new(BulletinStore::default()),
             md_rejects: Mutex::new(Vec::new()),
             md_merges: Mutex::new(Vec::new()),
+            md_resolved: Mutex::new(Vec::new()),
             tick_req_params: Mutex::new(Vec::new()),
             snapshot_acks: Mutex::new(Vec::new()),
             tbt_errors: Mutex::new(Vec::new()),
+            error_tap: ErrorTap::default(),
         }
     }
 
     #[doc(hidden)] pub fn push_tbt_error(&self, req_id: ReqId, code: i32, text: String) {
+        let event = self.error_tap.event(req_id, code as i64, &text);
         self.tbt_errors.lock().unwrap().push((req_id, code, text));
+        self.error_tap.send(event);
     }
 
     pub fn drain_tbt_errors(&self) -> Vec<(ReqId, i32, String)> {
@@ -399,6 +594,17 @@ impl MarketDataState {
     #[doc(hidden)] pub fn push_md_merge(&self, from: InstrumentId, into: InstrumentId) {
         let at = self.md_events.position();
         self.md_merges.lock().unwrap().push((from, into, at));
+    }
+
+    /// The lookup of a request without a conId found its contract (ibx#444).
+    #[doc(hidden)] pub fn push_md_resolved(&self, instrument: InstrumentId, con_id: i64) {
+        self.md_resolved.lock().unwrap().push((instrument, con_id));
+    }
+
+    pub fn drain_md_resolved(&self) -> Vec<(InstrumentId, i64)> {
+        let mut resolved = self.md_resolved.lock().unwrap();
+        if resolved.is_empty() { return Vec::new(); }
+        resolved.drain(..).collect()
     }
 
     pub fn drain_md_merges(&self) -> Vec<(InstrumentId, InstrumentId, u64)> {
@@ -575,6 +781,7 @@ pub struct OrderState {
     /// Notices of a server report given after the status of that report:
     /// the reject 201 and the cancel 202 (ibx#486).
     order_notices: Mutex<Vec<(i64, i64, String)>>,
+    error_tap: ErrorTap,
     what_if_responses: Mutex<Vec<WhatIfResponse>>,
     completed_orders: Mutex<Vec<CompletedOrder>>,
     /// Enriched order info from CCP exec reports (order_id -> RichOrderInfo).
@@ -582,6 +789,9 @@ pub struct OrderState {
     /// Set from the logon, or from a lost auth link, to the end of the order
     /// replay of the logon: open-order requests wait for the replay (ibx#251).
     open_orders_held: AtomicBool,
+    /// The order replay of the logon just ended: the client's working
+    /// orders it listed are followed by the end of the list (ibx#487).
+    login_orders_end: AtomicBool,
     /// The combo of each combo order sent this session (ibx#470).
     combo_views: Mutex<HashMap<OrderId, ComboView>>,
     /// Orders the engine dropped with no status for the client: filled
@@ -612,10 +822,12 @@ impl OrderState {
             cancel_rejects: Mutex::new(Vec::with_capacity(16)),
             order_errors: Mutex::new(Vec::new()),
             order_notices: Mutex::new(Vec::new()),
+            error_tap: ErrorTap::default(),
             what_if_responses: Mutex::new(Vec::with_capacity(8)),
             completed_orders: Mutex::new(Vec::with_capacity(64)),
             order_cache: Mutex::new(HashMap::new()),
             open_orders_held: AtomicBool::new(false),
+            login_orders_end: AtomicBool::new(false),
             forgotten_orders: Mutex::new(Vec::new()),
             api_order_ids: Mutex::new(HashMap::new()),
             book_seqs: Mutex::new(HashMap::new()),
@@ -648,6 +860,26 @@ impl OrderState {
         self.api_order_ids.lock().unwrap().insert(order_id, api_id);
     }
 
+    /// The engine now holds an order of an earlier session under `to`
+    /// instead of `from` (ibx#538): what is kept for it moves, and it keeps
+    /// the API order id it shows.
+    #[doc(hidden)] pub fn rekey_order(&self, from: OrderId, to: OrderId) {
+        let shown = self.api_order_id(from);
+        {
+            let mut ids = self.api_order_ids.lock().unwrap();
+            ids.remove(&from);
+            ids.insert(to, shown);
+        }
+        let mut cache = self.order_cache.lock().unwrap();
+        if let Some(info) = cache.remove(&from) { cache.insert(to, info); }
+        drop(cache);
+        let mut seqs = self.book_seqs.lock().unwrap();
+        if let Some(seq) = seqs.remove(&from) { seqs.insert(to, seq); }
+        drop(seqs);
+        let mut views = self.combo_views.lock().unwrap();
+        if let Some(view) = views.remove(&from) { views.insert(to, view); }
+    }
+
     /// An order's place in the reference's book, and the most orders the
     /// book held (engine side).
     #[doc(hidden)] pub fn note_book(&self, order_id: OrderId, seq: u64, peak: usize) {
@@ -667,6 +899,17 @@ impl OrderState {
     #[doc(hidden)]
     pub fn set_open_orders_held(&self, held: bool) {
         self.open_orders_held.store(held, Ordering::Release);
+    }
+
+    /// The order replay of the logon ended (ibx#487). Hot-loop side.
+    #[doc(hidden)]
+    pub fn set_login_orders_end(&self) {
+        self.login_orders_end.store(true, Ordering::Release);
+    }
+
+    /// True once after the order replay of the logon ended (ibx#487).
+    pub fn take_login_orders_end(&self) -> bool {
+        self.login_orders_end.swap(false, Ordering::AcqRel)
     }
 
     /// True while open-order requests wait for the order replay (ibx#251).
@@ -796,13 +1039,17 @@ impl OrderState {
     }
 
     #[doc(hidden)] pub fn push_order_error(&self, order_id: i64, code: i64, message: String) {
+        let event = self.error_tap.event(order_id, code, &message);
         self.order_errors.lock().unwrap().push((order_id, code, message));
+        self.error_tap.send(event);
     }
 
     /// A notice of a server report (201, 202), given after the status the
     /// same report gives, as the reference writes them (ibx#486).
     #[doc(hidden)] pub fn push_order_notice(&self, order_id: i64, code: i64, message: String) {
+        let event = self.error_tap.event(order_id, code, &message);
         self.order_notices.lock().unwrap().push((order_id, code, message));
+        self.error_tap.send(event);
     }
 
     #[doc(hidden)] pub fn push_what_if(&self, response: WhatIfResponse) {
@@ -855,6 +1102,7 @@ pub struct ReferenceState {
     /// Errors surfaced by HMDS for in-flight reference queries (req_id, code, message).
     /// Drained by the dispatcher and forwarded to `Wrapper::error`. ibx#186.
     historical_errors: Mutex<Vec<(ReqId, i32, String)>>,
+    error_tap: ErrorTap,
     market_rules: Mutex<Vec<MarketRule>>,
     depth_exchanges_cache: Mutex<Vec<DepthMktDataDescription>>,
     depth_exchanges_pending: Mutex<bool>,
@@ -882,6 +1130,9 @@ pub struct ReferenceState {
     /// (ibx#460): the provider check and the all-subscribed form of the
     /// historical news request use them.
     news_sources: Mutex<Vec<String>>,
+    /// API news source codes of the logon that are listed but not
+    /// subscribed (ibx#443).
+    news_sources_unsubscribed: Mutex<Vec<String>>,
     soft_dollar_tiers: Mutex<Vec<crate::types::SoftDollarTier>>,
     family_codes: Mutex<Vec<crate::types::FamilyCode>>,
     white_branding_id: Mutex<String>,
@@ -893,6 +1144,8 @@ pub struct ReferenceState {
     pending_accounts: Mutex<Vec<String>>,
     /// FA session, from CCP logon tag 6108 (ibx#481).
     fa_session: std::sync::atomic::AtomicBool,
+    /// A paper session, from the logon (ibx#444).
+    paper_session: std::sync::atomic::AtomicBool,
     /// The logon's super user and omnibus flags (ibx#417): either one lets
     /// a short-side order pass the side check.
     super_user: AtomicBool,
@@ -902,6 +1155,8 @@ pub struct ReferenceState {
     smart_combo_con_ids: Mutex<HashMap<String, i64>>,
     /// The API client id the new orders carry (ibx#466); 0 until set.
     api_client_id: std::sync::atomic::AtomicI64,
+    /// User name of the session: the submitter of the orders it places (ibx#519).
+    user_name: Mutex<String>,
     /// The algo definitions the server sent (ibx#263).
     algo_definitions: Mutex<crate::control::algo::AlgoDefinitions>,
     /// Most contracts with tick-by-tick data at once, from the logon;
@@ -960,6 +1215,7 @@ impl ReferenceState {
             historical_ticks: Mutex::new(Vec::with_capacity(4)),
             historical_schedules: Mutex::new(Vec::with_capacity(4)),
             historical_errors: Mutex::new(Vec::with_capacity(4)),
+            error_tap: ErrorTap::default(),
             market_rules: Mutex::new(Vec::new()),
             depth_exchanges_cache: Mutex::new(Vec::new()),
             depth_exchanges_pending: Mutex::new(false),
@@ -971,16 +1227,19 @@ impl ReferenceState {
             exchange_maps_at: Mutex::new(HashMap::new()),
             news_providers: Mutex::new(Vec::new()),
             news_sources: Mutex::new(Vec::new()),
+            news_sources_unsubscribed: Mutex::new(Vec::new()),
             soft_dollar_tiers: Mutex::new(Vec::new()),
             family_codes: Mutex::new(Vec::new()),
             white_branding_id: Mutex::new(String::new()),
             managed_accounts: Mutex::new(Vec::new()),
             pending_accounts: Mutex::new(Vec::new()),
             fa_session: std::sync::atomic::AtomicBool::new(false),
+            paper_session: std::sync::atomic::AtomicBool::new(false),
             super_user: AtomicBool::new(false),
             omnibus: AtomicBool::new(false),
             smart_combo_con_ids: Mutex::new(HashMap::new()),
             api_client_id: std::sync::atomic::AtomicI64::new(0),
+            user_name: Mutex::new(String::new()),
             algo_definitions: Mutex::new(Default::default()),
             tick_by_tick_limit: AtomicU64::new(u64::MAX),
             tick_by_tick_off: AtomicBool::new(false),
@@ -1188,7 +1447,9 @@ impl ReferenceState {
     }
 
     #[doc(hidden)] pub fn push_historical_error(&self, req_id: ReqId, code: i32, message: String) {
+        let event = self.error_tap.event(req_id, code as i64, &message);
         self.historical_errors.lock().unwrap().push((req_id, code, message));
+        self.error_tap.send(event);
     }
 
     #[doc(hidden)] pub fn push_market_rules(&self, rules: Vec<MarketRule>) {
@@ -1283,6 +1544,12 @@ impl ReferenceState {
     /// Subscribed API news source codes of the logon (ibx#460).
     pub fn news_sources(&self) -> Vec<String> {
         self.news_sources.lock().unwrap().clone()
+    }
+
+    /// API news source codes of the logon that are listed but not
+    /// subscribed (ibx#443).
+    pub fn news_sources_unsubscribed(&self) -> Vec<String> {
+        self.news_sources_unsubscribed.lock().unwrap().clone()
     }
 
     pub fn soft_dollar_tiers(&self) -> Vec<crate::types::SoftDollarTier> {
@@ -1414,6 +1681,10 @@ impl ReferenceState {
         *self.news_sources.lock().unwrap() = codes;
     }
 
+    #[doc(hidden)] pub fn set_news_sources_unsubscribed(&self, codes: Vec<String>) {
+        *self.news_sources_unsubscribed.lock().unwrap() = codes;
+    }
+
     #[doc(hidden)] pub fn set_soft_dollar_tiers(&self, tiers: Vec<crate::types::SoftDollarTier>) {
         *self.soft_dollar_tiers.lock().unwrap() = tiers;
     }
@@ -1470,6 +1741,15 @@ impl ReferenceState {
 
     #[doc(hidden)] pub fn set_fa_session(&self, fa: bool) {
         self.fa_session.store(fa, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// True when the logon says this is a paper session (ibx#444).
+    pub fn paper_session(&self) -> bool {
+        self.paper_session.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[doc(hidden)] pub fn set_paper_session(&self, paper: bool) {
+        self.paper_session.store(paper, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The server clock offset of the session (ibx#421).
@@ -1546,6 +1826,15 @@ impl ReferenceState {
     /// The API client id the new orders carry (ibx#466).
     pub fn api_client_id(&self) -> i64 {
         self.api_client_id.load(Ordering::Relaxed)
+    }
+
+    /// User name of the session; empty when not known.
+    pub fn user_name(&self) -> String {
+        self.user_name.lock().unwrap().clone()
+    }
+
+    pub fn set_user_name(&self, name: &str) {
+        *self.user_name.lock().unwrap() = name.to_string();
     }
 
     #[doc(hidden)] pub fn set_api_client_id(&self, client_id: i64) {
@@ -1831,7 +2120,11 @@ impl PortfolioState {
     /// no marks, does not overwrite them (ib-agent#172).
     #[doc(hidden)] pub fn set_position_marks(&self, con_id: i64, market_price: Price, market_value: Price, unrealized_pnl: Price, realized_pnl: Price) {
         let mut map = self.position_infos.lock().unwrap();
+        let next = map.values().map(|p| p.portfolio_seq).max().unwrap_or(0) + 1;
         let entry = map.entry(con_id).or_insert_with(|| PositionInfo { con_id, ..Default::default() });
+        if entry.portfolio_seq == 0 {
+            entry.portfolio_seq = next;
+        }
         entry.market_price = market_price;
         entry.market_value = market_value;
         entry.unrealized_pnl = unrealized_pnl;
@@ -1901,14 +2194,16 @@ pub struct SharedState {
     /// Link status messages for every client, as errors with id -1: link
     /// lost / restored and farm broken (ibx#399). (code, message).
     connection_notices: Mutex<Vec<(i64, String)>>,
+    error_tap: ErrorTap,
     /// Notifier for waking consumers (e.g. Python event loop) when data arrives.
-    notify_mutex: Mutex<bool>,
-    notify_condvar: Condvar,
+    notifier: Arc<Notifier>,
+    /// Commands sent to the engine and handled by it (ibx#529).
+    clock: Arc<CommandClock>,
 }
 
 impl SharedState {
     pub fn new() -> Self {
-        Self {
+        let shared = Self {
             market: MarketDataState::new(),
             orders: OrderState::new(),
             reference: ReferenceState::new(),
@@ -1916,9 +2211,21 @@ impl SharedState {
             ccp_rtt_ns: AtomicU64::new(0),
             connection_lost: AtomicBool::new(false),
             connection_notices: Mutex::new(Vec::new()),
-            notify_mutex: Mutex::new(false),
-            notify_condvar: Condvar::new(),
+            error_tap: ErrorTap::default(),
+            notifier: Arc::new(Notifier::default()),
+            clock: Arc::new(CommandClock::default()),
+        };
+        for tap in [&shared.market.error_tap, &shared.orders.error_tap, &shared.reference.error_tap, &shared.error_tap] {
+            tap.wakes(&shared.notifier);
+            tap.follows(&shared.clock);
         }
+        shared
+    }
+
+    /// The count of the commands sent to the engine and handled by it.
+    #[doc(hidden)]
+    pub fn command_clock(&self) -> &Arc<CommandClock> {
+        &self.clock
     }
 
     /// Signal that the session is over. Hot-loop side (ibx#242).
@@ -1938,8 +2245,19 @@ impl SharedState {
 
     /// Queue a link status message for the clients (ibx#399). Hot-loop side.
     #[doc(hidden)]
+    /// Give the errors and notices to the event channel too, as
+    /// `Event::Error` (ibx#498). The first channel attached stays.
+    pub fn attach_event_channel(&self, tx: &crossbeam_channel::Sender<Event>) {
+        self.market.error_tap.attach(tx);
+        self.orders.error_tap.attach(tx);
+        self.reference.error_tap.attach(tx);
+        self.error_tap.attach(tx);
+    }
+
     pub fn push_connection_notice(&self, code: i64, message: String) {
+        let event = self.error_tap.event(-1, code, &message);
         self.connection_notices.lock().unwrap().push((code, message));
+        self.error_tap.send(event);
         self.notify();
     }
 
@@ -1969,32 +2287,118 @@ impl SharedState {
     /// Signal that new data is available. Called by hot loop after pushing data.
     #[inline]
     pub fn notify(&self) {
-        let mut pending = self.notify_mutex.lock().unwrap();
-        *pending = true;
-        self.notify_condvar.notify_one();
+        self.notifier.notify();
     }
 
     /// Wait for data notification with a timeout. Returns true if notified, false if timed out.
     pub fn wait_for_data(&self, timeout: std::time::Duration) -> bool {
-        let mut pending = self.notify_mutex.lock().unwrap();
-        if *pending {
-            *pending = false;
-            return true;
-        }
-        let (lock, result) = self.notify_condvar.wait_timeout(pending, timeout).unwrap();
-        let had_data = *lock;
-        if had_data {
-            // Reset the flag via a mutable reference obtained from the MutexGuard's deref.
-            drop(lock);
-            *self.notify_mutex.lock().unwrap() = false;
-        }
-        had_data || !result.timed_out()
+        self.notifier.wait(timeout)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An error written by the thread of a caller waits for the engine to
+    /// handle the commands sent before it, so the answers come in the
+    /// order of the requests (ibx#529).
+    #[test]
+    fn a_local_error_waits_for_the_commands_sent_before_it() {
+        let shared = Arc::new(SharedState::new());
+        let clock = shared.command_clock().clone();
+        clock.note_sent();
+        // The engine: it answers the command a little later.
+        let engine = {
+            let shared = shared.clone();
+            std::thread::spawn(move || {
+                shared.command_clock().set_running(true);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                shared.reference.push_historical_error(1, 162, "cancelled".into());
+                shared.command_clock().note_handled(1);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                shared.command_clock().set_running(false);
+            })
+        };
+        while !clock.running.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        // The caller: refused locally, right after the command.
+        shared.reference.push_historical_error(2, 321, "refused".into());
+        let ids: Vec<i64> = shared.reference.drain_historical_errors().iter().map(|e| e.0).collect();
+        assert_eq!(ids, [1, 2], "the answer of the engine first");
+        engine.join().unwrap();
+    }
+
+    #[test]
+    fn a_local_error_does_not_wait_without_a_running_engine_or_with_nothing_sent() {
+        let shared = SharedState::new();
+        let clock = shared.command_clock();
+        let start = Instant::now();
+        // A command sent, no engine running (a client built by hand).
+        clock.note_sent();
+        shared.reference.push_historical_error(1, 321, "refused".into());
+        // An engine running, every command handled.
+        clock.note_handled(1);
+        clock.running.store(true, Ordering::Release);
+        shared.reference.push_historical_error(2, 321, "refused".into());
+        assert!(start.elapsed() < CommandClock::LIMIT / 2);
+        assert_eq!(shared.reference.drain_historical_errors().len(), 2);
+    }
+
+    #[test]
+    fn the_engine_does_not_wait_for_itself_and_a_caller_not_past_the_limit() {
+        let shared = SharedState::new();
+        let clock = shared.command_clock();
+        clock.note_sent();
+        // On the thread of the engine: at once, with a command unhandled.
+        clock.set_running(true);
+        let start = Instant::now();
+        shared.orders.push_order_error(1, 201, "rejected".into());
+        assert!(start.elapsed() < CommandClock::LIMIT / 2);
+        // On another thread, with an engine that never handles it: the
+        // error is written once the limit has passed.
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let start = Instant::now();
+                shared.orders.push_order_error(2, 110, "price".into());
+                assert!(start.elapsed() >= CommandClock::LIMIT);
+                assert!(start.elapsed() < CommandClock::LIMIT * 20);
+            });
+        });
+        clock.set_running(false);
+        assert_eq!(shared.orders.drain_order_errors().len(), 2);
+    }
+
+    /// Every error queue gives its entries to an attached event channel,
+    /// with the id and the code the queue holds, and nothing before a
+    /// channel is attached (ibx#498).
+    #[test]
+    fn errors_go_to_the_attached_event_channel() {
+        let shared = SharedState::new();
+        shared.reference.push_historical_error(1, 200, "before".into());
+        let (tx, rx) = crossbeam_channel::unbounded();
+        shared.attach_event_channel(&tx);
+
+        shared.reference.push_historical_error(7, 200, "no security definition".into());
+        shared.market.push_tbt_error(8, 10189, "tick-by-tick".into());
+        shared.orders.push_order_error(9, 110, "price".into());
+        shared.orders.push_order_notice(9, 201, "rejected".into());
+        shared.push_connection_notice(1100, "link lost".into());
+
+        let events: Vec<(i64, i64, String)> = rx.try_iter().map(|e| match e {
+            Event::Error { req_id, code, message } => (req_id, code, message),
+            other => panic!("only errors are expected: {other:?}"),
+        }).collect();
+        assert_eq!(events, [
+            (7, 200, "no security definition".to_string()), (8, 10189, "tick-by-tick".to_string()),
+            (9, 110, "price".to_string()), (9, 201, "rejected".to_string()), (-1, 1100, "link lost".to_string()),
+        ]);
+        // The queues keep every entry for the wrapper.
+        assert_eq!(shared.reference.drain_historical_errors().len(), 2);
+        assert_eq!(shared.orders.drain_order_errors().len() + shared.orders.drain_order_notices().len(), 2);
+        assert_eq!((shared.market.drain_tbt_errors().len(), shared.drain_connection_notices().len()), (1, 1));
+    }
 
     #[test]
     fn seqquote_write_read_roundtrip() {

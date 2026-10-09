@@ -158,6 +158,25 @@ pub(crate) fn replay_orders(fx: &Fixture) -> OrderReplay {
         }
     }
     s.settle();
+    // The reference's messages name another order (a child its parent, by
+    // the parent link and the group) by the reference's id of that order:
+    // read as ibx's id of the same order.
+    for (_, f) in theirs.iter_mut() {
+        for (t, v) in f.iter_mut() {
+            if matches!(t, 6107 | 583) && let Some(mine) = ids.get(base(v)) {
+                *v = v.replacen(base(v), mine, 1);
+            }
+        }
+    }
+    // The same in the callbacks: a child's OCA group is its parent's number.
+    for line in cb_theirs.iter_mut().filter(|l| l.starts_with("openOrder|")) {
+        for (theirs, mine) in &ids {
+            let group = format!(",ocaGroup={theirs},");
+            if line.contains(&group) {
+                *line = line.replace(&group, &format!(",ocaGroup={mine},"));
+            }
+        }
+    }
     let their_frames: Vec<Fields> = theirs.iter().map(|(_, f)| f.clone()).collect();
     let (kt, ko) = (keys(&their_frames), keys(&ours));
     let mut pairs: Vec<Pair> = Vec::new();
@@ -323,15 +342,18 @@ fn overnight_time_in_force_on_smart() {
     replay_and_compare("orders_i196_overnight", |r| r.seq < 1237, KNOWN, &[]);
 }
 
-// The session's order types (28/09/2026, rth_order_types): PEG BENCH, its
+// The session's order types (28/09/2026, rth_order_types): TRAIL MIT by
+// amount (filled at once) and by percent with its replace, TRAIL LIT,
+// PASSV REL and RPI refused with 387 (the SPY list has no key for them),
+// after the lookup of the contract's order types,
+// PEG BEST sent and rejected by the server (ibx#469); PEG BENCH, its
 // replace and cancel (openOrder auxPrice = the starting price);
 // OVERNIGHT, OVERNIGHT + DAY and includeOvernight in the session, the
-// directed OVERNIGHT order discarded (10). Left out here, each in an
-// ignored test below: TRAIL MIT, TRAIL LIT, PASSV REL, RPI and PEG BEST
-// (refused by ibx, ibx#469), the option combos refused with 460 (13, 14).
+// directed OVERNIGHT order discarded (10). Left out here, in an ignored
+// test below: the option combos refused with 460 (13, 14).
 #[test]
 fn session_order_types() {
-    replay_and_compare("orders_rth_order_types", all, KNOWN, &[1, 2, 3, 4, 5, 6, 7, 13, 14]);
+    replay_and_compare("orders_rth_order_types", all, KNOWN, &[13, 14]);
 }
 
 // What-if previews (02/10/2026, b1_462_whatif): LMT, MKT and a margin
@@ -369,28 +391,22 @@ fn why_held_is_trigger_for_a_stop() {
 }
 
 // The first openOrder of a STP order shows lmtPrice 250.03 (SELL stop at
-// 250, no 44 on the wire), the next ones none.
+// 250, no 44 on the wire), the next ones none. Not reproduced on
+// 07/10/2026: four STP orders showed no limit price (ibx#510).
 #[test]
-#[ignore = "ibx#486: the first openOrder of a STP order has a limit price the wire does not carry"]
+#[ignore = "not reproduced (ibx#510): the first openOrder of a STP order had a limit price the wire does not carry"]
 fn stp_first_open_order_limit_price() {
     replay_and_compare("orders_premarket_order_types", all, Known { stp_lmt: false, ..KNOWN }, &[]);
 }
 
 // A bracket in the client library's form: parent and take-profit with
 // transmit off, the stop with transmit on; the reference holds the first
-// two and sends the three new orders together. ibx refuses transmit off
-// (ibx#226).
+// two and sends the three new orders together, the children naming their
+// parent, and so does ibx (ibx#509).
 #[test]
-#[ignore = "ibx#486, ibx#226: transmit=false orders are refused instead of held for the group"]
 fn bracket_with_transmit_off() {
     replay_and_compare("orders_bracket", all, KNOWN, &[]);
     replay_and_compare("orders_bracket_b", all, KNOWN, &[]);
-}
-
-#[test]
-#[ignore = "ibx#469: TRAIL MIT, TRAIL LIT, PASSV REL, RPI and PEG BEST are refused locally"]
-fn trail_mit_trail_lit_peg_best() {
-    replay_and_compare("orders_rth_order_types", all, KNOWN, &[]);
 }
 
 // The reference gives a preview a ClOrdID of its own with version 0, and
@@ -406,7 +422,7 @@ fn what_if_clord_id_and_perm_id() {
 
 // A combo preview (QQQ,SPY BAG, conId 0 in the request).
 #[test]
-#[ignore = "ibx#486: the combo what-if of b1_462 is not sent by the replay"]
+#[ignore = "replay limit: the combo what-if of b1_462 is not sent by the replay"]
 fn what_if_of_a_combo() {
     replay_and_compare("orders_b1_462_whatif", all, KNOWN, &[]);
 }
@@ -419,7 +435,7 @@ fn what_if_of_a_combo() {
 // cached); ibx asks no schedule for an order, knows no zone, and sends the
 // order.
 #[test]
-#[ignore = "ibx#486: the contract's zone comes from a schedule the reference had before the recording"]
+#[ignore = "ibx#510: the contract's zone comes from a schedule the reference had before the recording"]
 fn condition_time_in_another_zone() {
     replay_and_compare("orders_b1_416_time_condition", all, KNOWN, &[]);
 }
@@ -446,7 +462,7 @@ fn overnight_directed_order() {
 // tag of the logon or of the contract replies of the recording names the
 // option permission.
 #[test]
-#[ignore = "ibx#486: the data behind 460 is not in the logon or the contract replies"]
+#[ignore = "ibx#510: the data behind 460 is not in the logon or the contract replies"]
 fn option_combo_without_permission() {
     replay_and_compare("orders_rth_order_types", all, KNOWN, &[1, 2, 3, 4, 5, 6, 7]);
 }
@@ -454,7 +470,7 @@ fn option_combo_without_permission() {
 // The algo refusals 441 / 443 need the algo definitions the reference
 // read from the server; this replay does not load them.
 #[test]
-#[ignore = "ibx#486: algo definitions are not part of the order replay"]
+#[ignore = "replay limit: algo definitions are not part of the order replay"]
 fn algo_refusals() {
     replay_and_compare("orders_b1_263_algo_refusals", all, KNOWN, &[]);
 }

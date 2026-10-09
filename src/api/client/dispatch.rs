@@ -106,6 +106,8 @@ impl EClient {
             // The order id the reference shows for the order.
             let shown = self.shared.orders.api_order_id(fill.order_id);
             exec.order_id = shown;
+            // The contract in full, on the exchange of the execution (ibx#543).
+            let c = self.core.execution_contract(&self.shared, fill.order_id, c, &exec.exchange);
             // A combo's report shows the combo or the leg (ibx#470).
             let mut c = c;
             ClientCore::apply_combo_exec(&fill_exec, &mut c, &mut exec);
@@ -124,6 +126,7 @@ impl EClient {
             // (ibx#473).
             let mut view = self.core.order_view(fill.order_id, &self.shared, status);
             ClientCore::report_client(&mut view, &fill_exec);
+            ClientCore::report_filled(&mut view, filled_f);
             let client_id = match &view {
                 Some(view) => {
                     wrapper.open_order(shown, &view.contract, &view.order, &view.state);
@@ -158,7 +161,7 @@ impl EClient {
             let order_id = exec.order_id;
             self.core.apply_fill_exec(&mut exec, &fill_exec, order_id);
             // An execution of another client's order: nothing for this one.
-            if fill_exec.other_client {
+            if fill_exec.other_client || fill_exec.replayed {
                 self.core.push_silent_execution(contract, exec, fill_exec.time_secs);
                 continue;
             }
@@ -205,6 +208,15 @@ impl EClient {
             }
         }
 
+        // The working orders of this client the logon replay listed are
+        // followed by the end of the list, as the reference's connect
+        // burst; no end when it listed none (`jextend.dL.bq()`, ibx#487).
+        if self.shared.orders.take_login_orders_end()
+            && !self.core.open_orders_listing(&self.shared, crate::client_core::OpenOrdersRequest::Open).is_empty()
+        {
+            wrapper.open_order_end();
+        }
+
         // A server reject of a cancel or modify gives no callback, as the
         // reference: no error, no status; the order status that answers the
         // engine's status request sets the state (ibx#252).
@@ -221,6 +233,7 @@ impl EClient {
                 self.core.peek_what_if(wi.order_id)
             };
             let (mut contract, mut order) = tracked.unwrap_or_else(|| (Contract::default(), ApiOrder::default()));
+            let placed_exchange = contract.exchange.clone();
             // A preview placed without a conId shows the contract looked
             // up (ibx#486).
             if contract.con_id == 0 && wi.state.con_id != 0 && !contract.sec_type.eq_ignore_ascii_case("BAG") {
@@ -228,6 +241,7 @@ impl EClient {
             }
             // The order as the reference shows it (its unset values); a
             // combo shows its combo (ibx#470).
+            crate::client_core::preview_view(&mut contract, &mut order, &placed_exchange, &self.shared);
             crate::client_core::reported_unset_values(&mut order);
             ClientCore::apply_combo_view(wi.order_id, &mut contract, &mut order, &self.shared);
             // The preview's order carries the account and the client id,
@@ -360,6 +374,9 @@ impl EClient {
                 let _ = self.cancel_mkt_data(req_id);
             }
         }
+        // Paper: the requests still without data after their wait (10197,
+        // ibx#444).
+        Self::md_notices(wrapper, self.core.take_md_no_data(std::time::Instant::now()));
 
         // Historical ticks — route to the variant-specific callback (iso
         // ibapi); before the tick-by-tick ticks, as the past ticks of a
@@ -656,7 +673,7 @@ impl EClient {
         // Account updates (ibx#475): values, portfolio rows each followed by
         // the account time, the time after the batch, and for the first image
         // the end, once per subscription.
-        if let Some(batch) = self.core.prepare_account_updates(&self.shared) {
+        if let Some(batch) = self.core.prepare_account_updates(&self.shared, &self.account_id) {
             for field in &batch.fields {
                 wrapper.update_account_value(&field.key, &field.value, &field.currency, &self.account_id);
             }

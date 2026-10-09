@@ -1566,19 +1566,97 @@ impl Contract {
     }
 }
 
+/// The conditions of an order as this module's condition objects, in a
+/// list (an empty one for none, as the official API's order).
+fn conditions_to_py(py: Python<'_>, conditions: &[OrderCondition]) -> PyResult<Py<PyAny>> {
+    let list = pyo3::types::PyList::empty(py);
+    for cond in conditions {
+        let obj: Py<PyAny> = match cond {
+            OrderCondition::Price { con_id, exchange, price, is_more, trigger_method } => Py::new(py, PriceCondition {
+                con_id: Some(*con_id), exchange: Some(exchange.clone()),
+                price: Some(*price as f64 / crate::api::types::PRICE_SCALE_F),
+                is_more: Some(*is_more), trigger_method: Some(i32::from(*trigger_method)),
+            })?.into_any(),
+            OrderCondition::Time { time, is_more } =>
+                Py::new(py, TimeCondition { time: Some(time.clone()), is_more: Some(*is_more) })?.into_any(),
+            OrderCondition::Margin { percent, is_more } =>
+                Py::new(py, MarginCondition { percent: Some(*percent), is_more: Some(*is_more) })?.into_any(),
+            OrderCondition::Execution { symbol, exchange, sec_type } => Py::new(py, ExecutionCondition {
+                symbol: Some(symbol.clone()), exchange: Some(exchange.clone()), sec_type: Some(sec_type.clone()),
+            })?.into_any(),
+            OrderCondition::Volume { con_id, exchange, volume, is_more } => Py::new(py, VolumeCondition {
+                con_id: Some(*con_id), exchange: Some(exchange.clone()), volume: Some(*volume), is_more: Some(*is_more),
+            })?.into_any(),
+            OrderCondition::PercentChange { con_id, exchange, percent, is_more } => Py::new(py, PercentChangeCondition {
+                con_id: Some(*con_id), exchange: Some(exchange.clone()), change_percent: *percent, is_more: Some(*is_more),
+            })?.into_any(),
+        };
+        list.append(obj)?;
+    }
+    Ok(list.into_any().unbind())
+}
+
+/// A condition object of the official API, read by its attributes
+/// (`condType` 1 price, 3 time, 4 margin, 5 execution, 6 volume, 7 percent
+/// change). `joined`: another condition follows it; the conditions of an
+/// order are joined by "and" here, so one joined by "or" is refused.
+fn official_condition(any: &Bound<'_, PyAny>, joined: bool) -> Result<OrderCondition, String> {
+    fn get<'py, T: pyo3::conversion::FromPyObjectOwned<'py>>(any: &Bound<'py, PyAny>, name: &str) -> Result<T, String> {
+        any.getattr(name).map_err(|_| format!("no `{name}`"))?
+            .extract::<T>().map_err(|_| format!("`{name}` has an unexpected value"))
+    }
+    let kind: i64 = get(any, "condType")?;
+    if joined && !get::<bool>(any, "isConjunctionConnection")? {
+        return Err("conditions joined by \"or\" are not supported".into());
+    }
+    let exchange = |any: &Bound<'_, PyAny>| get::<Option<String>>(any, "exchange").map(Option::unwrap_or_default);
+    let con_id = |any: &Bound<'_, PyAny>| get::<Option<i64>>(any, "conId").map(Option::unwrap_or_default);
+    let is_more = get::<bool>(any, "isMore");
+    Ok(match kind {
+        1 => OrderCondition::Price {
+            con_id: con_id(any)?, exchange: exchange(any)?,
+            price: crate::api::types::price_from_f64(get::<Option<f64>>(any, "price")?.unwrap_or(0.0)),
+            is_more: is_more?, trigger_method: get::<Option<i64>>(any, "triggerMethod")?.unwrap_or(0) as u8,
+        },
+        3 => OrderCondition::Time { time: get::<Option<String>>(any, "time")?.unwrap_or_default(), is_more: is_more? },
+        4 => OrderCondition::Margin { percent: get::<Option<u32>>(any, "percent")?.unwrap_or(0), is_more: is_more? },
+        5 => OrderCondition::Execution {
+            symbol: get::<Option<String>>(any, "symbol")?.unwrap_or_default(), exchange: exchange(any)?,
+            sec_type: get::<Option<String>>(any, "secType")?.unwrap_or_default(),
+        },
+        6 => OrderCondition::Volume {
+            con_id: con_id(any)?, exchange: exchange(any)?,
+            volume: get::<Option<i64>>(any, "volume")?.unwrap_or(0), is_more: is_more?,
+        },
+        7 => OrderCondition::PercentChange {
+            con_id: con_id(any)?, exchange: exchange(any)?,
+            percent: get::<Option<f64>>(any, "changePercent")?.filter(|p| *p != f64::MAX).unwrap_or(0.0),
+            is_more: is_more?,
+        },
+        other => return Err(format!("condition type {other} is unknown")),
+    })
+}
+
 impl Order {
-    /// Convert the conditions (this module's condition classes) to the
-    /// engine's.
-    pub fn convert_conditions(&self, py: Python<'_>) -> Vec<OrderCondition> {
-        items(py, &self.conditions).iter().filter_map(|any| {
-            if let Ok(c) = any.cast::<PriceCondition>() { return Some(c.borrow().to_internal()); }
-            if let Ok(c) = any.cast::<TimeCondition>() { return Some(c.borrow().to_internal()); }
-            if let Ok(c) = any.cast::<MarginCondition>() { return Some(c.borrow().to_internal()); }
-            if let Ok(c) = any.cast::<ExecutionCondition>() { return Some(c.borrow().to_internal()); }
-            if let Ok(c) = any.cast::<VolumeCondition>() { return Some(c.borrow().to_internal()); }
-            if let Ok(c) = any.cast::<PercentChangeCondition>() { return Some(c.borrow().to_internal()); }
-            log::warn!("Unknown order condition type, skipping");
-            None
+    /// Convert the conditions to the engine's: this module's condition
+    /// classes, and the official API's (read by their attributes). A
+    /// condition that is not understood is an error: the order must not go
+    /// out without it (ibx#541; it was skipped, and the order sent as a
+    /// plain order).
+    pub fn convert_conditions(&self, py: Python<'_>) -> PyResult<Vec<OrderCondition>> {
+        let list = items(py, &self.conditions);
+        let last = list.len().saturating_sub(1);
+        list.iter().enumerate().map(|(i, any)| {
+            if let Ok(c) = any.cast::<PriceCondition>() { return Ok(c.borrow().to_internal()); }
+            if let Ok(c) = any.cast::<TimeCondition>() { return Ok(c.borrow().to_internal()); }
+            if let Ok(c) = any.cast::<MarginCondition>() { return Ok(c.borrow().to_internal()); }
+            if let Ok(c) = any.cast::<ExecutionCondition>() { return Ok(c.borrow().to_internal()); }
+            if let Ok(c) = any.cast::<VolumeCondition>() { return Ok(c.borrow().to_internal()); }
+            if let Ok(c) = any.cast::<PercentChangeCondition>() { return Ok(c.borrow().to_internal()); }
+            official_condition(any, i < last).map_err(|why| pyo3::exceptions::PyValueError::new_err(format!(
+                "order condition {} ({}) is not understood: {}. The order is not sent.",
+                i + 1, any.get_type().name().map(|n| n.to_string()).unwrap_or_default(), why,
+            )))
         }).collect()
     }
 
@@ -1759,7 +1837,8 @@ impl Order {
 
     /// The order an order callback shows, from the Rust API order: every
     /// field; the empty lists are None, as the official API's decoding
-    /// leaves them. The conditions are not shown.
+    /// leaves them; the conditions as this module's condition objects
+    /// (ibx#543).
     pub fn from_api(py: Python<'_>, o: &crate::api::types::Order) -> PyResult<Self> {
         let tag_values = |list: &[crate::api::types::TagValue]| -> PyResult<Py<PyAny>> {
             let objs = list.iter()
@@ -1920,7 +1999,7 @@ impl Order {
             smart_combo_routing_params: tag_values(&o.smart_combo_routing_params)?,
             order_misc_options: tag_values(&o.order_misc_options)?,
             order_combo_legs: list_or_none(py, legs)?,
-            conditions: empty_list(),
+            conditions: conditions_to_py(py, &o.conditions)?,
             use_price_mgmt_algo: (o.use_price_mgmt_algo != i32::MAX).then_some(o.use_price_mgmt_algo != 0),
             route_marketable_to_bbo: o.route_marketable_to_bbo.then_some(true),
             seek_price_improvement: o.seek_price_improvement.then_some(true),
@@ -2419,6 +2498,11 @@ impl PriceCondition {
     #[pyo3(name = "condType")]
     fn cond_type() -> i32 { 1 }
 
+    /// The conditions of an order are joined by "and".
+    #[classattr]
+    #[pyo3(name = "isConjunctionConnection")]
+    fn joined_by_and() -> bool { true }
+
     fn __repr__(&self) -> String {
         let op = if self.is_more.unwrap_or(false) { ">" } else { "<" };
         format!("PriceCondition(conId={:?}, price {} {:?})", self.con_id, op, self.price)
@@ -2464,6 +2548,11 @@ impl TimeCondition {
     #[pyo3(name = "condType")]
     fn cond_type() -> i32 { 3 }
 
+    /// The conditions of an order are joined by "and".
+    #[classattr]
+    #[pyo3(name = "isConjunctionConnection")]
+    fn joined_by_and() -> bool { true }
+
     fn __repr__(&self) -> String {
         let op = if self.is_more.unwrap_or(false) { ">" } else { "<" };
         format!("TimeCondition(time {} {:?})", op, self.time)
@@ -2500,6 +2589,11 @@ impl MarginCondition {
     #[classattr]
     #[pyo3(name = "condType")]
     fn cond_type() -> i32 { 4 }
+
+    /// The conditions of an order are joined by "and".
+    #[classattr]
+    #[pyo3(name = "isConjunctionConnection")]
+    fn joined_by_and() -> bool { true }
 
     fn __repr__(&self) -> String {
         format!("MarginCondition({:?}% {})", self.percent, if self.is_more.unwrap_or(false) { "above" } else { "below" })
@@ -2538,6 +2632,11 @@ impl ExecutionCondition {
     #[classattr]
     #[pyo3(name = "condType")]
     fn cond_type() -> i32 { 5 }
+
+    /// The conditions of an order are joined by "and".
+    #[classattr]
+    #[pyo3(name = "isConjunctionConnection")]
+    fn joined_by_and() -> bool { true }
 
     fn __repr__(&self) -> String {
         format!("ExecutionCondition(symbol={:?}, exchange={:?})", self.symbol, self.exchange)
@@ -2582,6 +2681,11 @@ impl VolumeCondition {
     #[classattr]
     #[pyo3(name = "condType")]
     fn cond_type() -> i32 { 6 }
+
+    /// The conditions of an order are joined by "and".
+    #[classattr]
+    #[pyo3(name = "isConjunctionConnection")]
+    fn joined_by_and() -> bool { true }
 
     fn __repr__(&self) -> String {
         let op = if self.is_more.unwrap_or(false) { ">" } else { "<" };
@@ -2629,6 +2733,11 @@ impl PercentChangeCondition {
     #[classattr]
     #[pyo3(name = "condType")]
     fn cond_type() -> i32 { 7 }
+
+    /// The conditions of an order are joined by "and".
+    #[classattr]
+    #[pyo3(name = "isConjunctionConnection")]
+    fn joined_by_and() -> bool { true }
 
     fn __repr__(&self) -> String {
         let op = if self.is_more.unwrap_or(false) { ">" } else { "<" };
@@ -3239,6 +3348,55 @@ impl NewsProviderPy {
     fn new() -> Self { Self::default() }
 }
 
+// ── WshEventData ──
+
+/// ibapi-compatible WshEventData class (ibx#443).
+#[pyclass(from_py_object, name = "WshEventData")]
+#[derive(Clone, Debug)]
+pub struct WshEventDataPy {
+    #[pyo3(get, set)]
+    pub con_id: i32,
+    #[pyo3(get, set)]
+    pub filter: String,
+    #[pyo3(get, set)]
+    pub fill_watchlist: bool,
+    #[pyo3(get, set)]
+    pub fill_portfolio: bool,
+    #[pyo3(get, set)]
+    pub fill_competitors: bool,
+    #[pyo3(get, set)]
+    pub start_date: String,
+    #[pyo3(get, set)]
+    pub end_date: String,
+    #[pyo3(get, set)]
+    pub total_limit: i32,
+}
+
+#[pymethods]
+impl WshEventDataPy {
+    #[new]
+    #[pyo3(signature = ())]
+    fn new() -> Self {
+        let d = crate::api::types::WshEventData::default();
+        Self {
+            con_id: d.con_id,
+            filter: d.filter,
+            fill_watchlist: d.fill_watchlist,
+            fill_portfolio: d.fill_portfolio,
+            fill_competitors: d.fill_competitors,
+            start_date: d.start_date,
+            end_date: d.end_date,
+            total_limit: d.total_limit,
+        }
+    }
+}
+
+official_names!(WshEventDataPy, [
+    ("conId", "con_id"), ("fillWatchlist", "fill_watchlist"), ("fillPortfolio", "fill_portfolio"),
+    ("fillCompetitors", "fill_competitors"), ("startDate", "start_date"), ("endDate", "end_date"),
+    ("totalLimit", "total_limit"),
+]);
+
 // ── SoftDollarTier ──
 
 /// ibapi-compatible SoftDollarTier class.
@@ -3434,6 +3592,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SmartComponentPy>()?;
     m.add_class::<NewsProviderPy>()?;
     m.add_class::<SoftDollarTierPy>()?;
+    m.add_class::<WshEventDataPy>()?;
     m.add_class::<DepthMktDataDescriptionPy>()?;
     Ok(())
 }

@@ -184,6 +184,7 @@ fn fill_exec_of(parsed: &std::collections::HashMap<u32, String>, exec_id: &str) 
         last_liquidity: tag(851).and_then(|s| s.parse().ok()).unwrap_or(0),
         combo: None,
         other_client: false,
+        replayed: parsed.get(&97).is_some_and(|v| v == "Y"),
     }
 }
 
@@ -270,6 +271,17 @@ fn parent_order_id(parsed: &std::collections::HashMap<u32, String>, context: &Co
     context.last_clord.iter()
         .find(|(_, clord)| same_id(clord))
         .map_or(id, |(&order_id, _)| order_id)
+}
+
+/// The parent of a report's order: the report's parent link, or the
+/// parent the order is known to have when the report has no link (ibx#509:
+/// in the bracket recordings of 26/09/2026 some reports of a child carry
+/// no link, and the reference's orderStatus names the parent all the same).
+fn known_parent_id(parsed: &std::collections::HashMap<u32, String>, context: &Context, order_id: OrderId) -> i64 {
+    match parent_order_id(parsed, context) {
+        0 => context.book.get(&order_id).map_or(0, |e| e.parent),
+        parent => parent,
+    }
 }
 
 pub(crate) struct CcpState {
@@ -832,13 +844,15 @@ impl CcpState {
             log::debug!("Commission report for {} skipped: already reported", exec_id);
             return;
         }
-        let unset_when_zero = |v: Option<f64>| v.filter(|x| *x != 0.0).unwrap_or(f64::MAX);
+        // No realized P&L and no yield are 0, as the reference gives them
+        // (ibx#543: 14 and 24 reports of the order scenarios of 09/10/2026).
+        let unset_when_zero = |v: Option<f64>| v.unwrap_or(0.0);
         let report = api::CommissionAndFeesReport {
             exec_id: exec_id.clone(),
             commission_and_fees: commission.unwrap_or(0.0),
             currency: parsed.get(&6381).cloned().unwrap_or_default(),
             realized_pnl: unset_when_zero(parsed.get(&6099).and_then(|s| s.parse().ok())),
-            yield_amount: parsed.get(&236).and_then(|s| s.parse().ok()).unwrap_or(f64::MAX),
+            yield_amount: parsed.get(&236).and_then(|s| s.parse().ok()).unwrap_or(0.0),
             yield_redemption_date: parsed.get(&696).filter(|s| s.len() == 8).cloned().unwrap_or_default(),
         };
         log::info!("Commission report: exec={} commission={} {}", report.exec_id, report.commission_and_fees, report.currency);
@@ -1033,7 +1047,7 @@ impl CcpState {
                                 self.optcalc.xml_reply(&id, &xml, ccp_conn, hb, shared);
                             }
                         }
-                        "186" => self.handle_matching_symbols_reply(msg, &parsed, shared),
+                        "186" => self.handle_matching_symbols_reply(msg, &parsed, shared, event_tx),
                         // Option chain parameters (ibx#440): the derivative
                         // answer and the chain answer.
                         "5" => {
@@ -1297,6 +1311,7 @@ impl CcpState {
             // The replay of the logon: the requests made since the connect
             // are answered now, with no restored-link message (ibx#251).
             if std::mem::take(&mut self.awaiting_login_replay) {
+                shared.orders.set_login_orders_end();
                 shared.orders.set_open_orders_held(false);
                 shared.notify();
             }
@@ -1361,7 +1376,7 @@ impl CcpState {
                 .filter(|&id| id != 0 && id != server_id && context.order(id).is_none()
                     && !context.server_ids.contains_key(&id));
             if let Some(api_id) = api_id {
-                context.bind_server_id(api_id, server_id);
+                context.hold_recovered(api_id, server_id);
                 clord_id = api_id;
             }
             let con_id: i64 = parsed.get(&6008).and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -1791,7 +1806,7 @@ impl CcpState {
         if report_status && !had_fill {
             if let Some(order) = context.order(clord_id).copied() {
                 let perm_id: i64 = perm_id_of(parsed);
-                let parent_id = parent_order_id(parsed, context);
+                let parent_id = known_parent_id(parsed, context, clord_id);
                 // Average fill price rides on status reports too (ibx#315).
                 let avg_px = parsed.get(&6).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
                 // Filled so far as the server counts it (tag 14): an order
@@ -1825,12 +1840,18 @@ impl CcpState {
         {
             let account = parsed.get(&1).cloned().unwrap_or_default();
             let symbol = parsed.get(&55).cloned().unwrap_or_default();
-            let exchange = parsed.get(&207).cloned().unwrap_or_default();
+            // The exchange of the order's contract is the one the order
+            // was routed to (SMART for the smart route), as the reference's
+            // openOrder shows it, not the venue where it rests (ibx#519:
+            // an order of an earlier session resting on a venue shows SMART).
+            let exchange = parsed.get(&6004).filter(|e| !e.is_empty())
+                .map(|e| crate::control::contracts::exchange_from_fix(e).to_string())
+                .or_else(|| parsed.get(&207).cloned())
+                .unwrap_or_default();
             let sec_type = parsed.get(&167).cloned().unwrap_or_default();
             let currency = parsed.get(&15).cloned().unwrap_or_default();
             let con_id: i64 = parsed.get(&6008).and_then(|s| s.parse().ok()).unwrap_or(0);
             let local_symbol = parsed.get(&6035).cloned().unwrap_or_default();
-            let _routing_exchange = parsed.get(&6004).cloned().unwrap_or_default();
             let perm_id: i64 = perm_id_of(parsed);
             let total_qty: f64 = parsed.get(&38).and_then(|s| s.parse().ok()).unwrap_or(0.0);
             let ord_type_tag = parsed.get(&40).map(|s| s.as_str()).unwrap_or("");
@@ -1869,7 +1890,9 @@ impl CcpState {
             let order_type_str = match ord_type_tag {
                 "1" => "MKT", "2" => "LMT", "3" => "STP", "4" => "STP LMT",
                 "P" => "TRAIL", "5" => "MOC", "B" => "LOC", "J" => "MIT",
-                "K" => "MTL", "R" => "REL", _ => ord_type_tag,
+                "K" => "MTL", "R" => "REL",
+                "TMIT" => "TRAIL MIT", "TLIT" => "TRAIL LIT", "E2M" => "PEG BEST", "PSVR" => "PASSV REL",
+                _ => ord_type_tag,
             };
 
             // As the reference: an unknown code is kept ("???"), not read
@@ -1984,7 +2007,11 @@ impl CcpState {
                 tif: tif_str.to_string(),
                 account: if account.is_empty() { account_id.to_string() } else { account.clone() },
                 perm_id,
-                parent_id: parent_order_id(parsed, context),
+                parent_id: known_parent_id(parsed, context, clord_id),
+                // The OCA group the order has on the server, which the
+                // reference's openOrder shows: for a child, its parent's
+                // number (ibx#509, the bracket recordings of 26/09/2026).
+                oca_group: context.book.get(&clord_id).map(|e| e.oca_group.clone()).unwrap_or_default(),
                 // Filled so far, not the quantity still working (ibx#309).
                 filled_quantity: cum_qty,
                 outside_rth,
@@ -3020,6 +3047,43 @@ impl CcpState {
         self.pending_resolves.push(PendingResolve { lookup_id, req_id, request });
     }
 
+    /// Look up the conId of a display group update (ibx#424), as the
+    /// reference does for a contract it has not seen. The answer is read
+    /// by `contract_resolve_reply`.
+    pub(crate) fn start_display_group_lookup(
+        &mut self,
+        req_id: ReqId,
+        con_id: i64,
+        ccp_conn: &mut Option<Connection>,
+        hb: &mut HeartbeatState,
+    ) {
+        let lookup_id = HIST_LOOKUP_FIRST_ID + self.next_resolve_id % HIST_LOOKUP_IDS;
+        self.next_resolve_id = self.next_resolve_id.wrapping_add(1);
+        if let Some(conn) = ccp_conn.as_mut().filter(|_| !self.disconnected) {
+            let name = format!("{}{}", crate::control::contracts::SECDEF_MSG_NAME, lookup_id);
+            let con_id_str = con_id.to_string();
+            let ts = chrono_free_timestamp();
+            let _ = conn.send_fix(&[
+                (fix::TAG_MSG_TYPE, "c"),
+                (fix::TAG_SENDING_TIME, &ts),
+                (320, &name),
+                (321, "2"),
+                (146, "1"),
+                (6008, &con_id_str),
+                (6004, "ANYEXCH"),
+            ]);
+            hb.last_ccp_sent = Instant::now();
+            log::info!("Contract lookup {} for display group req_id={}: con_id={}", lookup_id, req_id, con_id);
+        } else {
+            log::warn!("Contract lookup {} for req_id={} queued with no auth connection", lookup_id, req_id);
+        }
+        self.pending_resolves.push(PendingResolve {
+            lookup_id,
+            req_id,
+            request: crate::types::ControlCommand::DisplayGroupLookup { req_id, con_id },
+        });
+    }
+
     /// The answer to a contract lookup of a historical-data request
     /// (ibx#427): exactly one contract releases the request with its
     /// conId; none or several give error 200 and no query, as the
@@ -3030,6 +3094,18 @@ impl CcpState {
         let Some(idx) = self.pending_resolves.iter().position(|p| ReqId::from(p.lookup_id) == number) else { return false };
         let pending = self.pending_resolves.swap_remove(idx);
         let records = crate::control::contracts::parse_secdef_records(msg).unwrap_or_default();
+        if matches!(pending.request, crate::types::ControlCommand::DisplayGroupLookup { .. }) {
+            // A display group update (ibx#424): a contract is kept and gives
+            // no answer, none gives the reference's error.
+            match records.iter().find(|def| def.con_id != 0) {
+                Some(def) => self.cache_definition(def, shared),
+                None => {
+                    let (code, text) = crate::client_core::DISPLAY_GROUP_NO_INSTRUMENT;
+                    shared.reference.push_historical_error(pending.req_id, code, text.to_string());
+                }
+            }
+            return true;
+        }
         let mut con_ids: Vec<i64> = Vec::new();
         for def in &records {
             if def.con_id != 0 && !con_ids.contains(&def.con_id) {
@@ -3242,6 +3318,7 @@ impl CcpState {
         msg: &[u8],
         parsed: &std::collections::HashMap<u32, String>,
         shared: &SharedState,
+        event_tx: &Option<Sender<Event>>,
     ) {
         let echoed = parsed.get(&320).and_then(|v| v.trim().parse::<u32>().ok());
         let Some(pos) = echoed.and_then(|rid| self.pending_matching_symbols.iter().position(|p| p.0 == rid)) else {
@@ -3265,11 +3342,15 @@ impl CcpState {
         match parsed.get(&58) {
             Some(text) => shared.reference.push_historical_error(req_id, 10159, format!("{}{}", MATCHING_SYMBOLS_FAILED, text)),
             // An empty result is a legitimate answer ("no such symbol") and
-            // is delivered (ibx#228).
-            None => shared.reference.push_matching_symbols(
-                req_id,
-                crate::control::contracts::parse_matching_symbols_response(msg).unwrap_or_default(),
-            ),
+            // is delivered (ibx#228), on the event channel too (ibx#387).
+            None => {
+                let matches = crate::control::contracts::parse_matching_symbols_response(msg).unwrap_or_default();
+                let for_event = clone_for_event(event_tx, &matches);
+                shared.reference.push_matching_symbols(req_id, matches);
+                if let Some(matches) = for_event {
+                    emit(event_tx, Event::SymbolSamples { req_id, matches });
+                }
+            }
         }
         match self.matching_acked.iter().position(|id| *id == wire_id) {
             Some(i) => { self.matching_acked.swap_remove(i); }
@@ -3546,9 +3627,14 @@ fn handle_account_end(msg: &[u8], shared: &SharedState) {
     }
 }
 
-/// Ledger tags of a `35=RL` row and the account keys the reference gives
-/// them (ibx#475). The row's currency (8002) is the key's currency.
+/// The account keys of a `35=RL` row and the ledger tag of each, in the
+/// order of the reference's table (`jaccount.X.n`, ibx#475, ibx#487). The
+/// row's currency (8002) is the key's currency. `Currency`, `AccountOrGroup`
+/// and `RealCurrency` are texts (tag ""); the insured deposit (8174) is
+/// added to CashBalance (the API setting that gives it a key of its own is
+/// off by default).
 const LEDGER_KEYS: &[(&str, &str)] = &[
+    ("", "Currency"),
     ("9806", "CashBalance"),
     ("9818", "TotalCashBalance"),
     ("6242", "AccruedCash"),
@@ -3560,6 +3646,19 @@ const LEDGER_KEYS: &[(&str, &str)] = &[
     ("6100", "UnrealizedPnL"),
     ("6099", "RealizedPnL"),
     ("9820", "ExchangeRate"),
+    ("6483", "FundValue"),
+    ("6681", "NetDividend"),
+    ("6682", "MutualFundValue"),
+    ("6683", "MoneyMarketFundValue"),
+    ("6684", "CorporateBondValue"),
+    ("6685", "TBondValue"),
+    ("6686", "TBillValue"),
+    ("6687", "WarrantValue"),
+    ("6711", "FxCashBalance"),
+    ("", "AccountOrGroup"),
+    ("", "RealCurrency"),
+    ("6924", "IssuerOptionValue"),
+    ("8406", "Cryptocurrency"),
 ];
 
 /// Rows of an account frame as (key, currency, value text), and the latest
@@ -3569,8 +3668,12 @@ const LEDGER_KEYS: &[(&str, &str)] = &[
 ///   `PNL` row ends the frame. `AddAccountCode` is skipped, and
 ///   `AccountCode` is kept only after an `AccountType` row of the same frame
 ///   (the periodic frames carry an empty one).
-/// - `35=RL`: each `LedgerList` row gives `Currency` and the ledger keys,
-///   with the row's currency (8002).
+/// - `35=RL`: each `LedgerList` row gives the keys of `LEDGER_KEYS` with
+///   the row's currency (8002): its currency as `Currency` and
+///   `RealCurrency`, the frame's account as `AccountOrGroup`, and each
+///   number the row has, written as the reference's account values (two to
+///   seven decimals; captured 07/10/2026: exchange rate `1.00`, cash
+///   balance `896958.4231`). A tag the row has not gives no row.
 pub(crate) fn parse_account_rows(text: &str) -> (Vec<(String, String, String)>, Option<i64>) {
     let mut rows = Vec::new();
     let mut time: Option<i64> = None;
@@ -3588,10 +3691,20 @@ pub(crate) fn parse_account_rows(text: &str) -> (Vec<(String, String, String)>, 
         let Some(k) = key else { return true };
         if ledger {
             if k == "LedgerList" && !currency.is_empty() {
-                rows.push(("Currency".into(), currency.into(), currency.into()));
+                // A value Java does not read as a number (`nan`) is not set.
+                let number = |tag: &str| ledger_values.iter().find(|(t, _)| *t == tag)
+                    .and_then(|(_, v)| v.parse::<f64>().ok()).filter(|v| v.is_finite());
                 for (tag, name) in LEDGER_KEYS {
-                    if let Some((_, v)) = ledger_values.iter().find(|(t, _)| t == tag) {
-                        rows.push((name.to_string(), currency.into(), v.to_string()));
+                    let text = match *name {
+                        "Currency" | "RealCurrency" => Some(currency.to_string()),
+                        // The account of the subscription: the client fills it.
+                        "AccountOrGroup" => Some(String::new()),
+                        "CashBalance" => number(tag).map(|c| c + number("8174").unwrap_or(0.0))
+                            .map(crate::client_core::java_account_value),
+                        _ => number(tag).map(crate::client_core::java_account_value),
+                    };
+                    if let Some(text) = text {
+                        rows.push((name.to_string(), currency.into(), text));
                     }
                 }
             }
@@ -3934,7 +4047,8 @@ pub(crate) fn handle_position_update(
     // average cost, which is actually the market price.
     let price_tag = |tag: u32| parsed.get(&tag)
         .and_then(|s| s.parse::<f64>().ok())
-        .map(|v| (v * PRICE_SCALE as f64) as Price)
+        // Rounded: 335.1000061 must not become 335.10000609 (ibx#487).
+        .map(|v| (v * PRICE_SCALE as f64).round() as Price)
         .unwrap_or(0);
     let avg_cost: Price = price_tag(6101);
     let market_price: Price = price_tag(6065);
@@ -4004,8 +4118,9 @@ mod tests {
         assert_eq!(r.exec_id, "0000e0d5.6ab5f36f.01.01");
         assert_eq!(r.commission_and_fees, 1.0003);
         assert_eq!(r.currency, "USD");
-        assert_eq!(r.realized_pnl, f64::MAX, "a realized P&L of 0 is sent as unset");
-        assert_eq!(r.yield_amount, f64::MAX);
+        // 0 when the report has none, as the reference gives them (ibx#543).
+        assert_eq!(r.realized_pnl, 0.0);
+        assert_eq!(r.yield_amount, 0.0);
         assert_eq!(r.yield_redemption_date, "");
     }
 
@@ -5790,6 +5905,37 @@ mod tests {
         assert!(ccp.pending_matching_symbols.is_empty());
     }
 
+    /// The event channel gets each answer once, an empty one included, and
+    /// nothing for the pending mark or an answer with an error text
+    /// (ibx#387).
+    #[test]
+    fn matching_symbols_answers_go_to_the_event_channel() {
+        let (mut ccp, mut context, shared) = u186_test_state();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let event_tx = Some(event_tx);
+        let mut hb = HeartbeatState::new();
+        ccp.pending_matching_symbols.extend([(1, 11), (2, 12), (3, 13)]);
+
+        let failed = crate::protocol::fix::fix_build(&[
+            (crate::protocol::fix::TAG_MSG_TYPE, "U"), (6040, "186"), (320, "3"), (58, "no service"),
+        ], 1);
+        for msg in [matching_symbols_ack("1"), matching_symbols_msg("1", &[]),
+                    matching_symbols_msg("2", &[("AAPL", "265598")]), failed] {
+            ccp.process_ccp_message(&msg, &mut None, &mut context, &shared, &event_tx, &mut hb, "DU1");
+        }
+
+        let events: Vec<String> = event_rx.try_iter().map(|e| match e {
+            Event::SymbolSamples { req_id, matches } => format!(
+                "{}:{}", req_id, matches.iter().map(|m| m.symbol.as_str()).collect::<Vec<_>>().join(","),
+            ),
+            other => panic!("only matching-symbols answers are expected: {other:?}"),
+        }).collect();
+        assert_eq!(events, ["11:", "12:AAPL"]);
+        // The same answers stay readable from the shared state.
+        assert_eq!(shared.reference.drain_matching_symbols().iter().map(|d| d.0).collect::<Vec<_>>(), [11, 12]);
+        assert_eq!(shared.reference.drain_historical_errors().iter().map(|e| (e.0, e.1)).collect::<Vec<_>>(), [(13, 10159)]);
+    }
+
     #[test]
     fn matching_symbols_ack_frame_does_not_consume_the_request() {
         let (mut ccp, mut context, shared) = u186_test_state();
@@ -6610,9 +6756,9 @@ mod tests {
         assert!(rl.contains(&row("NetLiquidationByCurrency", "USD", "953633.0601")));
         assert!(rl.contains(&row("RealizedPnL", "USD", "26.57")));
         assert!(rl.contains(&row("UnrealizedPnL", "BASE", "-791.71")));
-        assert!(rl.contains(&row("ExchangeRate", "USD", "1")));
+        assert!(rl.contains(&row("ExchangeRate", "USD", "1.00")));
+        assert!(rl.contains(&row("RealCurrency", "BASE", "BASE")));
         assert!(!rl.iter().any(|(k, _, _)| k == "LedgerList"));
-        assert_eq!(rl.iter().filter(|(_, c, _)| c == "USD").count(), 12);
     }
 
     // The periodic frame's empty AccountCode is skipped: no AccountType
@@ -7161,6 +7307,23 @@ mod reconnect_tests {
                     assert_eq!(symbol, "AAPL"),
                 other => panic!("{:?}", other),
             }
+        }
+
+        // ibx#424: the conId of a display group update that is not a
+        // contract gets 473; a contract is kept and gives no answer.
+        #[test]
+        fn display_group_lookup_gives_473_for_no_contract_only() {
+            let (mut ccp, mut context, shared) = (CcpState::new(), Context::new(), SharedState::new());
+            ccp.start_display_group_lookup(2, 999999999, &mut None, &mut HeartbeatState::new());
+            ccp.start_display_group_lookup(3, 8314, &mut None, &mut HeartbeatState::new());
+            let none = pipe_msg("35=d|43=N|320=SecDefReqMsgReqByConid3489660928|322=*|323=4|6038=Y|6019=0|6344=0");
+            let one = pipe_msg("35=d|43=N|320=SecDefReqMsgReqByConid3489660929|322=*|323=4|55=IBM|167=STK|207=BEST|6008=8314|15=USD");
+            ccp.process_ccp_message(&none, &mut None, &mut context, &shared, &None, &mut HeartbeatState::new(), "DU1");
+            ccp.process_ccp_message(&one, &mut None, &mut context, &shared, &None, &mut HeartbeatState::new(), "DU1");
+            assert!(ccp.pending_resolves.is_empty());
+            assert!(ccp.resolved_requests.is_empty());
+            assert_eq!(shared.reference.drain_historical_errors(), vec![(2, 473, "No Financial Instrument defined".to_string())]);
+            assert_eq!(shared.reference.get_contract(8314).map(|c| c.symbol), Some("IBM".to_string()));
         }
 
         #[test]

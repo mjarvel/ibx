@@ -66,6 +66,29 @@ pub(crate) struct BookEntry {
     pub owner: Option<i64>,
 }
 
+/// An order that ended and that the reference's book still holds
+/// (ibx#545). A global cancel walks them with the working orders and
+/// answers 161 for each (`trader.order.ay.a(pe, bs, bE, boolean)@176`):
+/// - a cancelled order stays [`CANCELLED_ORDER_KEPT`] after the report
+///   that ended it, then a timer takes it out (`ay.a(pe, fq, long,
+///   boolean)`, `UISettings.ce()`; paper 09/10/2026: 161 at 6 and 7 s,
+///   none at 17 s and later);
+/// - an order that was never sent (refused before the send, or held and
+///   cancelled) gets no report, so nothing takes it out: 161 at every
+///   global cancel of the session (paper 09/10/2026, three runs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EndedOrder {
+    pub order_id: OrderId,
+    /// The id the reference's book holds it under (its permId).
+    pub server_id: OrderId,
+    pub entry: BookEntry,
+    /// When the reference takes it out of its book; None for never.
+    pub until: Option<Instant>,
+}
+
+/// How long the reference keeps a cancelled order in its book.
+pub(crate) const CANCELLED_ORDER_KEPT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The table size of a `java.util.HashMap` that held `peak` entries: 16,
 /// doubled each time the entries pass three quarters of it; it never
 /// shrinks.
@@ -170,6 +193,10 @@ pub struct Context {
     pub(crate) recovered_keys: HashMap<OrderId, OrderId>,
     /// The other way: the key of an order to its server's order id.
     pub(crate) server_ids: HashMap<OrderId, OrderId>,
+    /// The keys of the orders of earlier sessions held under their API
+    /// order id (ibx#538): a new order of this session with that id is not
+    /// that order.
+    pub(crate) recovered: std::collections::HashSet<OrderId>,
     /// The reference's order id generator: the server's order id of each
     /// new order and preview.
     pub(crate) order_ids: OrderIdGenerator,
@@ -219,6 +246,10 @@ pub struct Context {
     /// Requests with outside-RTH waiting for their lookup, in order; later
     /// requests of the same order wait behind them.
     pub(crate) rth_parked: Vec<OrderRequest>,
+    /// The orders of each group transmitted together that still waits for
+    /// a contract (ibx#547): order id and instrument. No order of a group
+    /// goes out before the contract of each is known.
+    pub(crate) order_groups: Vec<Vec<(OrderId, InstrumentId)>>,
     pub(crate) next_rth_lookup: u32,
     /// The session counts US stock sizes in round lots (ibx#287).
     pub(crate) scale_us_lots: bool,
@@ -279,8 +310,14 @@ pub struct Context {
     /// Bounded: the oldest are dropped past `FINISHED_ORDERS_MAX`.
     finished_orders: HashMap<OrderId, OrderStatus>,
     finished_order_ids: std::collections::VecDeque<OrderId>,
+    /// Orders refused with 387 before anything was sent, with their
+    /// instrument, quantity and parent (ibx#542): the reference keeps such
+    /// an order, unlisted, until its cancel ends it.
+    pub(crate) unsent: HashMap<OrderId, (InstrumentId, Qty, i64)>,
     /// The book entry of each order held (see [`BookEntry`]).
     pub(crate) book: HashMap<OrderId, BookEntry>,
+    /// The ended orders the reference's book still holds (ibx#545).
+    pub(crate) ended: Vec<EndedOrder>,
     /// Orders of this client the reference keeps in its API pending map
     /// with no order made: a combo refused with 200 at its contract
     /// lookup. A cancel or a global cancel ends them as ApiCancelled.
@@ -306,6 +343,7 @@ impl Context {
             last_clord: HashMap::new(),
             recovered_keys: HashMap::new(),
             server_ids: HashMap::new(),
+            recovered: std::collections::HashSet::new(),
             order_ids: OrderIdGenerator::new(),
             cancel_clord: HashMap::new(),
             status_queries: std::collections::HashSet::new(),
@@ -314,6 +352,7 @@ impl Context {
             rth_types: HashMap::new(),
             rth_lookups: Vec::new(),
             rth_parked: Vec::new(),
+            order_groups: Vec::new(),
             next_rth_lookup: 0,
             what_ifs: HashMap::new(),
             what_if_send: None,
@@ -349,10 +388,12 @@ impl Context {
             md_resolved: Vec::new(),
             next_md_lookup: 0,
             finished_orders: HashMap::new(),
+            unsent: HashMap::new(),
             finished_order_ids: std::collections::VecDeque::new(),
             book: HashMap::new(),
             api_pending: HashMap::new(),
             next_book_seq: 0,
+            ended: Vec::new(),
             book_peak: 0,
             account: AccountState::default(),
             clock: Clock::new(),
@@ -1270,7 +1311,12 @@ impl Context {
             self.book.insert(oid, BookEntry { seq: self.next_book_seq, ..Default::default() });
             self.next_book_seq += 1;
         }
-        self.book_peak = self.book_peak.max(self.open_orders.len());
+        // The ended orders the reference still holds are in its book too.
+        if !self.ended.is_empty() {
+            let now = Instant::now();
+            self.ended.retain(|e| e.until.is_none_or(|until| now < until));
+        }
+        self.book_peak = self.book_peak.max(self.open_orders.len() + self.ended.len());
     }
 
     /// The server's id of an order, the id part of its ClOrdID: the id
@@ -1291,6 +1337,43 @@ impl Context {
         if key == server { return; }
         self.recovered_keys.insert(server, key);
         self.server_ids.insert(key, server);
+    }
+
+    /// Hold an order of an earlier session, of server id `server`, under its
+    /// API order id `key` (ibx#466), and remember that it is not an order
+    /// of this session (ibx#538).
+    pub(crate) fn hold_recovered(&mut self, key: OrderId, server: OrderId) {
+        self.bind_server_id(key, server);
+        if key != server {
+            self.recovered.insert(key);
+        }
+    }
+
+    /// A working order of an earlier session held under `key`: whether it
+    /// is this client's (same client id). None for any other key.
+    pub(crate) fn earlier_session_order(&self, key: OrderId) -> Option<bool> {
+        (self.recovered.contains(&key) && self.open_orders.contains_key(&key)).then(|| self.owned(key))
+    }
+
+    /// Put the order of an earlier session held under `key` back under its
+    /// server id, so the key is free for an order of this session
+    /// (ibx#538: the reference keeps the orders of each client id apart).
+    /// The server id it is now held under.
+    pub(crate) fn release_recovered_key(&mut self, key: OrderId) -> Option<OrderId> {
+        self.recovered.remove(&key);
+        let server = self.server_ids.remove(&key)?;
+        self.recovered_keys.remove(&server);
+        if let Some(mut order) = self.open_orders.remove(&key) {
+            order.order_id = server;
+            self.open_orders.insert(server, order);
+        }
+        if let Some(v) = self.book.remove(&key) { self.book.insert(server, v); }
+        if let Some(v) = self.modify_versions.remove(&key) { self.modify_versions.insert(server, v); }
+        if let Some(v) = self.last_clord.remove(&key) { self.last_clord.insert(server, v); }
+        if let Some(v) = self.cancel_clord.remove(&key) { self.cancel_clord.insert(server, v); }
+        if let Some(v) = self.trail_limit_reported.remove(&key) { self.trail_limit_reported.insert(server, v); }
+        if let Some(v) = self.reported_stop.remove(&key) { self.reported_stop.insert(server, v); }
+        Some(server)
     }
 
     /// A new order goes out under a server id of its own, from the
@@ -1424,8 +1507,12 @@ impl Context {
     /// Remove an order that ended with `status`, and keep that status for a
     /// later cancel of the same id (ibx#464).
     pub fn finish_order(&mut self, order_id: OrderId, status: OrderStatus) {
+        let kept = (status == OrderStatus::Cancelled).then(|| self.book.get(&order_id).cloned()).flatten();
         if !self.forget_order(order_id) {
             return;
+        }
+        if let Some(entry) = kept {
+            self.keep_ended(order_id, self.server_id(order_id), entry, Some(Instant::now() + CANCELLED_ORDER_KEPT));
         }
         if self.finished_orders.insert(order_id, status).is_none() {
             self.finished_order_ids.push_back(order_id);
@@ -1438,6 +1525,33 @@ impl Context {
                 }
             }
         }
+    }
+
+    /// Keep `status` as the end of an order that was never held (refused
+    /// before it was sent, ibx#542), for a later cancel of the same id.
+    pub(crate) fn finish_unsent(&mut self, order_id: OrderId, status: OrderStatus) {
+        if self.finished_orders.insert(order_id, status).is_none() {
+            self.finished_order_ids.push_back(order_id);
+        }
+    }
+
+    /// Keep an ended order as the reference's book does (ibx#545), in the
+    /// place a new entry of the book takes.
+    pub(crate) fn keep_ended(&mut self, order_id: OrderId, server_id: OrderId, mut entry: BookEntry, until: Option<Instant>) {
+        self.ended.retain(|e| e.order_id != order_id);
+        if until.is_none() {
+            entry.seq = self.next_book_seq;
+            self.next_book_seq += 1;
+        }
+        self.ended.push(EndedOrder { order_id, server_id, entry, until });
+        self.book_peak = self.book_peak.max(self.open_orders.len() + self.ended.len());
+    }
+
+    /// The ended orders the reference's book holds at `now`; those whose
+    /// time is over are dropped.
+    pub(crate) fn ended_orders(&mut self, now: Instant) -> Vec<EndedOrder> {
+        self.ended.retain(|e| e.until.is_none_or(|until| now < until));
+        self.ended.clone()
     }
 
     /// Remove an order and what is kept for it, without keeping a final
@@ -1993,6 +2107,46 @@ mod tests {
             let again = ids.next();
             assert!(again > 0 && again != i32::MAX, "{bound}: {again}");
         }
+    }
+
+    // ibx#538: a working order of an earlier session held under its API
+    // order id. Another client's gives the id back to a new order of this
+    // session and goes on under its server id; this client's own is the
+    // order with that id.
+    #[test]
+    fn an_order_of_an_earlier_session_gives_its_key_back_to_a_new_order_of_another_client() {
+        let mut ctx = Context::new();
+        ctx.api_client_id = 93;
+        ctx.order_ids.start_at(1_000_000_001);
+        ctx.hold_recovered(21, 1_459_034_036);
+        ctx.insert_order(Order::new(21, 0, Side::Buy, 1, 100, b'2', b'1', 0));
+        ctx.book.get_mut(&21).unwrap().owner = Some(0);
+        ctx.modify_versions.insert(21, 2);
+        assert_eq!(ctx.earlier_session_order(21), Some(false), "an order of client 0");
+        assert_eq!(ctx.earlier_session_order(22), None);
+
+        assert_eq!(ctx.release_recovered_key(21), Some(1_459_034_036));
+        assert!(ctx.order(21).is_none(), "the key is free");
+        assert_eq!(ctx.order(1_459_034_036).map(|o| o.order_id), Some(1_459_034_036));
+        assert_eq!((ctx.key_of(1_459_034_036), ctx.server_id(1_459_034_036)), (1_459_034_036, 1_459_034_036));
+        assert_eq!(ctx.modify_versions.get(&1_459_034_036), Some(&2), "its version goes with it");
+        assert_eq!(ctx.book.get(&1_459_034_036).and_then(|e| e.owner), Some(0));
+        assert_eq!(ctx.earlier_session_order(21), None);
+
+        ctx.assign_server_id(21);
+        assert_eq!(ctx.server_id(21), 1_000_000_001, "the new order has an identity of its own");
+    }
+
+    #[test]
+    fn an_order_of_an_earlier_session_of_this_client_is_the_order_with_that_id() {
+        let mut ctx = Context::new();
+        ctx.hold_recovered(21, 1_459_034_036);
+        ctx.insert_order(Order::new(21, 0, Side::Buy, 1, 100, b'2', b'1', 0));
+        ctx.book.get_mut(&21).unwrap().owner = Some(0);
+        assert_eq!(ctx.earlier_session_order(21), Some(true), "client 0, its own order");
+        // Once it is finished the id is an id like any other.
+        ctx.finish_order(21, OrderStatus::Cancelled);
+        assert_eq!(ctx.earlier_session_order(21), None);
     }
 
     // ibx#466: a new order is held under its API order id and gets a
