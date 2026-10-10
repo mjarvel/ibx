@@ -3350,6 +3350,8 @@ impl ClientCore {
             MdReject::NoSecurityDefinition { .. } =>
                 (200, crate::engine::hot_loop::ccp::NO_SECURITY_DEFINITION.into(), true),
             MdReject::NewsRefused { text, .. } => (10094, text.clone(), true),
+            MdReject::UnsupportedRoute { .. } =>
+                (-1, "Controlled sessions do not support this market-data route".into(), true),
             // Not errors: `take_md_rejects` moves the requests (ibx#447).
             MdReject::Frozen { .. } | MdReject::Live { .. } => (0, String::new(), false),
         }

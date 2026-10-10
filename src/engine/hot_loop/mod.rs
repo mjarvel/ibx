@@ -482,6 +482,11 @@ impl HotLoop {
             return Some(PRIMARY_MD);
         }
         let (name, host) = (route.farm.clone(), route.host.clone());
+        if self.connection_control.is_some() {
+            self.shared.market.push_md_reject(crate::bridge::MdReject::UnsupportedRoute { instrument: sub.instrument });
+            self.farm.generic_waiting.retain(|w| w.instrument != sub.instrument);
+            return None;
+        }
         Some(self.pool.ensure(&name, &host, FarmKind::MarketData, Instant::now()))
     }
 
@@ -633,6 +638,9 @@ impl HotLoop {
             return Some(PRIMARY_HMDS);
         }
         let (name, host) = (route.farm.clone(), route.host.clone());
+        if self.connection_control.is_some() {
+            return None;
+        }
         Some(self.pool.ensure(&name, &host, FarmKind::Historical, Instant::now()))
     }
 
@@ -881,12 +889,14 @@ impl HotLoop {
 
     /// The farm of a market data route: the primary farm, or one opened on
     /// demand.
-    fn md_farm_of(&mut self, route: &crate::engine::routing::Route) -> pool::FarmId {
+    fn md_farm_of(&mut self, route: &crate::engine::routing::Route) -> Result<pool::FarmId, ()> {
         if route.farm == self.farm_name {
-            PRIMARY_MD
+            Ok(PRIMARY_MD)
+        } else if self.connection_control.is_some() {
+            Err(())
         } else {
             let (name, host) = (route.farm.clone(), route.host.clone());
-            self.pool.ensure(&name, &host, FarmKind::MarketData, Instant::now())
+            Ok(self.pool.ensure(&name, &host, FarmKind::MarketData, Instant::now()))
         }
     }
 
@@ -894,17 +904,17 @@ impl HotLoop {
     /// of the aggregate, level-two, extended and plain depth routes, as the
     /// reference tries them. The aggregate rows are taken only with a known
     /// listing exchange.
-    fn depth_route(&mut self, con_id: i64, exchange: &str, sec_type: &str) -> Option<pool::FarmId> {
+    fn depth_route(&mut self, con_id: i64, exchange: &str, sec_type: &str) -> Result<Option<pool::FarmId>, ()> {
         use crate::engine::routing::DataType;
         let route_exchange = farm::routing_exchange(exchange, sec_type);
         let agg_group = self.agg_group_for(con_id, route_exchange);
         let listing = self.context.listing_exchanges.get(&con_id).cloned();
-        let table = self.farm.routing.as_ref()?;
-        let route = [DataType::AggDeep, DataType::Deep2, DataType::DeepX, DataType::Deep].into_iter()
+        let Some(table) = self.farm.routing.as_ref() else { return Ok(None) };
+        let Some(route) = [DataType::AggDeep, DataType::Deep2, DataType::DeepX, DataType::Deep].into_iter()
             .filter(|dt| *dt != DataType::AggDeep || listing.is_some())
-            .find_map(|dt| table.lookup(route_exchange, agg_group, sec_type, dt, listing.as_deref().unwrap_or("*")))?
-            .clone();
-        Some(self.md_farm_of(&route))
+            .find_map(|dt| table.lookup(route_exchange, agg_group, sec_type, dt, listing.as_deref().unwrap_or("*")))
+            .cloned() else { return Ok(None) };
+        self.md_farm_of(&route).map(Some)
     }
 
     /// The routing table has the market-maker depth service (Deep2) for
@@ -969,8 +979,10 @@ impl HotLoop {
         if is_smart_depth && !valid.is_empty() && st == "STK" {
             return self.gather_depth_components(req_id, con_id, st, num_rows, valid);
         }
-        let Some(farm_id) = self.depth_route(con_id, &exchange, &st) else {
-            return refuse(&self.shared, 10092, "Deep market data is not supported for this combination of security type/exchange".into());
+        let farm_id = match self.depth_route(con_id, &exchange, &st) {
+            Ok(Some(id)) => id,
+            Ok(None) => return refuse(&self.shared, 10092, "Deep market data is not supported for this combination of security type/exchange".into()),
+            Err(()) => return self.reject_controlled_depth_route(req_id),
         };
         if is_smart_depth {
             // SmartDepth that the contract does not allow: the reference
@@ -1002,13 +1014,13 @@ impl HotLoop {
 
     /// The farm of the top-of-book route of a contract on an exchange
     /// (#452).
-    fn top_route_farm(&mut self, con_id: i64, exchange: &str, sec_type: &str) -> Option<pool::FarmId> {
+    fn top_route_farm(&mut self, con_id: i64, exchange: &str, sec_type: &str) -> Result<Option<pool::FarmId>, ()> {
         let route_exchange = farm::routing_exchange(exchange, sec_type);
         let group = self.agg_group_for(con_id, route_exchange);
-        let route = self.farm.routing.as_ref()?
-            .lookup(route_exchange, group, sec_type, crate::engine::routing::DataType::Top, "*")?
-            .clone();
-        Some(self.md_farm_of(&route))
+        let Some(route) = self.farm.routing.as_ref()
+            .and_then(|table| table.lookup(route_exchange, group, sec_type, crate::engine::routing::DataType::Top, "*"))
+            .cloned() else { return Ok(None) };
+        self.md_farm_of(&route).map(Some)
     }
 
     /// SmartDepth (#452): the contract is looked up on each of its valid
@@ -1057,6 +1069,11 @@ impl HotLoop {
         }
     }
 
+    /// Reject only the request when its route needs an unsupported controlled farm.
+    fn reject_controlled_depth_route(&self, req_id: ReqId) {
+        self.shared.orders.push_order_error(i64::from(req_id), -1,
+            "Controlled sessions do not support this market-depth route".into());
+    }
     /// The books and tops of a SmartDepth request, as the reference sorts
     /// its components (`jextend.d1.process`, `jextend.d0.b(dy)`): a
     /// component found with a depth route gets a book; else one with a top
@@ -1067,27 +1084,42 @@ impl HotLoop {
     /// (`jclient.is.a(pa,List,List,..)@531-738`, `jmdclient.aP.a(dy,TopQuote,..)`;
     /// captured 28/09/2026: `207=ISE|264=442` with `207=BEST|264=443`,
     /// `207=IBEOS|264=442` with `207=IBEOS|264=443`).
+
     fn start_smart_depth(&mut self, g: farm::DepthGather) {
         let st = g.sec_type.as_str();
         let has_smart = g.components.iter().any(|c| c.exchange == "SMART");
         let listing = self.context.listing_exchanges.get(&g.con_id).cloned();
         let last_default = if has_smart {
-            self.top_route_farm(g.con_id, "SMART", st).map(|f| (f, "BEST".to_string()))
+            self.top_route_farm(g.con_id, "SMART", st).map(|farm| farm.map(|f| (f, "BEST".to_string())))
+        } else if let Some(l) = listing {
+            self.top_route_farm(g.con_id, &l, st).map(|farm| farm.map(|f| (f, l)))
         } else {
-            listing.and_then(|l| self.top_route_farm(g.con_id, &l, st).map(|f| (f, l)))
+            Ok(None)
+        };
+        let last_default = match last_default {
+            Ok(value) => value,
+            Err(()) => return self.reject_controlled_depth_route(g.req_id),
         };
         let mut specs = Vec::new();
         let mut tops = Vec::new();
         for c in &g.components {
             let farm::ComponentDefinition::Found { not2d } = c.definition else { continue };
-            if let Some(farm_id) = self.depth_route(g.con_id, &c.exchange, st) {
-                specs.push(farm::DepthSpec::Book { farm: farm_id, exchange: farm::routing_exchange(&c.exchange, st).to_string() });
-                continue;
+            match self.depth_route(g.con_id, &c.exchange, st) {
+                Ok(Some(farm_id)) => {
+                    specs.push(farm::DepthSpec::Book { farm: farm_id, exchange: farm::routing_exchange(&c.exchange, st).to_string() });
+                    continue;
+                }
+                Ok(None) => {}
+                Err(()) => return self.reject_controlled_depth_route(g.req_id),
             }
             if not2d || c.exchange == "SMART" {
                 continue;
             }
-            let Some(farm_id) = self.top_route_farm(g.con_id, &c.exchange, st) else { continue };
+            let farm_id = match self.top_route_farm(g.con_id, &c.exchange, st) {
+                Ok(Some(id)) => id,
+                Ok(None) => continue,
+                Err(()) => return self.reject_controlled_depth_route(g.req_id),
+            };
             let last = if farm::overnight_venue(&c.exchange) {
                 Some((farm_id, c.exchange.clone()))
             } else {
@@ -5611,6 +5643,22 @@ mod tests {
         assert_eq!(engine.set_connection_control(lifecycle_control()).unwrap_err().kind(), io::ErrorKind::InvalidInput);
     }
 
+    #[test]
+    fn controlled_commands_remain_bounded_after_upstream_pacing_reconciliation() {
+        for controlled in [false, true] {
+            let shared = Arc::new(SharedState::new());
+            let mut engine = HotLoop::new(shared, None, None);
+            let (tx, rx) = crossbeam_channel::bounded(200);
+            for _ in 0..200 { tx.send(ControlCommand::Ping).unwrap(); }
+            engine.set_control_rx(rx);
+            if controlled {
+                engine.set_connection_control(lifecycle_control()).unwrap();
+            }
+            engine.poll_control_commands();
+            assert_eq!(engine.cmd_received, if controlled { 65 } else { 200 });
+            assert_eq!(engine.control_rx.as_ref().unwrap().len(), if controlled { 135 } else { 0 });
+        }
+    }
     fn controlled_tcp_pair() -> (std::net::TcpStream, std::net::TcpStream) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let socket = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -5725,6 +5773,72 @@ mod routing_tests {
         engine.context.market.set_routing(s.instrument, &s.sec_type, &s.exchange);
     }
 
+    fn routing_control() -> ConnectionControl {
+        ConnectionControl::new(Duration::from_secs(5),
+            std::collections::BTreeMap::from([("localhost".into(), vec![std::net::IpAddr::from([127, 0, 0, 1])])]),
+            "offline-hardware".into()).unwrap()
+    }
+
+    #[test]
+    fn controlled_alternate_md_route_keeps_primary_subscription_and_order_link() {
+        let (mut engine, mut farm_side) = engine();
+        let (ccp, _ccp_side) = loopback();
+        engine.ccp_conn = Some(ccp);
+        let control = routing_control();
+        engine.set_connection_control(control.clone()).unwrap();
+        engine.set_routing_table(TableKind::MarketData, MD_TABLE);
+        let mut primary = sub(265598, "AAPL", "NASDAQ", "STK");
+        register(&mut engine, &mut primary);
+        engine.route_md_subscribe(&primary);
+        assert_eq!(sent(&mut farm_side).len(), 1);
+        let mut future = sub(815824267, "MNQ", "CME", "FUT");
+        register(&mut engine, &mut future);
+        engine.route_md_subscribe(&future);
+        assert!(sent(&mut farm_side).is_empty());
+        assert_eq!(engine.shared.market.drain_md_rejects(),
+            [crate::bridge::MdReject::UnsupportedRoute { instrument: future.instrument }]);
+        assert!(engine.pool.is_empty());
+        assert!(!control.is_cancelled());
+        assert!(!engine.shared.take_connection_lost());
+        assert!(engine.farm.has_md_subscription(primary.instrument));
+        assert!(engine.ccp_conn.is_some());
+
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        engine.set_control_rx(rx);
+        tx.send(ControlCommand::Unsubscribe { instrument: primary.instrument }).unwrap();
+        engine.poll_control_commands();
+        assert_eq!(sent(&mut farm_side).len(), 1, "the existing subscription can still be cancelled");
+        assert!(!engine.farm.has_md_subscription(primary.instrument));
+        assert!(!control.is_cancelled());
+    }
+
+    #[test]
+    fn controlled_depth_refuses_alternate_components_without_partial_subscription() {
+        let (mut engine, mut farm_side) = engine();
+        let control = routing_control();
+        engine.set_connection_control(control.clone()).unwrap();
+        engine.set_routing_table(TableKind::MarketData,
+            "NASDAQ,STK,Top|Deep,-1,*,primary.invalid,4000,usfarm;\
+             CME,STK,Top|Deep,-1,*,alternate.invalid,4000,alternate");
+        engine.context.agg_groups.insert(1, -1);
+        engine.route_depth_subscribe(8, 1, "CME".into(), "STK".into(), 5, false);
+        engine.start_smart_depth(farm::DepthGather {
+            req_id: 9, con_id: 1, sec_type: "STK".into(), num_rows: 5,
+            components: vec![
+                farm::DepthComponent { exchange: "NASDAQ".into(), lookup: String::new(), definition: farm::ComponentDefinition::Found { not2d: false } },
+                farm::DepthComponent { exchange: "CME".into(), lookup: String::new(), definition: farm::ComponentDefinition::Found { not2d: false } },
+            ],
+            deadline: Instant::now(),
+        });
+        let errors = engine.shared.orders.drain_order_errors();
+        assert_eq!(errors.iter().map(|e| (e.0, e.1)).collect::<Vec<_>>(), [(8, -1), (9, -1)]);
+        assert!(sent(&mut farm_side).is_empty(), "no partial SmartDepth subscription");
+        assert!(engine.pool.is_empty());
+        assert!(!engine.farm.has_depth_req(9, true));
+        assert!(!control.is_cancelled());
+        engine.route_depth_subscribe(10, 1, "NASDAQ".into(), "STK".into(), 5, false);
+        assert_eq!(sent(&mut farm_side).len(), 1, "a primary depth request still works");
+    }
     // #445: each entry writes the contract's own exchange and security
     // type (captured 23/09/2026: a future, a currency pair, a SMART stock).
     #[test]
@@ -6855,6 +6969,7 @@ mod tbt_tests {
 #[cfg(test)]
 mod bars_routing_tests {
     use super::*;
+    use std::time::Duration;
     use std::sync::Arc;
     use crate::bridge::SharedState;
     use crate::engine::routing::TableKind;
@@ -6867,6 +6982,35 @@ mod bars_routing_tests {
         }
     }
 
+    #[test]
+    fn controlled_historical_route_refuses_one_request_and_keeps_primary_link() {
+        let shared = Arc::new(SharedState::new());
+        let mut engine = HotLoop::new(shared.clone(), None, None);
+        let (client, mut server) = crate::protocol::connection::mem_pair();
+        engine.hmds_conn = Some(Connection::new_mem(client));
+        let control = ConnectionControl::new(Duration::from_secs(5),
+            std::collections::BTreeMap::from([("localhost".into(), vec![std::net::IpAddr::from([127, 0, 0, 1])])]),
+            "offline-hardware".into()).unwrap();
+        engine.set_connection_control(control.clone()).unwrap();
+        engine.set_routing_table(TableKind::Historical,
+            "CME,FUT,DayChart,-1,*,primary.invalid,4000,ushmds;\
+             IDEALPRO,CASH,DayChart,4,*,alternate.invalid,4000,cashhmds");
+        let (tx, rx) = crossbeam_channel::bounded(2);
+        engine.set_control_rx(rx);
+        tx.send(bars(1, 12087792, "IDEALPRO", "CASH", "1 hour")).unwrap();
+        tx.send(bars(2, 815824267, "CME", "FUT", "1 hour")).unwrap();
+        engine.poll_control_commands();
+        let errors = shared.reference.drain_historical_errors();
+        assert_eq!(errors.len(), 1);
+        assert_eq!((errors[0].0, errors[0].1), (1, 162));
+        assert!(engine.pool.is_empty());
+        assert!(engine.hmds_conn.is_some());
+        assert!(!control.is_cancelled());
+        assert!(!shared.take_connection_lost());
+        use std::io::Read;
+        server.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        assert!(server.read(&mut [0u8; 8192]).unwrap() > 0, "the primary request was sent");
+    }
     // #445: bars go to the farm of their historical row (day charts, or
     // end of day charts for daily bars), opened on demand; the cancel goes
     // to the same farm; with no row the request ends with 162.

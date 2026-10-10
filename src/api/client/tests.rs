@@ -7350,3 +7350,16 @@ fn display_group_requests_as_the_reference() {
     ]);
     assert!(!w.events.iter().any(|e| e.starts_with("display_group")), "{:?}", w.events);
 }
+
+#[test]
+fn unsupported_controlled_market_data_route_releases_request_mapping() {
+    let (client, _rx, shared) = test_client();
+    client.core.req_to_instrument.lock().unwrap().insert(5, 0);
+    client.core.instrument_to_req.lock().unwrap().insert(0, vec![5]);
+    shared.market.push_md_reject(crate::bridge::MdReject::UnsupportedRoute { instrument: 0 });
+    let mut w = RecordingWrapper::default();
+    client.process_msgs(&mut w);
+    assert!(w.events.iter().any(|event|
+        event == "error:5:-1:Controlled sessions do not support this market-data route"));
+    assert!(!client.core.req_to_instrument.lock().unwrap().contains_key(&5));
+}
