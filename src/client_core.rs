@@ -1388,6 +1388,23 @@ pub(crate) fn wsh_event_data_error(reference: &crate::bridge::ReferenceState) ->
     wsh_refusal(&reference.news_sources(), &reference.news_sources_unsubscribed()).unwrap_or(WSH_META_NOT_REQUESTED)
 }
 
+/// The requests of the official client library that a session of the
+/// reference does not have (ibx#516): the client library refuses them
+/// itself, with these codes and texts (run of 10/10/2026). The two cancels
+/// carry the request's id, the two verify requests id -1.
+pub const CANCEL_CONTRACT_DATA_UNSUPPORTED: (i64, &str) =
+    (503, "The TWS is out of date and must be upgraded.  It does not support contract data cancels.");
+pub const CANCEL_HISTORICAL_TICKS_UNSUPPORTED: (i64, &str) =
+    (503, "The TWS is out of date and must be upgraded.  It does not support historical ticks cancels.");
+pub const VERIFY_REQUEST_NO_INTENT: (i64, i64, &str) =
+    (-1, 544, "Verify Request Sending Error -   Intent to authenticate needs to be expressed during initial connect request.");
+pub const VERIFY_AND_AUTH_REQUEST_NO_INTENT: (i64, i64, &str) =
+    (-1, 551, "Verify And Auth Request Sending Error -   Intent to authenticate needs to be expressed during initial connect request.");
+/// verifyMessage on a session with no verification started: the
+/// reference's answer (ibx#516, run of 10/10/2026).
+pub const VERIFY_MESSAGE_OUT_OF_SEQUENCE: (i64, i64, &str) =
+    (-1, 10095, "ApiVerify error:ApiVerifyMessage ignored. Message sequence error. State: verifyStatus=NONE, verifyInProgress=false");
+
 /// requestFA on a session that is not FA: the reference's error, with its
 /// request id for a request that has none (ibx#481).
 pub const REQUEST_FA_NOT_FA: (i64, i64, &str) =
@@ -1930,6 +1947,8 @@ impl ClientCore {
         generic_tick_list: &str,
         mode_9887: i32,
     ) -> Result<Option<InstrumentId>, String> {
+        // One API request for the pacing, whatever it sends (ibx#555).
+        let _one = crate::engine::park::one_request();
         let (last_trade_date, strike, right, multiplier) = (
             filters.last_trade_date_or_contract_month.as_str(), filters.strike,
             filters.right.as_str(), filters.multiplier.as_str(),
@@ -1996,17 +2015,30 @@ impl ClientCore {
         // contract it finds is subscribed already, the request joins that
         // subscription (`take_md_rejects`).
         if con_id == 0 {
-            let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
-            control_tx.send(ControlCommand::SubscribeBySymbol {
+            let by_symbol = |reply_tx| ControlCommand::SubscribeBySymbol {
                 symbol: symbol.to_string(),
                 sec_type: sec_type.to_string(),
                 exchange: exchange.to_string(),
                 currency: currency.to_string(),
                 filters: filters.clone(),
                 mode_9887, snapshot,
-                reply_tx: Some(reply_tx),
-            }).map_err(|e| format!("Engine stopped: {}", e))?;
+                reply_tx,
+            };
+            let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+            if control_tx.paced() {
+                // Its slot is told at once, and the call does not wait for
+                // the turn of the request (ibx#565).
+                control_tx.send(ControlCommand::MarketDataSlot {
+                    con_id: 0, symbol: symbol.to_string(), sec_type: sec_type.to_string(),
+                    exchange: exchange.to_string(), mode_9887, snapshot, plain: false, reply_tx,
+                }).map_err(|e| format!("Engine stopped: {}", e))?;
+            } else {
+                control_tx.send(by_symbol(Some(reply_tx))).map_err(|e| format!("Engine stopped: {}", e))?;
+            }
             let instrument_id = Self::recv_registration(reply_rx)?;
+            if control_tx.paced() {
+                control_tx.send(by_symbol(None)).map_err(|e| format!("Engine stopped: {}", e))?;
+            }
             return attach(instrument_id, false);
         }
 
@@ -2053,13 +2085,7 @@ impl ClientCore {
             return Ok(None);
         }
 
-        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
-        control_tx.send(ControlCommand::RegisterInstrument {
-            con_id, symbol: symbol.to_string(),
-            sec_type: sec_type.to_string(), exchange: exchange.to_string(),
-            reply_tx: None,
-        }).map_err(|e| format!("Engine stopped: {}", e))?;
-        control_tx.send(ControlCommand::Subscribe {
+        let subscribe = |reply_tx| ControlCommand::Subscribe {
             con_id,
             symbol: symbol.to_string(),
             exchange: exchange.to_string(),
@@ -2069,10 +2095,31 @@ impl ClientCore {
             right: right.to_string(),
             multiplier: multiplier.to_string(),
             mode_9887, snapshot,
-            reply_tx: Some(reply_tx),
-        }).map_err(|e| format!("Engine stopped: {}", e))?;
-
+            reply_tx,
+        };
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        if control_tx.paced() {
+            // The slot is told at once; the request itself waits for its
+            // turn among the requests made before it, and the call does
+            // not (ibx#561).
+            control_tx.send(ControlCommand::MarketDataSlot {
+                con_id, symbol: symbol.to_string(),
+                sec_type: sec_type.to_string(), exchange: exchange.to_string(),
+                mode_9887, snapshot, plain: false, reply_tx,
+            }).map_err(|e| format!("Engine stopped: {}", e))?;
+        } else {
+            control_tx.send(ControlCommand::RegisterInstrument {
+                con_id, symbol: symbol.to_string(),
+                sec_type: sec_type.to_string(), exchange: exchange.to_string(),
+                reply_tx: None,
+            }).map_err(|e| format!("Engine stopped: {}", e))?;
+            control_tx.send(subscribe(Some(reply_tx))).map_err(|e| format!("Engine stopped: {}", e))?;
+        }
         let instrument_id = Self::recv_registration(reply_rx)?;
+        if control_tx.paced() {
+            control_tx.send(subscribe(None)).map_err(|e| format!("Engine stopped: {}", e))?;
+        }
+
         self.con_id_to_instrument.lock().unwrap().insert(con_id, instrument_id);
         let attached = attach(instrument_id, false);
         if delayed_known && self.req_to_instrument.lock().unwrap().contains_key(&req_id) {
@@ -2095,6 +2142,8 @@ impl ClientCore {
     /// records it kept waiting once the count is under the limit
     /// (ibx#444). They get no second 101.
     pub fn promote_waiting_md(&self, shared: &SharedState, control_tx: &ControlSender) {
+        // Not an API request: not paced (ibx#555).
+        let _internal = crate::engine::park::not_a_request();
         loop {
             if self.md_waiting.lock().unwrap().is_empty()
                 || self.md_lines_in_use() >= shared.reference.snapshot_rate_limit() as usize
@@ -2232,15 +2281,28 @@ impl ClientCore {
                 format!("Regulatory snapshot for {} is already being fetched in ticker id={}", symbol, other));
             return Ok(());
         }
-        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
-        control_tx.send(ControlCommand::RegisterInstrument {
-            con_id, symbol: symbol.to_string(), sec_type: sec_type.to_string(), exchange: exchange.to_string(), reply_tx: None,
-        }).map_err(|e| format!("Engine stopped: {}", e))?;
-        control_tx.send(ControlCommand::SubscribeSnapshot {
+        let snapshot = |reply_tx| ControlCommand::SubscribeSnapshot {
             con_id, symbol: symbol.to_string(), exchange: exchange.to_string(), sec_type: sec_type.to_string(),
-            reply_tx: Some(reply_tx),
-        }).map_err(|e| format!("Engine stopped: {}", e))?;
+            reply_tx,
+        };
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        if control_tx.paced() {
+            // Its slot is told at once, and the call does not wait for the
+            // turn of the request (ibx#565).
+            control_tx.send(ControlCommand::MarketDataSlot {
+                con_id, symbol: symbol.to_string(), sec_type: sec_type.to_string(), exchange: exchange.to_string(),
+                mode_9887: 0, snapshot: true, plain: true, reply_tx,
+            }).map_err(|e| format!("Engine stopped: {}", e))?;
+        } else {
+            control_tx.send(ControlCommand::RegisterInstrument {
+                con_id, symbol: symbol.to_string(), sec_type: sec_type.to_string(), exchange: exchange.to_string(), reply_tx: None,
+            }).map_err(|e| format!("Engine stopped: {}", e))?;
+            control_tx.send(snapshot(Some(reply_tx))).map_err(|e| format!("Engine stopped: {}", e))?;
+        }
         let instrument = Self::recv_registration(reply_rx)?;
+        if control_tx.paced() {
+            control_tx.send(snapshot(None)).map_err(|e| format!("Engine stopped: {}", e))?;
+        }
         self.reg_snapshots.lock().unwrap().push(crate::control::regsnapshot::Fetch::new(
             req_id, con_id, instrument, symbol.to_string(), std::time::Instant::now(),
         ));
@@ -2324,6 +2386,8 @@ impl ClientCore {
     /// later call. Checked when positions or requests change, and every
     /// second.
     pub fn maintain_pnl_quotes(&self, shared: &SharedState, control_tx: &ControlSender) {
+        // Not an API request: not paced (ibx#555).
+        let _internal = crate::engine::park::not_a_request();
         let n_pnl = self.pnl_reqs.lock().unwrap().len();
         let singles: Vec<i64> = self.pnl_single_reqs.lock().unwrap().values().copied().collect();
         let mut q = self.pnl_quotes.lock().unwrap();

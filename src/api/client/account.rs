@@ -17,6 +17,10 @@ impl EClient {
     /// `cancel_positions`. What is ready now is sent through `wrapper`; the
     /// rest comes through `process_msgs`. No wait in the caller's thread.
     pub fn req_positions(&self, wrapper: &mut impl Wrapper) {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
+        // Answered here: after the requests made before it (ibx#561).
+        self.shared.command_clock().take_turn();
         // Accounts whose application is not approved (ibx#421).
         match crate::client_core::ClientCore::positions_pending_check(&self.shared.reference) {
             Err((code, message)) => {
@@ -48,7 +52,7 @@ impl EClient {
             wrapper.position_end();
         }
         if let Some((code, message)) = batch.error {
-            wrapper.error(-1, code, &message, "");
+            self.local_error(wrapper, -1, code, &message);
         }
     }
 
@@ -58,6 +62,8 @@ impl EClient {
     /// Several requests can run; an empty or unknown account gives 321, a
     /// request id already running gives 102 (ibx#478).
     pub fn req_pnl(&self, req_id: i64, account: &str, _model_code: &str) {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if !crate::client_core::ClientCore::ids_fit("req_pnl", &[req_id]) { return; }
         if let Err((code, message)) = self.core.request_pnl(req_id, account, &self.account_id) {
             self.shared.orders.push_order_error(req_id, code, message);
@@ -67,6 +73,8 @@ impl EClient {
     /// Cancel PnL subscription. Matches `cancelPnL` in C++.
     /// A request id not running gives 10185 (ibx#478).
     pub fn cancel_pnl(&self, req_id: i64) {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if !crate::client_core::ClientCore::ids_fit("cancel_pnl", &[req_id]) { return; }
         if let Some((code, message)) = self.core.cancel_pnl_request(req_id) {
             self.shared.orders.push_order_error(req_id, code, message);
@@ -76,6 +84,8 @@ impl EClient {
     /// Subscribe to single-position PnL updates. Matches `reqPnLSingle` in C++.
     /// Same checks as `req_pnl` (ibx#478).
     pub fn req_pnl_single(&self, req_id: i64, account: &str, _model_code: &str, con_id: i64) {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if !crate::client_core::ClientCore::ids_fit("req_pnl_single", &[req_id, con_id]) { return; }
         if let Err((code, message)) = self.core.request_pnl_single(req_id, account, &self.account_id, con_id) {
             self.shared.orders.push_order_error(req_id, code, message);
@@ -85,6 +95,8 @@ impl EClient {
     /// Cancel single-position PnL subscription. Matches `cancelPnLSingle` in C++.
     /// A request id not running gives 10186 (ibx#478).
     pub fn cancel_pnl_single(&self, req_id: i64) {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if !crate::client_core::ClientCore::ids_fit("cancel_pnl_single", &[req_id]) { return; }
         if let Some((code, message)) = self.core.cancel_pnl_single_request(req_id) {
             self.shared.orders.push_order_error(req_id, code, message);
@@ -97,6 +109,8 @@ impl EClient {
     /// A server subscription: the rows come as the server sends them, each
     /// batch ends with account_summary_end, until the cancel (ibx#479).
     pub fn req_account_summary(&self, req_id: i64, group: &str, tags: &str) {
+        // One API request for the pacing, whatever it sends (ibx#555).
+        let _one = crate::engine::park::one_request();
         if !crate::client_core::ClientCore::ids_fit("req_account_summary", &[req_id]) { return; }
         match self.core.subscribe_account_summary(req_id, group, tags) {
             Ok(plan) => {
@@ -113,6 +127,8 @@ impl EClient {
 
     /// Cancel account summary. Matches `cancelAccountSummary` in C++.
     pub fn cancel_account_summary(&self, req_id: i64) {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if !crate::client_core::ClientCore::ids_fit("cancel_account_summary", &[req_id]) { return; }
         if let Some(sr_id) = self.core.unsubscribe_account_summary(req_id) {
             let _ = self.control_tx.send(ControlCommand::CancelAccountSummary { sr_id });
@@ -123,6 +139,8 @@ impl EClient {
 
     /// Subscribe to account updates. Matches `reqAccountUpdates` in C++.
     pub fn req_account_updates(&self, subscribe: bool, acct_code: &str) {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         // An account whose application is not approved: a warning, the
         // request goes on (ibx#421).
         if let Some((code, message)) = crate::client_core::ClientCore::account_updates_pending_warning(
@@ -138,6 +156,8 @@ impl EClient {
 
     /// Cancel positions subscription. Matches `cancelPositions` in C++.
     pub fn cancel_positions(&self) {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         self.core.unsubscribe_positions();
     }
 
@@ -146,6 +166,10 @@ impl EClient {
     /// separated, as the reference (ibx#420); the logon account when the
     /// logon had no list.
     pub fn req_managed_accts(&self, wrapper: &mut impl Wrapper) {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
+        // Answered here: after the requests made before it (ibx#561).
+        self.shared.command_clock().take_turn();
         wrapper.managed_accounts(&self.shared.reference.managed_accounts_text(&self.account_id));
     }
 
@@ -162,9 +186,11 @@ impl EClient {
         &self, req_id: i64, account: &str, model_code: &str, ledger_and_nlv: bool,
         wrapper: &mut impl Wrapper,
     ) {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if !crate::client_core::ClientCore::ids_fit("req_account_updates_multi", &[req_id]) { return; }
         if let Err((code, message)) = self.core.subscribe_account_multi(req_id, account, model_code, ledger_and_nlv) {
-            wrapper.error(req_id, code, &message, "");
+            self.local_error(wrapper, req_id, code, &message);
             return;
         }
         self.dispatch_multi(wrapper);
@@ -172,6 +198,8 @@ impl EClient {
 
     /// Cancel multi-account updates. Matches `cancelAccountUpdatesMulti` in C++.
     pub fn cancel_account_updates_multi(&self, req_id: i64) {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if !crate::client_core::ClientCore::ids_fit("cancel_account_updates_multi", &[req_id]) { return; }
         self.core.unsubscribe_account_multi(req_id);
     }
@@ -186,6 +214,8 @@ impl EClient {
         &self, req_id: i64, account: &str, model_code: &str,
         wrapper: &mut impl Wrapper,
     ) {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if !crate::client_core::ClientCore::ids_fit("req_positions_multi", &[req_id]) { return; }
         // An account whose application is not approved (ibx#421).
         if let Some((code, message)) = crate::client_core::ClientCore::positions_multi_pending_refusal(
@@ -200,6 +230,8 @@ impl EClient {
 
     /// Cancel multi-account positions. Matches `cancelPositionsMulti` in C++.
     pub fn cancel_positions_multi(&self, req_id: i64) {
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
         if !crate::client_core::ClientCore::ids_fit("cancel_positions_multi", &[req_id]) { return; }
         self.core.unsubscribe_positions_multi(req_id);
     }
@@ -233,7 +265,7 @@ impl EClient {
                 wrapper.position_multi_end(req_id);
             }
             if let Some((code, message)) = batch.error {
-                wrapper.error(req_id, code, &message, "");
+                self.local_error(wrapper, req_id, code, &message);
             }
         }
     }

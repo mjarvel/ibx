@@ -35,11 +35,21 @@ fn orders() -> Options {
 /// Replay a scenario and check both legs; the outcome for more checks.
 #[track_caller]
 fn check(name: &str, opts: Options) -> Outcome {
-    let o = replay(&load_scenario(name), &opts);
+    let sc = load_scenario(name);
+    let o = replay(&sc, &opts);
     if std::env::var_os("IBX_SCENARIO_DUMP").is_some() {
         dump(name, &o);
     }
     o.assert_same();
+    // Once more as a session opened by a logon runs: the requests paced
+    // and the market data sent in passes, by the times of the recording
+    // (ibx#563). The same messages in the same order, the same callbacks.
+    let paced = replay(&sc, &opts.clone().paced());
+    if std::env::var_os("IBX_SCENARIO_DUMP").is_some() {
+        dump(&format!("{name} (paced)"), &paced);
+    }
+    paced.assert_same();
+    assert_eq!(paced.frames_compared, o.frames_compared, "{name}: frames compared with the pacing on");
     o
 }
 
@@ -301,21 +311,31 @@ fn historical_ticks() {
 }
 
 // Two scanner subscriptions, then their cancels (26/09/2026, ibx#457):
-// the reference sends the subscriptions that waited for the scanner
-// parameters in the reverse order of the requests, each with an XML
-// declaration; ibx sends them in request order with none.
+// the subscriptions that waited for the scanner parameters go out in the
+// reference's order, the second request first here, each with an XML
+// declaration (ibx#513); the lookups of the rows' contracts in row order.
+// The recording ends before the answer to the last cancel, which the
+// reference gives (run of 10/10/2026): left out on both sides.
 #[test]
-#[ignore = "ibx#513: scanner subscriptions in reverse order, XML declaration"]
 fn two_scanner_subscriptions() {
-    check("20260926b/scanner_two", Options::default().compare(&[SCANNER, LOOKUP]));
+    let o = check("20260926b/scanner_two", Options::default().compare(&[SCANNER, LOOKUP])
+        .keep(|l| !l.starts_with("error|9006|162|")));
+    assert_eq!(o.frames_compared, 24);
 }
 
-// News ticks on a contract asked twice (02/10/2026, ibx#458): the
-// reference's subscription of tick 292 lists the news providers (6472).
+// News ticks on a contract asked twice, then on a second contract with
+// one provider (02/10/2026, ibx#458): the news subscription lists the
+// session's news providers, or the one asked (ibx#514). Stops before the
+// cancels, which the reference groups into one message per kind: the
+// engine does it in its market data passes (ibx#560), which the replay
+// does not run yet (ibx#563). The order of marketDataType and tickReqParams on a contract
+// asked before is ibx#535: left out.
 #[test]
-#[ignore = "ibx#514: 292 subscription without the provider list 6472"]
 fn news_ticks_twice() {
-    check("20261002/b1_458_news_dup", Options::default().compare(&[MARKET_DATA, HISTORICAL]));
+    let o = check("20261002/b1_458_news_dup", Options::default().compare(&[MARKET_DATA, HISTORICAL])
+        .skip_frame(exchange_map).until(15737)
+        .keep(|l| !l.starts_with("marketDataType|") && !l.starts_with("tickReqParams|")));
+    assert_eq!(o.frames_compared, 4);
 }
 
 fn dump(name: &str, o: &Outcome) {

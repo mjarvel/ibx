@@ -55,6 +55,12 @@ pub(crate) struct HmdsState {
     pub(crate) next_fundamental_window: u32,
     /// A scanner parameters request is on the wire.
     pub(crate) pending_scanner_params: bool,
+    /// When the scanner parameters request leaves: the reference asks for
+    /// them about 1 s after the first need (ibx#553).
+    pub(crate) scanner_params_due: Option<Instant>,
+    /// The delay applies: a session opened by a logon. An engine built by
+    /// hand asks at once.
+    pub(crate) scanner_params_delayed: bool,
     /// Scanner parameters of this connection: one request, then every
     /// client request is answered from here (ibx#457).
     pub(crate) scanner_params: Option<String>,
@@ -64,6 +70,9 @@ pub(crate) struct HmdsState {
     pub(crate) scan_size_limits: std::collections::HashMap<String, u32>,
     /// Live scanner subscriptions, matched to results by their id (ibx#457).
     pub(crate) pending_scanner: Vec<ScannerSub>,
+    /// The ids of `pending_scanner` in the order the waiting subscriptions
+    /// go out when the scanner parameters arrive (ibx#513).
+    pub(crate) scanner_table: crate::control::scanner::ScannerTable,
     /// News queries in flight, matched to replies by query id (ibx#459).
     pub(crate) pending_news: Vec<NewsQuery>,
     pub(crate) pending_articles: Vec<NewsQuery>,
@@ -383,6 +392,10 @@ pub(crate) struct NewsQuery {
 /// them (ibx#457): the text of 165 with the notice after its colon
 /// (`jextend.dt.e(String)` gives `d7.I.c(text)`, joined by
 /// `jextend.ac.a(String,String)`; ibx#485).
+/// The scanner parameters are asked this long after their first need
+/// (ibx#553).
+pub(crate) const SCANNER_PARAMS_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
 const SCANNER_LINK_LOST: &str =
     "Historical Market Data Service query message:HMDS server disconnect occurred.  Attempting reconnection...";
 const SCANNER_LINK_RESTORED: &str = "Historical Market Data Service query message:HMDS server connection was successful.";
@@ -463,10 +476,13 @@ impl HmdsState {
             next_histogram_window: 0,
             next_fundamental_window: 1,
             pending_scanner_params: false,
+            scanner_params_due: None,
+            scanner_params_delayed: false,
             scanner_params: None,
             scanner_params_waiting: 0,
             scan_size_limits: std::collections::HashMap::new(),
             pending_scanner: Vec::new(),
+            scanner_table: Default::default(),
             pending_news: Vec::new(),
             pending_articles: Vec::new(),
             next_news_query: 0,
@@ -858,7 +874,7 @@ impl HmdsState {
                                 let req_id = self.rtbar_subs.remove(pos).req_id;
                                 released = Some((req_id, 420, crate::control::historical::join_error_text(INVALID_REAL_TIME_QUERY, &error_msg)));
                             } else if let Some(pos) = self.pending_scanner.iter().position(|s| s.scan_id == *qid) {
-                                let req_id = self.pending_scanner.remove(pos).req_id;
+                                let req_id = self.drop_scanner(pos).req_id;
                                 released = Some((req_id, 162, error_msg.clone()));
                             } else if let Some(pos) = self.tbt_subscriptions.iter().position(|s| s.window_id == wid && s.query_pending) {
                                 // A refused tick-by-tick query ends its
@@ -1773,18 +1789,46 @@ impl HmdsState {
         }
     }
 
+    /// The scanner parameters are needed and not known: their request
+    /// leaves `SCANNER_PARAMS_DELAY` after the first need, as the
+    /// reference's (ibx#553; recording of 26/09/2026: first subscription
+    /// at 0 ms, parameters asked at +1,039 ms). A later need before it
+    /// leaves does not move it.
+    fn need_scanner_params(&mut self, now: Instant, hmds_conn: &mut Option<Connection>, hb: &mut HeartbeatState) {
+        if self.pending_scanner_params || self.scanner_params_due.is_some() {
+            return;
+        }
+        if self.scanner_params_delayed {
+            self.scanner_params_due = Some(now + SCANNER_PARAMS_DELAY);
+        } else {
+            self.send_scanner_params_request(hmds_conn, hb);
+        }
+    }
+
+    /// Send the scanner parameters request once its delay has passed
+    /// (ibx#553). With the link down it is left to the link's return.
+    pub(crate) fn sweep_scanner_params(&mut self, now: Instant, hmds_conn: &mut Option<Connection>, hb: &mut HeartbeatState) {
+        if self.scanner_params_due.is_some_and(|due| now >= due) {
+            self.scanner_params_due = None;
+            if !self.pending_scanner_params && self.scanner_params.is_none() {
+                self.send_scanner_params_request(hmds_conn, hb);
+            }
+        }
+    }
+
     /// A client asks for the scanner parameters (ibx#457): answered from
     /// the cache of this connection, else one request goes out and every
     /// waiting client gets its answer.
-    pub(crate) fn req_scanner_params(&mut self, hmds_conn: &mut Option<Connection>, hb: &mut HeartbeatState, shared: &SharedState) {
+    pub(crate) fn req_scanner_params(&mut self, now: Instant, hmds_conn: &mut Option<Connection>, hb: &mut HeartbeatState, shared: &SharedState) {
         if let Some(xml) = &self.scanner_params {
             shared.reference.push_scanner_params(xml.clone());
             return;
         }
         self.scanner_params_waiting += 1;
-        if !self.pending_scanner_params {
-            self.send_scanner_params_request(hmds_conn, hb);
-        }
+        // It has its place among the scanner sessions until it is
+        // answered (ibx#552).
+        self.scanner_table.insert(crate::control::scanner::ScannerTable::PARAMS_REQUEST);
+        self.need_scanner_params(now, hmds_conn, hb);
     }
 
     fn on_scanner_params(&mut self, xml: &str, hmds_conn: &mut Option<Connection>, hb: &mut HeartbeatState, shared: &SharedState) {
@@ -1795,6 +1839,7 @@ impl HmdsState {
         self.scan_size_limits = crate::control::scanner::scan_size_limits(xml);
         self.scanner_params = Some(xml.to_string());
         self.send_waiting_scanners(hmds_conn, hb);
+        self.scanner_table.remove(crate::control::scanner::ScannerTable::PARAMS_REQUEST);
     }
 
     /// Send the subscriptions that are not on the wire yet. A subscription
@@ -1805,10 +1850,12 @@ impl HmdsState {
         if self.scanner_params.is_none() {
             return;
         }
-        for i in 0..self.pending_scanner.len() {
-            if self.pending_scanner[i].sent {
-                continue;
-            }
+        // Several wait only for the parameters: they go out in the
+        // reference's order, not the order of the requests (ibx#513).
+        let waiting: Vec<usize> = self.scanner_table.ids()
+            .filter_map(|id| self.pending_scanner.iter().position(|s| !s.sent && s.scan_id == id))
+            .collect();
+        for i in waiting {
             let sub = &mut self.pending_scanner[i];
             let xml = sub.xml.get_or_insert_with(|| {
                 let limit = self.scan_size_limits.get(&sub.request.scan_code).copied();
@@ -1837,7 +1884,7 @@ impl HmdsState {
         };
         let req_id = self.pending_scanner[pos].req_id;
         if !result.error_text.is_empty() {
-            self.pending_scanner.remove(pos);
+            self.drop_scanner(pos);
             shared.reference.push_historical_error(req_id, 162, historical_service_error(&result.error_text));
             return;
         }
@@ -1883,14 +1930,22 @@ impl HmdsState {
 
     /// Start a scanner subscription (ibx#456): sent at once when the
     /// scanner parameters are known, else after they arrive.
-    pub(crate) fn send_scanner_subscribe(&mut self, req_id: ReqId, client_id: i64, request: crate::control::scanner::ScannerSubscription, hmds_conn: &mut Option<Connection>, hb: &mut HeartbeatState) {
+    pub(crate) fn send_scanner_subscribe(&mut self, req_id: ReqId, client_id: i64, request: crate::control::scanner::ScannerSubscription, now: Instant, hmds_conn: &mut Option<Connection>, hb: &mut HeartbeatState) {
         let scan_id = crate::control::scanner::scanner_subscription_id(client_id, req_id);
+        self.scanner_table.insert(&scan_id);
         self.pending_scanner.push(ScannerSub { scan_id, req_id, request, xml: None, sent: false });
         if self.scanner_params.is_some() {
             self.send_waiting_scanners(hmds_conn, hb);
-        } else if !self.pending_scanner_params {
-            self.send_scanner_params_request(hmds_conn, hb);
+        } else {
+            self.need_scanner_params(now, hmds_conn, hb);
         }
+    }
+
+    /// End the subscription at `pos`.
+    fn drop_scanner(&mut self, pos: usize) -> ScannerSub {
+        let sub = self.pending_scanner.remove(pos);
+        self.scanner_table.remove(&sub.scan_id);
+        sub
     }
 
     pub(crate) fn send_scanner_cancel(&mut self, scan_id: &str, hmds_conn: &mut Option<Connection>, hb: &mut HeartbeatState) {
@@ -1918,7 +1973,7 @@ impl HmdsState {
                 format!("No scanner subscription found for ticker id:{}", req_id));
             return false;
         };
-        let sub = self.pending_scanner.remove(pos);
+        let sub = self.drop_scanner(pos);
         shared.reference.push_historical_error(req_id, 162,
             historical_service_error(&format!("API scanner subscription cancelled: {}", req_id)));
         if sub.sent {
@@ -1934,6 +1989,7 @@ impl HmdsState {
     pub(crate) fn scanner_link_lost(&mut self, shared: &SharedState) {
         self.scanner_params = None;
         self.pending_scanner_params = false;
+        self.scanner_params_due = None;
         for sub in &mut self.pending_scanner {
             sub.sent = false;
             shared.reference.push_historical_error(sub.req_id, 165, SCANNER_LINK_LOST.to_string());

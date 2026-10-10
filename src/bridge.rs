@@ -97,8 +97,8 @@ pub struct ComboView {
     pub leg_prices: Vec<f64>,
 }
 
-/// The event channel as the error queues see it (ibx#498): unset, and
-/// free, until a channel is attached.
+/// The event channel as the queues of errors and answers see it (ibx#498):
+/// unset, and free, until a channel is attached.
 #[derive(Default)]
 struct ErrorTap {
     events: std::sync::OnceLock<crossbeam_channel::Sender<Event>>,
@@ -127,6 +127,13 @@ impl ErrorTap {
     /// Send it once the error is in its queue, so the event never shows
     /// before the queue has it. Non-blocking, as every event: dropped when
     /// the channel is full. The waiting consumer is woken.
+    /// An error written by the thread of the caller while the requests are
+    /// paced: the engine takes it and writes it at its turn (ibx#561).
+    #[inline]
+    fn defer(&self, queue: ErrorQueue, req_id: i64, code: i64, message: &str) -> bool {
+        self.clock.get().is_some_and(|clock| clock.defer_error(queue, req_id, code, message))
+    }
+
     #[inline]
     fn send(&self, event: Option<Event>) {
         if let (Some(tx), Some(event)) = (self.events.get(), event) {
@@ -139,6 +146,30 @@ impl ErrorTap {
 
     fn attach(&self, tx: &crossbeam_channel::Sender<Event>) {
         let _ = self.events.set(tx.clone());
+    }
+
+    /// A copy of an answer for the event channel, made only when a channel
+    /// is attached. Taken before the answer goes to its queue.
+    #[inline]
+    fn copy<T: Clone>(&self, value: &T) -> Option<T> {
+        self.events.get().map(|_| value.clone())
+    }
+
+    /// Give an answer to the event channel once its queue has it.
+    /// Non-blocking: dropped when the channel is full.
+    #[inline]
+    fn emit(&self, event: Option<Event>) {
+        if let (Some(tx), Some(event)) = (self.events.get(), event) {
+            let _ = tx.try_send(event);
+        }
+    }
+
+    /// An error with no queue behind it, answered by the client itself.
+    #[inline]
+    fn emit_error(&self, req_id: i64, code: i64, message: &str) {
+        if let Some(tx) = self.events.get() {
+            let _ = tx.try_send(Event::Error { req_id, code, message: message.to_string() });
+        }
     }
 
     fn wakes(&self, notifier: &Arc<Notifier>) {
@@ -166,6 +197,12 @@ pub struct CommandClock {
     handled: AtomicU64,
     /// The loop of the engine runs on its thread.
     running: AtomicBool,
+    /// The engine paces the requests: an answer of the client itself is
+    /// given to it and comes out at the turn of its request (ibx#561).
+    paced: AtomicBool,
+    /// Those answers, each with the count of commands sent before it.
+    deferred: Mutex<Vec<(u64, ControlCommand)>>,
+    waker: std::sync::OnceLock<Arc<crate::engine::park::Waker>>,
 }
 
 impl CommandClock {
@@ -192,6 +229,106 @@ impl CommandClock {
     pub(crate) fn set_running(&self, on: bool) {
         ON_ENGINE_THREAD.with(|flag| flag.set(on));
         self.running.store(on, Ordering::Release);
+        if !on {
+            // Nothing takes them any more: a call that waits for its turn
+            // goes on.
+            self.deferred.lock().unwrap().clear();
+        }
+    }
+
+    /// The engine paces the requests, and is woken by `waker`.
+    pub(crate) fn set_paced(&self, waker: Option<Arc<crate::engine::park::Waker>>) {
+        if let Some(waker) = waker {
+            let _ = self.waker.set(waker);
+        }
+        self.paced.store(true, Ordering::Release);
+    }
+
+    /// Whether an answer of the calling thread goes through the engine: the
+    /// requests are paced, the loop runs, and this is not its thread.
+    #[inline]
+    fn takes_turns(&self) -> bool {
+        self.paced.load(Ordering::Acquire) && self.running.load(Ordering::Acquire)
+            && !ON_ENGINE_THREAD.with(|flag| flag.get())
+    }
+
+    /// Give the engine a command of the client that follows the commands
+    /// sent so far.
+    fn defer(&self, cmd: ControlCommand) {
+        let after = self.sent.load(Ordering::Acquire);
+        self.deferred.lock().unwrap().push((after, crate::engine::park::scoped(cmd)));
+        if let Some(waker) = self.waker.get() {
+            waker.wake();
+        }
+    }
+
+    /// The commands given by `defer` since the last call.
+    pub(crate) fn take_deferred(&self) -> Vec<(u64, ControlCommand)> {
+        let mut deferred = self.deferred.lock().unwrap();
+        if deferred.is_empty() { Vec::new() } else { std::mem::take(&mut *deferred) }
+    }
+
+    /// Put back commands taken by `take_deferred` and not handled, ahead
+    /// of those given since.
+    #[cfg(any(test, feature = "test-support", feature = "python"))]
+    pub fn give_back_deferred(&self, mut rest: Vec<(u64, ControlCommand)>) {
+        let mut deferred = self.deferred.lock().unwrap();
+        rest.append(&mut deferred);
+        *deferred = rest;
+    }
+
+    /// An error of the client itself: true when the engine takes it and
+    /// writes it at the turn of its request.
+    #[inline]
+    fn defer_error(&self, queue: ErrorQueue, req_id: i64, code: i64, message: &str) -> bool {
+        if !self.takes_turns() {
+            return false;
+        }
+        self.defer(ControlCommand::LocalError { queue, req_id, code, message: message.to_string() });
+        true
+    }
+
+    /// Longest wait for a turn: a queue of fifty requests is emptied in a
+    /// few seconds.
+    const TURN_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// A request answered by the calling thread waits here for its turn
+    /// among the requests made before it, as on the reference, where every
+    /// request goes through one paced queue (ibx#561). At once when the
+    /// requests are not paced.
+    pub fn take_turn(&self) {
+        if !self.takes_turns() {
+            return;
+        }
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.defer(ControlCommand::Turn { reply_tx });
+        let _ = reply_rx.recv_timeout(Self::TURN_LIMIT);
+    }
+
+    /// As `take_turn`, without waiting: the receiver tells when the turn
+    /// has come. `None` when the requests are not paced: the turn is now.
+    pub fn turn_ticket(&self) -> Option<crossbeam_channel::Receiver<()>> {
+        if !self.takes_turns() {
+            return None;
+        }
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.defer(ControlCommand::Turn { reply_tx });
+        Some(reply_rx)
+    }
+
+    /// The requests are paced and an engine runs, on another thread than
+    /// the caller's: for a test that plays the engine itself (ibx#563).
+    #[cfg(any(test, feature = "test-support", feature = "python"))]
+    pub fn pace_for_test(&self) {
+        self.paced.store(true, Ordering::Release);
+        self.running.store(true, Ordering::Release);
+    }
+
+    /// The calling thread is (or is no longer) the one that runs the
+    /// engine, for a test that steps the engine itself (ibx#563).
+    #[cfg(any(test, feature = "test-support", feature = "python"))]
+    pub fn set_engine_thread(&self, on: bool) {
+        ON_ENGINE_THREAD.with(|flag| flag.set(on));
     }
 
     /// Wait until the engine has handled the commands sent so far. At once
@@ -293,9 +430,49 @@ pub enum Event {
     SymbolSamples { req_id: ReqId, matches: Vec<SymbolMatch> },
     /// An error or a notice, as the wrapper's `error` gets it (ibx#498):
     /// `req_id` is the request id, the order id (as in `OrderUpdate`) for
-    /// an order, and -1 for a link status message. A refused market data
-    /// request is not given here.
+    /// an order, and -1 for a link status message. The errors the client
+    /// answers itself (a refused market data request, a lookup answered
+    /// from kept data) are given when the client gives them to its wrapper.
     Error { req_id: i64, code: i64, message: String },
+    /// Option chain parameters (ibx#498): every row of a request at once;
+    /// the request has no other answer, this is also its end.
+    OptionChains { req_id: ReqId, chains: Vec<crate::control::optparams::OptionChain> },
+    /// Market rules received with contract definitions and not known
+    /// before. The market rule request is answered from them.
+    MarketRules(Vec<MarketRule>),
+    /// Historical ticks of a request; `done` on its last part.
+    HistoricalTicks { req_id: ReqId, data: HistoricalTickData, what_to_show: String, done: bool },
+    /// Historical trading schedule.
+    HistoricalSchedule { req_id: ReqId, data: HistoricalScheduleResponse },
+    /// Histogram of a request.
+    HistogramData { req_id: ReqId, entries: Vec<HistogramEntry> },
+    /// A bar of a historical request kept up to date.
+    HistoricalUpdate { req_id: ReqId, bar: HistoricalBar },
+    /// Commission report of an execution.
+    CommissionReport(api::CommissionAndFeesReport),
+    /// An order that reached its end (filled, cancelled, rejected).
+    CompletedOrder(CompletedOrder),
+    /// An order as the client reports it open, after each of its reports.
+    OpenOrder { order_id: OrderId, info: RichOrderInfo },
+    /// Scanner parameters, as XML.
+    ScannerParameters(String),
+    /// Rows of a scanner subscription.
+    ScannerData { req_id: ReqId, result: ScannerResult },
+    /// Fundamental data of a request.
+    FundamentalData { req_id: ReqId, data: String },
+    /// Historical news headlines; `has_more` when the server has more.
+    HistoricalNews { req_id: ReqId, headlines: Vec<NewsHeadline>, has_more: bool },
+    /// A news article.
+    NewsArticle { req_id: ReqId, article_type: i32, text: String },
+    /// A news bulletin, once per message id and day, whether or not
+    /// bulletins are subscribed.
+    NewsBulletin(NewsBulletin),
+    /// Account summary rows and ends, as they arrive.
+    AccountSummary(AccountSummaryEvent),
+    /// A 5 second real-time bar.
+    RealTimeBar { req_id: ReqId, bar: RealTimeBar },
+    /// Answer of an option price or implied volatility calculation.
+    OptionComputation(crate::control::optcalc::OptionComputation),
     /// Position update.
     /// `position` is fixed-point (QTY_SCALE).
     PositionUpdate { instrument: InstrumentId, con_id: i64, position_fixed: Qty, avg_cost: Price },
@@ -554,6 +731,7 @@ impl MarketDataState {
     }
 
     #[doc(hidden)] pub fn push_tbt_error(&self, req_id: ReqId, code: i32, text: String) {
+        if self.error_tap.defer(ErrorQueue::TickByTick, req_id, code as i64, &text) { return; }
         let event = self.error_tap.event(req_id, code as i64, &text);
         self.tbt_errors.lock().unwrap().push((req_id, code, text));
         self.error_tap.send(event);
@@ -716,7 +894,9 @@ impl MarketDataState {
 
 
     #[doc(hidden)] pub fn push_real_time_bar(&self, req_id: ReqId, bar: RealTimeBar) {
+        let copy = self.error_tap.copy(&bar);
         self.real_time_bars.lock().unwrap().push((req_id, bar));
+        self.error_tap.emit(copy.map(|bar| Event::RealTimeBar { req_id, bar }));
     }
 
     #[doc(hidden)] pub fn push_depth_update(&self, update: DepthUpdate) {
@@ -754,8 +934,10 @@ impl MarketDataState {
         if store.store.iter().any(|b| b.msg_id == bulletin.msg_id) {
             return false;
         }
+        let copy = self.error_tap.copy(&bulletin);
         store.store.push(bulletin.clone());
         store.queue.push(bulletin);
+        self.error_tap.emit(copy.map(Event::NewsBulletin));
         true
     }
 
@@ -1027,7 +1209,9 @@ impl OrderState {
     }
 
     #[doc(hidden)] pub fn push_commission_report(&self, report: api::CommissionAndFeesReport) {
+        let copy = self.error_tap.copy(&report);
         self.commission_reports.lock().unwrap().push(report);
+        self.error_tap.emit(copy.map(|report| Event::CommissionReport(report)));
     }
 
     #[doc(hidden)] pub fn push_order_update(&self, update: OrderUpdate) {
@@ -1039,6 +1223,7 @@ impl OrderState {
     }
 
     #[doc(hidden)] pub fn push_order_error(&self, order_id: i64, code: i64, message: String) {
+        if self.error_tap.defer(ErrorQueue::Order, order_id, code, &message) { return; }
         let event = self.error_tap.event(order_id, code, &message);
         self.order_errors.lock().unwrap().push((order_id, code, message));
         self.error_tap.send(event);
@@ -1047,6 +1232,7 @@ impl OrderState {
     /// A notice of a server report (201, 202), given after the status the
     /// same report gives, as the reference writes them (ibx#486).
     #[doc(hidden)] pub fn push_order_notice(&self, order_id: i64, code: i64, message: String) {
+        if self.error_tap.defer(ErrorQueue::OrderNotice, order_id, code, &message) { return; }
         let event = self.error_tap.event(order_id, code, &message);
         self.order_notices.lock().unwrap().push((order_id, code, message));
         self.error_tap.send(event);
@@ -1057,11 +1243,15 @@ impl OrderState {
     }
 
     #[doc(hidden)] pub fn push_completed_order(&self, order: CompletedOrder) {
+        let copy = self.error_tap.copy(&order);
         self.completed_orders.lock().unwrap().push(order);
+        self.error_tap.emit(copy.map(|order| Event::CompletedOrder(order)));
     }
 
     #[doc(hidden)] pub fn push_order_info(&self, order_id: OrderId, info: RichOrderInfo) {
+        let copy = self.error_tap.copy(&info);
         self.order_cache.lock().unwrap().insert(order_id, info);
+        self.error_tap.emit(copy.map(|info| Event::OpenOrder { order_id, info }));
     }
 }
 
@@ -1290,7 +1480,9 @@ impl ReferenceState {
     }
 
     #[doc(hidden)] pub fn push_option_chains(&self, req_id: ReqId, rows: Vec<crate::control::optparams::OptionChain>) {
+        let copy = self.error_tap.copy(&rows);
         self.option_chains.lock().unwrap().push((req_id, rows));
+        self.error_tap.emit(copy.map(|chains| Event::OptionChains { req_id, chains }));
     }
 
     pub fn drain_scanner_params(&self) -> Vec<String> {
@@ -1380,7 +1572,9 @@ impl ReferenceState {
     }
 
     #[doc(hidden)] pub fn push_historical_update(&self, req_id: ReqId, bar: HistoricalBar) {
+        let copy = self.error_tap.copy(&bar);
         self.historical_updates.lock().unwrap().push((req_id, bar));
+        self.error_tap.emit(copy.map(|bar| Event::HistoricalUpdate { req_id, bar }));
     }
 
     /// Drop the updates of a request not delivered yet: none goes out
@@ -1406,11 +1600,15 @@ impl ReferenceState {
     }
 
     #[doc(hidden)] pub fn push_scanner_params(&self, xml: String) {
+        let copy = self.error_tap.copy(&xml);
         self.scanner_params.lock().unwrap().push(xml);
+        self.error_tap.emit(copy.map(|xml| Event::ScannerParameters(xml)));
     }
 
     #[doc(hidden)] pub fn push_scanner_data(&self, req_id: ReqId, result: ScannerResult) {
+        let copy = self.error_tap.copy(&result);
         self.scanner_data.lock().unwrap().push((req_id, result));
+        self.error_tap.emit(copy.map(|result| Event::ScannerData { req_id, result }));
     }
 
     /// Drop the queued results of a cancelled scanner (ibx#457).
@@ -1419,34 +1617,49 @@ impl ReferenceState {
     }
 
     #[doc(hidden)] pub fn push_historical_news(&self, req_id: ReqId, headlines: Vec<NewsHeadline>, has_more: bool) {
+        let copy = self.error_tap.copy(&headlines);
         self.historical_news.lock().unwrap().push((req_id, headlines, has_more));
+        self.error_tap.emit(copy.map(|headlines| Event::HistoricalNews { req_id, headlines, has_more }));
     }
 
     #[doc(hidden)] pub fn push_news_article(&self, req_id: ReqId, article_type: i32, article_text: String) {
+        let copy = self.error_tap.copy(&article_text);
         self.news_articles.lock().unwrap().push((req_id, article_type, article_text));
+        self.error_tap.emit(copy.map(|text| Event::NewsArticle { req_id, article_type, text }));
     }
 
     #[doc(hidden)] pub fn push_option_computation(&self, answer: crate::control::optcalc::OptionComputation) {
+        let copy = self.error_tap.copy(&answer);
         self.option_computations.lock().unwrap().push(answer);
+        self.error_tap.emit(copy.map(|answer| Event::OptionComputation(answer)));
     }
 
     #[doc(hidden)] pub fn push_fundamental_data(&self, req_id: ReqId, data: String) {
+        let copy = self.error_tap.copy(&data);
         self.fundamental_data.lock().unwrap().push((req_id, data));
+        self.error_tap.emit(copy.map(|data| Event::FundamentalData { req_id, data }));
     }
 
     #[doc(hidden)] pub fn push_histogram_data(&self, req_id: ReqId, entries: Vec<HistogramEntry>) {
+        let copy = self.error_tap.copy(&entries);
         self.histogram_data.lock().unwrap().push((req_id, entries));
+        self.error_tap.emit(copy.map(|entries| Event::HistogramData { req_id, entries }));
     }
 
     #[doc(hidden)] pub fn push_historical_ticks(&self, req_id: ReqId, data: HistoricalTickData, what_to_show: String, done: bool) {
+        let copy = self.error_tap.copy(&data).zip(self.error_tap.copy(&what_to_show));
         self.historical_ticks.lock().unwrap().push((req_id, data, what_to_show, done));
+        self.error_tap.emit(copy.map(|(data, what_to_show)| Event::HistoricalTicks { req_id, data, what_to_show, done }));
     }
 
     #[doc(hidden)] pub fn push_historical_schedule(&self, req_id: ReqId, response: HistoricalScheduleResponse) {
+        let copy = self.error_tap.copy(&response);
         self.historical_schedules.lock().unwrap().push((req_id, response));
+        self.error_tap.emit(copy.map(|data| Event::HistoricalSchedule { req_id, data }));
     }
 
     #[doc(hidden)] pub fn push_historical_error(&self, req_id: ReqId, code: i32, message: String) {
+        if self.error_tap.defer(ErrorQueue::Historical, req_id, code as i64, &message) { return; }
         let event = self.error_tap.event(req_id, code as i64, &message);
         self.historical_errors.lock().unwrap().push((req_id, code, message));
         self.error_tap.send(event);
@@ -1454,10 +1667,15 @@ impl ReferenceState {
 
     #[doc(hidden)] pub fn push_market_rules(&self, rules: Vec<MarketRule>) {
         let mut lock = self.market_rules.lock().unwrap();
+        let known = lock.len();
         for rule in rules {
             if !lock.iter().any(|r| r.rule_id == rule.rule_id) {
                 lock.push(rule);
             }
+        }
+        // The rules not known before, once (ibx#498).
+        if lock.len() > known {
+            self.error_tap.emit(self.error_tap.copy(&lock[known..].to_vec()).map(Event::MarketRules));
         }
     }
 
@@ -1764,6 +1982,11 @@ impl ReferenceState {
         self.clock.now_ms().div_euclid(1000)
     }
 
+    /// Current server time in milliseconds, from the same clock (ibx#516).
+    pub fn server_time_millis(&self) -> i64 {
+        self.clock.now_ms()
+    }
+
     /// Whether the logon feature list allows matching symbols requests
     /// (SECDEFTA, ibx#421).
     pub fn matching_symbols_allowed(&self) -> bool {
@@ -1962,6 +2185,7 @@ pub struct PortfolioState {
     account: Mutex<AccountState>,
     /// Account summary rows and ends, in arrival order (ibx#479).
     account_summary_events: Mutex<Vec<AccountSummaryEvent>>,
+    error_tap: ErrorTap,
     /// Account values as the server sends them (ibx#475).
     account_rows: Mutex<AccountRows>,
     /// True once the first gateway account message ("UT"/"UM"/"RL") has been received.
@@ -1989,6 +2213,7 @@ impl PortfolioState {
             account: Mutex::new(AccountState::default()),
             account_rows: Mutex::new(AccountRows::default()),
             account_summary_events: Mutex::new(Vec::new()),
+            error_tap: ErrorTap::default(),
             account_data_received: AtomicBool::new(false),
             account_download_complete: AtomicBool::new(false),
             position_infos: Mutex::new(HashMap::new()),
@@ -2014,7 +2239,9 @@ impl PortfolioState {
 
     #[doc(hidden)]
     pub fn push_account_summary_event(&self, event: AccountSummaryEvent) {
+        let copy = self.error_tap.copy(&event);
         self.account_summary_events.lock().unwrap().push(event);
+        self.error_tap.emit(copy.map(Event::AccountSummary));
     }
 
     pub fn drain_account_summary_events(&self) -> Vec<AccountSummaryEvent> {
@@ -2251,10 +2478,20 @@ impl SharedState {
         self.market.error_tap.attach(tx);
         self.orders.error_tap.attach(tx);
         self.reference.error_tap.attach(tx);
+        self.portfolio.error_tap.attach(tx);
         self.error_tap.attach(tx);
     }
 
+    /// An error the client answers itself, with no queue behind it (a
+    /// refused market data request, a lookup answered from kept data):
+    /// given to the event channel when one is attached (ibx#498).
+    #[doc(hidden)]
+    pub fn emit_error(&self, req_id: i64, code: i64, message: &str) {
+        self.error_tap.emit_error(req_id, code, message);
+    }
+
     pub fn push_connection_notice(&self, code: i64, message: String) {
+        if self.error_tap.defer(ErrorQueue::Connection, -1, code, &message) { return; }
         let event = self.error_tap.event(-1, code, &message);
         self.connection_notices.lock().unwrap().push((code, message));
         self.error_tap.send(event);
@@ -2398,6 +2635,120 @@ mod tests {
         assert_eq!(shared.reference.drain_historical_errors().len(), 2);
         assert_eq!(shared.orders.drain_order_errors().len() + shared.orders.drain_order_notices().len(), 2);
         assert_eq!((shared.market.drain_tbt_errors().len(), shared.drain_connection_notices().len()), (1, 1));
+    }
+
+    /// The answers written to the queues go to an attached event channel
+    /// too, in the order written and with their request id; the queues
+    /// keep them for the wrapper, and nothing is given before a channel is
+    /// attached (ibx#498).
+    #[test]
+    fn answers_go_to_the_attached_event_channel() {
+        use crate::control::optparams::OptionChain;
+        let chain = || OptionChain {
+            exchange: "SMART".into(), underlying_con_id: 265598, trading_class: "AAPL".into(),
+            multiplier: "100".into(), expirations: vec!["20261016".into()], strikes: vec![250.0],
+        };
+        let rule = |rule_id| MarketRule { rule_id, ..Default::default() };
+        let bulletin = |msg_id| NewsBulletin { msg_id, msg_type: 1, message: "m".into(), exchange: "X".into() };
+        let bar = RealTimeBar { timestamp: 1, open: 1.0, high: 2.0, low: 0.5, close: 1.5, volume: 10.0, wap: 1.2, count: 3 };
+        let summary = || AccountSummaryEvent { sr_id: "1".into(), rows: vec![], ledger: false, end: true, ledgers: vec![] };
+
+        let shared = SharedState::new();
+        shared.reference.push_option_chains(1, vec![chain()]);
+        shared.reference.push_market_rules(vec![rule(26)]);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        shared.attach_event_channel(&tx);
+
+        shared.reference.push_option_chains(2, vec![chain()]);
+        // Rule 26 was known before the channel: only 239 is new.
+        shared.reference.push_market_rules(vec![rule(26), rule(239)]);
+        shared.reference.push_market_rules(vec![rule(239)]);
+        shared.reference.push_histogram_data(3, vec![HistogramEntry { price: 250.0, count: 7 }]);
+        shared.reference.push_scanner_params("<xml/>".into());
+        shared.reference.push_fundamental_data(4, "<report/>".into());
+        shared.reference.push_news_article(5, 0, "text".into());
+        shared.reference.push_historical_news(6, vec![], true);
+        shared.market.push_real_time_bar(7, bar);
+        shared.market.push_news_bulletin_on(bulletin(1), jiff::civil::date(2026, 10, 9));
+        shared.market.push_news_bulletin_on(bulletin(1), jiff::civil::date(2026, 10, 9));
+        shared.orders.push_commission_report(api::CommissionAndFeesReport { exec_id: "e1".into(), ..Default::default() });
+        shared.portfolio.push_account_summary_event(summary());
+
+        let events: Vec<String> = rx.try_iter().map(|e| match e {
+            Event::OptionChains { req_id, chains } => format!("chains {req_id} {}", chains[0].trading_class),
+            Event::MarketRules(rules) => format!("rules {:?}", rules.iter().map(|r| r.rule_id).collect::<Vec<_>>()),
+            Event::HistogramData { req_id, entries } => format!("histogram {req_id} {}", entries[0].count),
+            Event::ScannerParameters(xml) => format!("scanner {xml}"),
+            Event::FundamentalData { req_id, data } => format!("fundamental {req_id} {data}"),
+            Event::NewsArticle { req_id, article_type, text } => format!("article {req_id} {article_type} {text}"),
+            Event::HistoricalNews { req_id, headlines, has_more } => format!("news {req_id} {} {has_more}", headlines.len()),
+            Event::RealTimeBar { req_id, bar } => format!("bar {req_id} {}", bar.close),
+            Event::NewsBulletin(b) => format!("bulletin {}", b.msg_id),
+            Event::CommissionReport(r) => format!("commission {}", r.exec_id),
+            Event::AccountSummary(s) => format!("summary {} {}", s.sr_id, s.end),
+            other => panic!("not expected: {other:?}"),
+        }).collect();
+        assert_eq!(events, [
+            "chains 2 AAPL", "rules [239]", "histogram 3 7", "scanner <xml/>", "fundamental 4 <report/>",
+            "article 5 0 text", "news 6 0 true", "bar 7 1.5", "bulletin 1", "commission e1", "summary 1 true",
+        ]);
+        // The queues keep every entry for the wrapper.
+        assert_eq!(shared.reference.drain_option_chains().len(), 2);
+        assert_eq!(shared.reference.drain_histogram_data().len(), 1);
+        assert_eq!(shared.portfolio.drain_account_summary_events().len(), 1);
+    }
+
+    /// The answers of orders, historical requests kept open, scanners and
+    /// option calculations on the event channel (ibx#498).
+    #[test]
+    fn order_and_stream_answers_go_to_the_attached_event_channel() {
+        let shared = SharedState::new();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        shared.attach_event_channel(&tx);
+        let bar = HistoricalBar { time: "20261009-13:30:00".into(), open: 1.0, high: 2.0, low: 0.5, close: 1.5, volume: 10, wap: 1.2, count: 3 };
+        let answer = crate::control::optcalc::OptionComputation {
+            req_id: 4, tick_type: 53, tick_attrib: 0, implied_vol: 0.3, delta: 0.5, opt_price: 2.0, pv_dividend: 0.0,
+            gamma: 0.1, vega: 0.1, theta: -0.1, und_price: 250.0,
+        };
+
+        shared.orders.push_order_info(11, RichOrderInfo {
+            contract: api::Contract { symbol: "SPY".into(), ..Default::default() }, order: Default::default(),
+            order_state: Default::default(), last_exec: Default::default(),
+        });
+        shared.orders.push_completed_order(CompletedOrder {
+            order_id: 11, instrument: 2, status: OrderStatus::Cancelled, filled_qty_fixed: 0, timestamp_ns: 1,
+        });
+        shared.reference.push_historical_update(1, bar);
+        shared.reference.push_historical_ticks(2, HistoricalTickData::Last(vec![]), "TRADES".into(), true);
+        shared.reference.push_scanner_data(3, ScannerResult::default());
+        shared.reference.push_option_computation(answer);
+
+        let events: Vec<String> = rx.try_iter().map(|e| match e {
+            Event::OpenOrder { order_id, info } => format!("open {order_id} {}", info.contract.symbol),
+            Event::CompletedOrder(o) => format!("completed {} {:?}", o.order_id, o.status),
+            Event::HistoricalUpdate { req_id, bar } => format!("update {req_id} {}", bar.close),
+            Event::HistoricalTicks { req_id, data, what_to_show, done } =>
+                format!("ticks {req_id} {what_to_show} {done} {}", matches!(data, HistoricalTickData::Last(_))),
+            Event::ScannerData { req_id, .. } => format!("scanner {req_id}"),
+            Event::OptionComputation(a) => format!("computation {} {}", a.req_id, a.opt_price),
+            other => panic!("not expected: {other:?}"),
+        }).collect();
+        assert_eq!(events, [
+            "open 11 SPY", "completed 11 Cancelled", "update 1 1.5", "ticks 2 TRADES true true", "scanner 3", "computation 4 2",
+        ]);
+    }
+
+    /// An error the client answers itself has no queue: it goes to the
+    /// channel when one is attached, and nowhere before (ibx#498).
+    #[test]
+    fn a_client_error_goes_to_the_attached_event_channel() {
+        let shared = SharedState::new();
+        shared.emit_error(1, 322, "before".into());
+        let (tx, rx) = crossbeam_channel::unbounded();
+        shared.attach_event_channel(&tx);
+        shared.emit_error(2, 354, "not subscribed");
+        let events: Vec<Event> = rx.try_iter().collect();
+        assert!(matches!(&events[..], [Event::Error { req_id: 2, code: 354, message }] if message == "not subscribed"));
     }
 
     #[test]

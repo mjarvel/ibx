@@ -182,6 +182,8 @@ impl EClient {
 
     /// Single iteration of event dispatch: drain all shared queues and fire Python callbacks.
     pub(crate) fn dispatch_once(&self, py: Python<'_>, shared: &Arc<SharedState>) -> PyResult<()> {
+        // The requests the client answers itself, at their turn (ibx#565).
+        self.answer_local_calls(py)?;
         // Drain engine events. The lock is held only to drain, never across
         // a callback, so a callback may call disconnect() or connect()
         // (ibx#268). A stopped engine ends the session: run() exits and
@@ -409,8 +411,13 @@ impl EClient {
         let (notices, commands) = self.core.take_md_rejects(shared);
         self.md_notices(py, notices)?;
         if let Ok(tx) = self.tx() {
-            for command in commands {
-                let _ = send_cmd(py, &tx, command);
+            {
+                // The client's own follow-up of a refusal, not an API
+                // request: not paced (ibx#555).
+                let _internal = crate::engine::park::not_a_request();
+                for command in commands {
+                    let _ = send_cmd(py, &tx, command);
+                }
             }
             // Requests that waited for a market data line (101) take the
             // lines set free (ibx#444).

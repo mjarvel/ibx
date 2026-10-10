@@ -1127,8 +1127,16 @@ fn market_data_rejects_are_reported() {
     shared.market.push_md_reject(crate::bridge::MdReject::Delayed { instrument: 0 });
     shared.market.push_md_reject(crate::bridge::MdReject::NotSubscribed {
         instrument: 1, delayed_available: false, needs_api_subscription: false, description: String::new(), kept_params: None });
+    let (tx, events) = crossbeam_channel::unbounded();
+    shared.attach_event_channel(&tx);
     let mut w = RecordingWrapper::default();
     client.process_msgs(&mut w);
+    // The same errors on the event channel, with their request ids (ibx#498).
+    let on_channel: Vec<(i64, i64)> = events.try_iter().filter_map(|e| match e {
+        crate::bridge::Event::Error { req_id, code, .. } => Some((req_id, code)),
+        _ => None,
+    }).collect();
+    assert_eq!(on_channel, [(5, 10167), (6, 354)]);
     let at = |e: &str| w.events.iter().position(|x| x == e);
     let mdt = at("market_data_type:5:3").expect("type 3");
     let delayed = at("error:5:10167:Requested market data is not subscribed. Displaying delayed market data.").expect("10167");
@@ -3510,6 +3518,22 @@ fn req_market_rule_answers_known_rules_and_refuses_others() {
         "error:-1:322:Error processing request.-'cd' : cause - Market rule with id = 999999 is missing".to_string(),
         "error:-1:322:Error processing request.-'cd' : cause - Price increment rule for market rule with id = 5 is missing".to_string(),
     ]);
+}
+
+// ibx#498: an error the client answers itself (here the market rule
+// lookup) also goes to an attached event channel.
+#[test]
+fn an_error_answered_by_the_client_goes_to_the_event_channel() {
+    let (client, _rx, shared) = test_client();
+    let (tx, events) = crossbeam_channel::unbounded();
+    shared.attach_event_channel(&tx);
+    let mut w = RecordingWrapper::default();
+    client.req_market_rule(999999, &mut w);
+    assert_eq!(w.events.len(), 1);
+    match events.try_recv() {
+        Ok(crate::bridge::Event::Error { req_id: -1, code: 322, message }) => assert!(message.ends_with("999999 is missing")),
+        other => panic!("the 322 was expected on the channel: {other:?}"),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -6550,6 +6574,80 @@ fn req_current_time_adds_the_logon_clock_offset() {
     let local = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
     assert_eq!(w.0.len(), 1);
     assert!((w.0[0] - local - 60).abs() <= 1, "{} vs local {}", w.0[0], local);
+}
+
+// ibx#516: the time in milliseconds comes from the clock of the time in
+// seconds.
+#[test]
+fn req_current_time_in_millis_adds_the_logon_clock_offset() {
+    #[derive(Default)]
+    struct Time(Vec<i64>);
+    impl Wrapper for Time {
+        fn current_time_in_millis(&mut self, time_in_millis: i64) { self.0.push(time_in_millis); }
+    }
+    let (client, _rx, shared) = test_client();
+    shared.reference.clock().set(60_000);
+    let mut w = Time::default();
+    client.req_current_time_in_millis(&mut w);
+    let local = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    assert_eq!(w.0.len(), 1);
+    assert!((w.0[0] - local - 60_000).abs() <= 1_000, "{} vs local {}", w.0[0], local);
+}
+
+// ibx#516: the requests a session of the reference does not have give the
+// answers of the reference run of 10/10/2026, and send nothing.
+#[test]
+fn requests_the_reference_session_does_not_have() {
+    let (client, rx, shared) = test_client();
+    client.cancel_contract_data(7001);
+    client.cancel_historical_ticks(7003);
+    client.verify_request("app", "1.0");
+    client.verify_message("data");
+    client.verify_and_auth_request("app", "1.0", "key");
+    client.verify_and_auth_message("data", "response");
+    assert!(rx.try_recv().is_err(), "nothing goes to the engine");
+    assert_eq!(shared.orders.drain_order_errors(), [
+        (7001, 503, "The TWS is out of date and must be upgraded.  It does not support contract data cancels.".to_string()),
+        (7003, 503, "The TWS is out of date and must be upgraded.  It does not support historical ticks cancels.".to_string()),
+        (-1, 544, "Verify Request Sending Error -   Intent to authenticate needs to be expressed during initial connect request.".to_string()),
+        (-1, 10095, "ApiVerify error:ApiVerifyMessage ignored. Message sequence error. State: verifyStatus=NONE, verifyInProgress=false".to_string()),
+        (-1, 551, "Verify And Auth Request Sending Error -   Intent to authenticate needs to be expressed during initial connect request.".to_string()),
+    ]);
+}
+
+// ibx#561: on a paced session a market data request asks for its slot
+// first, which the engine tells at once, and sends its subscribe with no
+// reply to wait for.
+#[test]
+fn a_paced_market_data_request_does_not_wait_for_its_subscribe() {
+    let shared = Arc::new(SharedState::new());
+    let (raw_tx, rx) = crossbeam_channel::unbounded();
+    let tx = crate::engine::park::ControlSender::new(raw_tx, None, None);
+    let core = crate::client_core::ClientCore::new();
+    let engine = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        while let Ok(cmd) = rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            match cmd {
+                ControlCommand::MarketDataSlot { con_id, reply_tx, .. } => {
+                    seen.push(format!("slot {con_id}"));
+                    let _ = reply_tx.send(Ok(7));
+                }
+                // Never answered: the call must not wait for it.
+                ControlCommand::Subscribe { con_id, reply_tx, .. } => {
+                    seen.push(format!("subscribe {con_id} reply {}", reply_tx.is_some()));
+                }
+                other => seen.push(format!("{other:?}").chars().take(20).collect()),
+            }
+        }
+        seen
+    });
+    let started = std::time::Instant::now();
+    let slot = core.register_mkt_data(&shared, &tx, 1, 265598, "AAPL", "SMART", "STK", "USD", &Default::default(), false, "mdoff", 0)
+        .unwrap();
+    assert_eq!(slot, Some(7));
+    assert!(started.elapsed() < std::time::Duration::from_millis(200), "{:?}", started.elapsed());
+    drop(tx);
+    assert_eq!(engine.join().unwrap(), ["slot 265598", "subscribe 265598 reply false"]);
 }
 
 // Without SECDEFTA in the logon feature list, a matching symbols request
