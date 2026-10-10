@@ -27,6 +27,17 @@
 IBX connects directly to Interactive Brokers servers — without requiring the official Java Gateway. Built in Rust for ultra-low-latency, available as both a Rust library and a Python library via PyO3. Both expose an ibapi-compatible `EClient`/`Wrapper` API.
 
 For opt-in historical response validation, see [strict historical parsing](docs/strict-history.md).
+## Local patch
+
+This local branch carries our bounded paper/live mobile-push login/lifecycle and opt-in strict
+history patch. See [the contract, limits and offline validation](docs/local-patch.md).
+Direct backend production adoption remains gated. Our fork uses `main` for
+development/integration and `main-upstream` as a pristine upstream mirror.
+Our checkpoint and contribution history is maintained centrally in
+[rust-library1/docs/ibx-changelog.md](https://github.com/mjarvel/rust-library1/blob/main/docs/ibx-changelog.md).
+The existing fork workflow/validation notes describe earlier dated arrangements;
+current shared Git rules govern new work.
+
 
 ## Benchmarks
 
@@ -282,3 +293,5 @@ This approach is consistent with the principle of **interoperability through pro
 ### EU Interoperability
 
 For users and contributors in the European Union: Article 6 of the EU Software Directive (2009/24/EC) permits reverse engineering for the purpose of achieving interoperability with independently created software, provided that specific conditions are met. IBX was developed with this legal framework in mind, enabling interoperability with IB's trading infrastructure on platforms where the official Java-based Gateway cannot run (headless Linux, containers, embedded systems).
+
+Local fork reconciliation results and remaining production gates: [checkpoint](docs/reconciliation-checkpoint.md).

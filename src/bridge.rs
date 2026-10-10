@@ -679,6 +679,9 @@ pub enum MdReject {
     /// A subscription given without a conId whose lookup found no single
     /// contract: error 200, the subscription is gone (ibx#278).
     NoSecurityDefinition { instrument: InstrumentId },
+    /// The controlled session cannot serve this route. The request ends with
+    /// a local error; the initialized farms and the session remain available.
+    UnsupportedRoute { instrument: InstrumentId },
     /// A request with the news tick refused once its contract was known:
     /// error 10094 with this text, nothing was sent (ibx#458). `con_id`:
     /// its contract.
@@ -699,6 +702,7 @@ impl MdReject {
             MdReject::Delayed { instrument }
             | MdReject::NotSubscribed { instrument, .. }
             | MdReject::NoSecurityDefinition { instrument }
+            | MdReject::UnsupportedRoute { instrument }
             | MdReject::NewsRefused { instrument, .. }
             | MdReject::Frozen { instrument, .. }
             | MdReject::Live { instrument, .. } => instrument,
