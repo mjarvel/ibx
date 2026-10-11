@@ -26,6 +26,8 @@ pub struct StrictHistoricalBar {
     pub time_average: Option<f64>,
     /// Nonnegative trade count; absent, empty and the unset sentinel become None.
     pub count: Option<u32>,
+    /// Original optional empty-bar marker; no price or statistic is inferred.
+    pub empty: Option<String>,
 }
 
 /// One validated response, without inferred coverage or timestamp conversion.
@@ -35,6 +37,14 @@ pub struct StrictHistoricalResponse {
     pub query_id: String,
     /// Original timezone text, or an empty string when absent.
     pub timezone: String,
+    /// Original optional approximate-step text, without duration conversion.
+    pub approx_step: Option<String>,
+    /// Original optional data-family text, without request-dependent interpretation.
+    pub data: Option<String>,
+    /// Optional finite reported price increment, without scaling bar prices.
+    pub min_tick: Option<f64>,
+    /// Optional finite reported size increment, without scaling bar statistics.
+    pub size_min_tick: Option<f64>,
     /// Validated bars in their original order.
     pub bars: Vec<StrictHistoricalBar>,
     /// Whether this response explicitly identifies itself as the final response.
@@ -93,6 +103,10 @@ pub fn parse_bar_response_strict(
     }
     let mut query_id = None;
     let mut timezone = None;
+    let mut approx_step = None;
+    let mut data = None;
+    let mut min_tick = None;
+    let mut size_min_tick = None;
     let mut is_complete = None;
     let mut events = None;
     let mut fields = root.body;
@@ -100,6 +114,18 @@ pub fn parse_bar_response_strict(
         match field.name {
             "id" => set_once(&mut query_id, nonempty(field, "id")?, "id")?,
             "tz" => set_once(&mut timezone, scalar(field)?, "tz")?,
+            "approxStep" => set_once(
+                &mut approx_step,
+                nonempty(field, "approxStep")?,
+                "approxStep",
+            )?,
+            "data" => set_once(&mut data, nonempty(field, "data")?, "data")?,
+            "minTick" => set_once(&mut min_tick, finite(scalar(field)?, "minTick")?, "minTick")?,
+            "sizeMinTick" => set_once(
+                &mut size_min_tick,
+                finite(scalar(field)?, "sizeMinTick")?,
+                "sizeMinTick",
+            )?,
             "eoq" => {
                 let complete = match scalar(field)?.trim() {
                     "true" => true,
@@ -132,6 +158,10 @@ pub fn parse_bar_response_strict(
     Ok(StrictHistoricalResponse {
         query_id: query_id.to_owned(),
         timezone: timezone.unwrap_or("").to_owned(),
+        approx_step: approx_step.map(str::to_owned),
+        data: data.map(str::to_owned),
+        min_tick,
+        size_min_tick,
         bars,
         is_complete,
     })
@@ -294,7 +324,7 @@ fn finite(text: &str, field: &'static str) -> ParseResult<f64> {
 }
 
 fn parse_bar(body: &str) -> ParseResult<StrictHistoricalBar> {
-    let mut values = [None; 10];
+    let mut values = [None; 11];
     let names = [
         "time",
         "open",
@@ -306,6 +336,7 @@ fn parse_bar(body: &str) -> ParseResult<StrictHistoricalBar> {
         "count",
         "endTime",
         "timeAvg",
+        "empty",
     ];
     let mut fields = body;
     while let Some(field) = next_element(&mut fields)? {
@@ -365,6 +396,9 @@ fn parse_bar(body: &str) -> ParseResult<StrictHistoricalBar> {
             .map(|text| finite(text, "timeAvg"))
             .transpose()?,
         count,
+        empty: values[10]
+            .map(|_| required(10).map(str::to_owned))
+            .transpose()?,
     })
 }
 
@@ -399,6 +433,140 @@ mod tests {
     }
     fn parse(xml: &str) -> Result<StrictHistoricalResponse, StrictHistoryError> {
         parse_bar_response_strict(xml, 10, 10_000)
+    }
+
+    // Synthetic prices with the response shape captured during daily-bar testing.
+    const DAILY_METADATA: &str = "<approxStep>1d</approxStep><data>Last</data><minTick>0.01</minTick><sizeMinTick>1</sizeMinTick>";
+
+    fn with_metadata(metadata: &str, events: &str) -> String {
+        frame(events, "true").replace("<Events>", &format!("{metadata}<Events>"))
+    }
+
+    #[test]
+    fn strict_history_preserves_daily_response_metadata_and_empty_bar_marker() {
+        let events = format!(
+            "{}{}",
+            bar(
+                "20260827-13:30:00",
+                "<endTime>20260827-20:00:00</endTime><weightedAvg>10.153</weightedAvg><volume>4300</volume><count>20</count>"
+            ),
+            bar(
+                "20260930-13:30:00",
+                "<endTime>20260930-20:00:00</endTime><weightedAvg>10.12</weightedAvg><volume>0</volume><count>0</count><empty>yes</empty>"
+            )
+        );
+        let xml = with_metadata(DAILY_METADATA, &events);
+        let response = parse_bar_response_strict(&xml, 2, xml.len()).unwrap();
+        assert_eq!(response.approx_step.as_deref(), Some("1d"));
+        assert_eq!(response.data.as_deref(), Some("Last"));
+        assert_eq!(response.min_tick, Some(0.01));
+        assert_eq!(response.size_min_tick, Some(1.0));
+        assert_eq!(response.bars.len(), 2);
+        assert_eq!(response.bars[0].empty, None);
+        assert_eq!(response.bars[0].volume, Some(4300));
+        assert_eq!(response.bars[0].count, Some(20));
+        assert_eq!(response.bars[1].empty.as_deref(), Some("yes"));
+        assert_eq!(
+            response.bars[1].end_time.as_deref(),
+            Some("20260930-20:00:00")
+        );
+        assert_eq!(response.bars[1].volume, Some(0));
+        assert_eq!(response.bars[1].count, Some(0));
+        assert_eq!(response.bars[1].wap, Some(10.12));
+        // Metadata and empty bars do not bypass either caller limit.
+        assert_eq!(
+            parse_bar_response_strict(&xml, 1, xml.len()),
+            Err(StrictHistoryError::RowLimit)
+        );
+        assert_eq!(
+            parse_bar_response_strict(&xml, 2, xml.len() - 1),
+            Err(StrictHistoryError::ByteLimit)
+        );
+    }
+
+    #[test]
+    fn strict_history_optional_metadata_has_no_inferred_defaults_or_scaling() {
+        let response = parse(&frame(&bar("20261006", ""), "true")).unwrap();
+        assert_eq!(response.approx_step, None);
+        assert_eq!(response.data, None);
+        assert_eq!(response.min_tick, None);
+        assert_eq!(response.size_min_tick, None);
+        assert_eq!(response.bars[0].empty, None);
+        let response = parse(&with_metadata(
+            "<approxStep> 5s </approxStep><data> BidAsk </data><minTick>0.000005</minTick><sizeMinTick>0.5</sizeMinTick>",
+            &bar("20261006", "<volume>7</volume><empty> yes </empty>"))).unwrap();
+        assert_eq!(response.approx_step.as_deref(), Some(" 5s "));
+        assert_eq!(response.data.as_deref(), Some(" BidAsk "));
+        assert_eq!(response.min_tick, Some(0.000005));
+        assert_eq!(response.size_min_tick, Some(0.5));
+        assert_eq!(response.bars[0].empty.as_deref(), Some(" yes "));
+        assert_eq!(response.bars[0].open, -1.123456789);
+        assert_eq!(response.bars[0].volume, Some(7));
+    }
+
+    #[test]
+    fn strict_history_rejects_invalid_duplicate_or_nested_response_metadata() {
+        for (name, value) in [
+            ("approxStep", "1d"),
+            ("data", "Last"),
+            ("minTick", "0.01"),
+            ("sizeMinTick", "1"),
+        ] {
+            let field = format!("<{name}>{value}</{name}>");
+            assert_eq!(
+                parse(&with_metadata(&field.repeat(2), "")),
+                Err(StrictHistoryError::DuplicateField(name))
+            );
+            let nested = format!("<{name}><extra>{value}</extra></{name}>");
+            assert_eq!(
+                parse(&with_metadata(&nested, "")),
+                Err(StrictHistoryError::UnexpectedField)
+            );
+            assert!(parse(&with_metadata(&format!("<{name}/>"), "")).is_err());
+        }
+        for name in ["minTick", "sizeMinTick"] {
+            for value in ["NaN", "inf", "-inf", "overflow", "1e999"] {
+                assert_eq!(
+                    parse(&with_metadata(&format!("<{name}>{value}</{name}>"), "")),
+                    Err(StrictHistoryError::InvalidField(name))
+                );
+            }
+        }
+        assert_eq!(
+            parse(&with_metadata(
+                &format!("{DAILY_METADATA}<unknown>1</unknown>"),
+                ""
+            )),
+            Err(StrictHistoryError::UnexpectedField)
+        );
+    }
+
+    #[test]
+    fn strict_history_empty_marker_is_nonempty_scalar_and_occurs_at_most_once() {
+        for marker in ["<empty/>", "<empty> </empty>"] {
+            assert_eq!(
+                parse(&frame(&bar("20261006", marker), "true")),
+                Err(StrictHistoryError::MissingField("empty"))
+            );
+        }
+        assert_eq!(
+            parse(&frame(
+                &bar("20261006", "<empty>yes</empty><empty>yes</empty>"),
+                "true"
+            )),
+            Err(StrictHistoryError::DuplicateField("empty"))
+        );
+        assert_eq!(
+            parse(&frame(
+                &bar("20261006", "<empty><unknown/></empty>"),
+                "true"
+            )),
+            Err(StrictHistoryError::UnexpectedField)
+        );
+        assert_eq!(
+            parse(&frame(&bar("20261006", "<unknown>yes</unknown>"), "true")),
+            Err(StrictHistoryError::UnexpectedField)
+        );
     }
 
     #[test]

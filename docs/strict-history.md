@@ -12,6 +12,14 @@ validation uses a fixed-depth borrowed stack; no dependency is added.
 The result preserves the query identifier, timezone text, row order and original
 daily or intraday timestamps. Prices are finite `f64` values, including negative
 prices. Optional bar end timestamps and time averages remain distinct metadata.
+Optional response metadata is preserved explicitly: `approx_step` and `data`
+retain their original nonempty scalar text, while `min_tick` and `size_min_tick`
+retain finite numeric values. Missing metadata remains `None`; neither reported
+increment scales bar prices or statistics. No request-dependent units are inferred.
+The optional per-bar `empty` marker retains its original nonempty scalar text;
+its presence does not drop the bar, invent prices or replace zero statistics.
+All these fields reject duplicates and nested content.
+
 Volume and count are optional nonnegative integers: missing, empty and unset
 values become `None`, while real zero remains present. A weighted average of -1
 remains a raw price because interpretation depends on the requested price family.
@@ -27,5 +35,6 @@ completion after a parser failure. This function does not establish transport,
 account or broker acceptance.
 
 Validation uses captured responses already present in the upstream test suite,
+a synthetic daily response reproducing observed metadata and empty-bar markers,
 malformed input, byte/row boundaries and property tests. No broker connection is
 needed to run these tests.
