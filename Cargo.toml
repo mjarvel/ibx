@@ -53,6 +53,9 @@ num-traits = "0.2"
 num-integer = "0.1"
 rand = "0.9"
 
+# Nonblocking controlled TCP connect; already resolved through Tokio.
+socket2 = "0.6"
+
 # TLS
 native-tls = "0.2"
 # Controlled login avoids platform certificate-chain URL retrieval.

@@ -9,7 +9,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const CONNECT_SLICE: Duration = Duration::from_millis(100);
+// TCP needs a connection allowance distinct from stop/I/O polling.
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(5_000);
 /// Controlled blocking I/O wakes at least once per this poll interval.
 pub const CONTROLLED_IO_POLL: Duration = Duration::from_millis(100);
 /// Maximum retained login-stage buffer and aggregate input per ControlledIo.
@@ -17,6 +18,28 @@ pub const CONTROLLED_IO_POLL: Duration = Duration::from_millis(100);
 pub const LOGIN_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum individual NS/XYZ payload accepted during controlled login.
 pub const LOGIN_FRAME_BYTES: usize = 256 * 1024;
+
+/// Nonblocking connect reports pending differently on Windows and Unix.
+fn connect_in_progress(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::EINPROGRESS) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Networking::WinSock::{WSAEALREADY, WSAEINPROGRESS};
+        if matches!(
+            error.raw_os_error(),
+            Some(WSAEALREADY) | Some(WSAEINPROGRESS)
+        ) {
+            return true;
+        }
+    }
+    false
+}
 
 struct State {
     cancelled: bool,
@@ -279,8 +302,9 @@ impl ConnectionControl {
         self.check()?;
         Ok(stream)
     }
-    /// Establish a TCP socket from caller-provided addresses only. Each connect
-    /// is capped at 100ms and checked again before the socket enters authentication.
+    /// Establish a TCP socket from caller-provided addresses only. Each address
+    /// gets up to five seconds, capped by the remaining login deadline. Stop is
+    /// checked every 100ms while the same pending socket keeps connecting.
     pub(crate) fn connect_tcp(&self, host: &str, port: u16) -> io::Result<TcpStream> {
         self.check()?;
         let ips = self.owner.addresses.get(host).ok_or_else(|| {
@@ -302,15 +326,15 @@ impl ConnectionControl {
                     .map(|deadline| {
                         deadline
                             .saturating_duration_since(Instant::now())
-                            .min(CONNECT_SLICE)
+                            .min(CONNECT_TIMEOUT)
                     })
-                    .unwrap_or(CONNECT_SLICE)
+                    .unwrap_or(CONNECT_TIMEOUT)
             };
             if timeout.is_zero() {
                 self.cancel();
                 self.check()?;
             }
-            match TcpStream::connect_timeout(&SocketAddr::new(*ip, port), timeout) {
+            match self.connect_tcp_address(SocketAddr::new(*ip, port), timeout) {
                 Ok(socket) => {
                     // Windows shutdown on a clone can wait for an outstanding
                     // synchronous recv. Finite I/O polling is the stop bound.
@@ -343,6 +367,76 @@ impl ConnectionControl {
         }
         self.check()?;
         Err(last)
+    }
+    /// Poll the same pending socket. Its caller retains ownership through stop,
+    /// timeout and probe errors; no second connect operation is issued.
+    fn wait_for_connect<T>(
+        &self,
+        mut probe: impl FnMut() -> io::Result<Option<T>>,
+        timeout: Duration,
+    ) -> io::Result<T> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.check()?;
+            let ready = probe();
+            self.check()?;
+            if let Some(value) = ready? {
+                return Ok(value);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "controlled TCP address connection exceeded its time budget",
+                ));
+            }
+            // Lock across the cancel-state check and interruptible wait to avoid
+            // losing a stop notification between them.
+            let state = self.owner.signals.state.lock().unwrap();
+            if state.cancelled {
+                drop(state);
+                self.check()?;
+            } else {
+                let (state, _) = self
+                    .owner
+                    .signals
+                    .wake
+                    .wait_timeout(state, remaining.min(CONTROLLED_IO_POLL))
+                    .unwrap();
+                drop(state);
+            }
+        }
+    }
+
+    /// Initiate exactly one locally owned nonblocking socket for this address.
+    fn connect_tcp_address(&self, address: SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
+        self.check()?;
+        let socket = socket2::Socket::new(
+            socket2::Domain::for_address(address),
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )?;
+        socket.set_nonblocking(true)?;
+        match socket.connect(&address.into()) {
+            Ok(()) => {}
+            Err(error) if connect_in_progress(&error) => {}
+            Err(error) => return Err(error),
+        }
+        self.wait_for_connect(
+            || {
+                if let Some(error) = socket.take_error()? {
+                    return Err(error);
+                }
+                match socket.peer_addr() {
+                    Ok(_) => Ok(Some(())),
+                    Err(error) if error.kind() == io::ErrorKind::NotConnected => Ok(None),
+                    Err(error) => Err(error),
+                }
+            },
+            timeout,
+        )?;
+        socket.set_nonblocking(false)?;
+        Ok(socket.into())
     }
     /// Retain an unfinished engine handle after best-effort client drop.
     pub(crate) fn retain_worker(&self, handle: JoinHandle<()>) {
@@ -512,6 +606,120 @@ mod tests {
         );
         control.join_workers(Duration::from_secs(1)).unwrap();
     }
+    #[test]
+    fn pending_tcp_connect_can_complete_after_the_poll_interval() {
+        let control = control(Duration::from_secs(10));
+        let started = Instant::now();
+        let mut polls = 0;
+        control
+            .wait_for_connect(
+                || {
+                    polls += 1;
+                    Ok((started.elapsed() >= Duration::from_millis(250)).then_some(()))
+                },
+                CONNECT_TIMEOUT,
+            )
+            .unwrap();
+        assert!(polls > 1);
+        control.cancel();
+        control.join_workers(Duration::from_secs(1)).unwrap();
+    }
+
+    struct PendingConnectDrop(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for PendingConnectDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn stop_drops_a_pending_tcp_connect_before_its_five_second_budget() {
+        let control = control(Duration::from_secs(10));
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = PendingConnectDrop(dropped.clone());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let stopping_control = control.clone();
+        let stopper = thread::spawn(move || {
+            started_rx.recv().unwrap();
+            stopping_control.cancel();
+        });
+        let mut started_tx = Some(started_tx);
+        let stopped = Instant::now();
+        let error = control
+            .wait_for_connect(
+                move || {
+                    let _ = &guard;
+                    if let Some(tx) = started_tx.take() {
+                        tx.send(()).unwrap();
+                    }
+                    Ok(None::<()>)
+                },
+                CONNECT_TIMEOUT,
+            )
+            .unwrap_err();
+        stopper.join().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(stopped.elapsed() < Duration::from_secs(2));
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        control.join_workers(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn per_address_timeout_drops_pending_connect_without_cancelling_login() {
+        let control = control(Duration::from_secs(10));
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = PendingConnectDrop(dropped.clone());
+        let error = control
+            .wait_for_connect(
+                move || {
+                    let _ = &guard;
+                    Ok(None::<()>)
+                },
+                Duration::from_millis(250),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        control.check().unwrap(); // Next prepared IP remains eligible.
+        control.cancel();
+        control.join_workers(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn login_deadline_shortens_the_pending_tcp_address_budget() {
+        let control = control(Duration::from_secs(10));
+        let deadline_control = control.clone();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = PendingConnectDrop(dropped.clone());
+        let mut armed = false;
+        let stopped = Instant::now();
+        let error = control
+            .wait_for_connect(
+                move || {
+                    let _ = &guard;
+                    if !armed {
+                        // Arm after the probe started to avoid a scheduling race.
+                        deadline_control
+                            .owner
+                            .signals
+                            .state
+                            .lock()
+                            .unwrap()
+                            .deadline = Some(Instant::now() + Duration::from_millis(100));
+                        deadline_control.owner.signals.wake.notify_all();
+                        armed = true;
+                    }
+                    Ok(None::<()>)
+                },
+                CONNECT_TIMEOUT,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(stopped.elapsed() < Duration::from_secs(2));
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        control.join_workers(Duration::from_secs(1)).unwrap();
+    }
+
     #[test]
     fn deadline_closes_stalled_raw_socket_and_prevents_late_success() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
