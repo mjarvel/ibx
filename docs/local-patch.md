@@ -220,3 +220,29 @@ and parser-only contribution source are unchanged. Offline regressions cover a
 connect pending beyond 100ms, stop/deadline disposal and per-address exhaustion.
 The increased allowance does not establish live server reachability or successful
 login; the next user-run acceptance attempt must confirm that separately.
+
+## Pending TCP readiness correction (2026-10-11)
+
+The next user-run attempt at 02:27:15 exposed a defect in our preceding
+five-second connector: Windows peer_addr could already report the destination
+while TCP was still pending. The trace declared TCP success after 1.66ms; the
+first verified-TLS I/O then failed with WSAENOTCONN 10057. No authentication
+request or SRP exchange was reached. This defect was in our local correction.
+
+The same false success was reproduced offline against a closed loopback port,
+with a regression that failed before the correction. Windows now requires
+select write readiness (or exception readiness for failure) and SO_ERROR;
+Unix requires poll writability and SO_ERROR. A zero-time OS probe never blocks:
+the existing control condvar waits between probes on the same owned socket.
+The 5,000ms per-IP budget, login deadline and responsive Stop remain unchanged.
+Refusal never registers a stream or starts TLS, and the loopback/TLS/cancellation
+fixtures still exercise the actual connector. No live reachability is claimed.
+
+Windows completion semantics:
+https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-select
+
+Validation: the refused-port regression failed on the previous connector and
+passes after correction; all 20 lifecycle-related tests and the complete locked
+offline native library suite pass (1,906 passed, 6 ignored). Existing warnings
+remain. Windows is exercised; the Unix polling branch is reviewed but was not
+compiled or executed on this Windows host.

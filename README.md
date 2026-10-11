@@ -28,7 +28,8 @@ IBX connects directly to Interactive Brokers servers — without requiring the o
 
 For opt-in historical response validation, see [strict historical parsing](docs/strict-history.md).
 Controlled TCP login now allows 5,000ms per prepared IP while checking stop every
-100ms. See the connection allowance correction in docs/local-patch.md.
+100ms. OS writability and SO_ERROR now prove completion before TLS; a destination
+address alone is insufficient. See both connection corrections in docs/local-patch.md.
 
 ## Local patch
 
