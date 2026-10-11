@@ -27,7 +27,8 @@ Hostnames are at most 253 bytes; usernames at most 256 bytes and passwords at mo
 4096 bytes. Disabled certificate validation and challenge-response callbacks are rejected before effects.
 
 The control is single-use for physical login. All sockets are registered with an
-owned watchdog; TCP connects and blocking reads/writes poll at most every 100ms.
+owned watchdog. Each TCP address has a five-second connection allowance (or the
+remaining login budget), separate from 100ms stop checks and blocking I/O polls.
 `cancel()` signals stop without queue admission or synchronous socket shutdown.
 The watchdog aborts registered sockets. Short read timeouts preserve partial
 frame reads while allowing cancellation checks; idle drains expose those timeouts.
@@ -202,3 +203,20 @@ the actual controlled login primitives on registered loopback sockets and exerci
 cancellation, timeout, scoped farm joins and rejected callbacks before effects.
 They do not synthesize a complete successful Gateway login or claim real broker
 acceptance. Existing native HotLoop data/cache bounds remain a later milestone.
+
+## TCP connection allowance correction (2026-10-11)
+
+The user-run downloader trace showed DNS resolving cdc1.ibllc.com, followed by
+TCP timeout at 8.17.22.31:4001 after 100.37ms, before TLS/authentication. The old
+100ms stop-poll interval was incorrectly also the entire address connect budget.
+Controlled connect now gives each prepared IP 5,000ms, capped by the remaining
+login deadline. The already-resolved socket2 dependency starts one nonblocking
+connect. The owned login worker probes it across 100ms interruptible stop checks,
+without an async runtime, socket restart or hostname resolution. Pending sockets
+are owned locally and drop on
+stop/deadline/timeout. Successful sockets become blocking before the existing
+watchdog registration and 100ms read/write configuration. Legacy connect paths
+and parser-only contribution source are unchanged. Offline regressions cover a
+connect pending beyond 100ms, stop/deadline disposal and per-address exhaustion.
+The increased allowance does not establish live server reachability or successful
+login; the next user-run acceptance attempt must confirm that separately.
