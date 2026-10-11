@@ -246,3 +246,22 @@ passes after correction; all 20 lifecycle-related tests and the complete locked
 offline native library suite pass (1,906 passed, 6 ignored). Existing warnings
 remain. Windows is exercised; the Unix polling branch is reviewed but was not
 compiled or executed on this Windows host.
+
+## 2026-10-11 - observed daily historical response metadata
+
+The user-run downloader capture reached ResultSetBar with 24 daily bars. Our
+strict parser rejected approxStep; the same response also reports data, minTick,
+sizeMinTick and per-bar empty markers. Main now shares the contribution's strict
+parser, preserving these optional fields explicitly without defaults, scaling or
+bar omission. Unknown fields, duplicates, malformed values and caller limits
+still fail. See strict-history.md for the additive public result fields.
+
+The standalone captured response failed before correction and passes offline
+after it, including all 24 bars and five empty markers. The contribution's full
+offline suite passes (1,828 tests, 6 ignored). Main's integrated validation and
+exact revisions are recorded centrally in rust-library1/docs/ibx-changelog.md.
+This is offline parsing evidence; accepted broker output files remain pending.
+
+Integrated main validation passed offline and locked: 1,910 tests, 6 existing
+ignored tests. The main and native test-chain source trees differ only in
+the parser before this reconciliation and share the corrected parser afterward.
