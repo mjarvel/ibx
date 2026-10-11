@@ -265,3 +265,27 @@ This is offline parsing evidence; accepted broker output files remain pending.
 Integrated main validation passed offline and locked: 1,910 tests, 6 existing
 ignored tests. The main and native test-chain source trees differ only in
 the parser before this reconciliation and share the corrected parser afterward.
+
+
+## 2026-10-11 - tested source reconciliation and local checkpoint 101
+
+The user requested reconciliation of the historical test branch into main and a
+fresh frozen native checkpoint 101. Main already contains the same native source,
+manifest, lockfile and fixtures as the tested branch; this merge preserves main's
+more complete documentation while retaining both histories. Temporary dbg tracing
+is unapplied in preserved stashes. The upstream mirror and numerical 100 remain
+unchanged; this is local integration, not another upstream contribution.
+
+The user-run library/downloader chain established live DataOnly login and saved
+384 daily-stock outputs in its extended final session, without historical parser
+failures. At 06:02 recovery began and failed repeatedly until user shutdown at
+07:01; successful recovery and the cause of session loss are unproven. Other
+instrument types and futures/intraday live acceptance remain pending. The wrapper's
+failure-only XML archive is application-owned and is not a native parser fallback.
+Contributions are deferred; separate numbered records, validation and full hashes
+remain centrally in rust-library1/docs/ibx-changelog.md and docs/patches/ibx/.
+
+Reconciled native validation: 1,910 tests passed, six existing ignored, zero
+failures, offline/locked with test-support (38.90 seconds). Existing warnings
+remain. Checkpoint 101 will freeze this main revision in G:\repos\ibx-worktree-101;
+its final hash is recorded centrally after creation, never in the frozen copy.

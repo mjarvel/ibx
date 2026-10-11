@@ -36,7 +36,8 @@ address alone is insufficient. See both connection corrections in docs/local-pat
 
 This local branch carries our bounded paper/live mobile-push login/lifecycle and opt-in strict
 history patch. See [the contract, limits and offline validation](docs/local-patch.md).
-Direct backend production adoption remains gated. Our fork uses `main` for
+Basic user-run daily history is accepted; recovery and broader instrument coverage
+remain unproven. Direct backend production adoption remains gated. Our fork uses `main` for
 development/integration and `main-upstream` as a pristine upstream mirror.
 Our checkpoint and contribution history is maintained centrally in
 [rust-library1/docs/ibx-changelog.md](https://github.com/mjarvel/rust-library1/blob/main/docs/ibx-changelog.md).
