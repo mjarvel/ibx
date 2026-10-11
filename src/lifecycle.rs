@@ -41,6 +41,89 @@ fn connect_in_progress(error: &io::Error) -> bool {
     false
 }
 
+/// A destination address is not proof of connection completion on Windows.
+/// Only OS readiness plus SO_ERROR may publish the pending socket.
+#[cfg(windows)]
+fn tcp_connect_ready(socket: &socket2::Socket) -> io::Result<Option<()>> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        FD_SET, SOCKET_ERROR, TIMEVAL, WSAGetLastError, select,
+    };
+
+    let mut writable = FD_SET::default();
+    writable.fd_count = 1;
+    writable.fd_array[0] = socket.as_raw_socket() as _;
+    let mut failed = writable;
+    let timeout = TIMEVAL::default(); // Zero-time probe; the control condvar owns waiting.
+    // SAFETY: the borrowed socket remains alive; both fd sets and timeout are
+    // initialized, valid for this call, and contain exactly one socket.
+    let ready = unsafe {
+        select(
+            0,
+            std::ptr::null_mut(),
+            &mut writable,
+            &mut failed,
+            &timeout,
+        )
+    };
+    if ready == SOCKET_ERROR {
+        // SAFETY: obtain this thread's immediately preceding Winsock failure.
+        let error = io::Error::from_raw_os_error(unsafe { WSAGetLastError() });
+        return if error.kind() == io::ErrorKind::Interrupted {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    if ready == 0 {
+        return Ok(None);
+    }
+    if let Some(error) = socket.take_error()? {
+        return Err(error);
+    }
+    if failed.fd_count != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "controlled TCP connection failed without a socket error",
+        ));
+    }
+    Ok((writable.fd_count != 0).then_some(()))
+}
+
+#[cfg(unix)]
+fn tcp_connect_ready(socket: &socket2::Socket) -> io::Result<Option<()>> {
+    use std::os::fd::AsRawFd;
+
+    let mut descriptor = libc::pollfd {
+        fd: socket.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: descriptor is initialized, its borrowed socket remains alive,
+    // and the pointer covers one valid pollfd. Timeout zero never blocks.
+    let ready = unsafe { libc::poll(&mut descriptor, 1, 0) };
+    if ready < 0 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::Interrupted {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    if ready == 0 {
+        return Ok(None);
+    }
+    if let Some(error) = socket.take_error()? {
+        return Err(error);
+    }
+    if descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "controlled TCP connection failed without a socket error",
+        ));
+    }
+    Ok((descriptor.revents & libc::POLLOUT != 0).then_some(()))
+}
 struct State {
     cancelled: bool,
     login_claimed: bool,
@@ -422,19 +505,7 @@ impl ConnectionControl {
             Err(error) if connect_in_progress(&error) => {}
             Err(error) => return Err(error),
         }
-        self.wait_for_connect(
-            || {
-                if let Some(error) = socket.take_error()? {
-                    return Err(error);
-                }
-                match socket.peer_addr() {
-                    Ok(_) => Ok(Some(())),
-                    Err(error) if error.kind() == io::ErrorKind::NotConnected => Ok(None),
-                    Err(error) => Err(error),
-                }
-            },
-            timeout,
-        )?;
+        self.wait_for_connect(|| tcp_connect_ready(&socket), timeout)?;
         socket.set_nonblocking(false)?;
         Ok(socket.into())
     }
@@ -604,6 +675,31 @@ mod tests {
             control.connect_tcp("localhost", 1).unwrap_err().kind(),
             io::ErrorKind::Interrupted
         );
+        control.join_workers(Duration::from_secs(1)).unwrap();
+    }
+    #[test]
+    fn refused_tcp_connect_never_becomes_a_registered_stream() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener); // A local closed port exercises the pending-connect failure path.
+        let control = control(Duration::from_secs(10));
+        let result = control.connect_tcp("localhost", port);
+        assert!(
+            result.is_err(),
+            "a pending/refused TCP connection must not be published as connected"
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionRefused);
+        assert!(
+            control
+                .owner
+                .signals
+                .state
+                .lock()
+                .unwrap()
+                .sockets
+                .is_empty()
+        );
+        control.cancel();
         control.join_workers(Duration::from_secs(1)).unwrap();
     }
     #[test]
