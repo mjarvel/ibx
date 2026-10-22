@@ -1,7 +1,7 @@
 //! Order-path tests against the real server on the paper account, through `EClient`.
 //!
 //! Covers the order paths fixed in ibx#240 ibx#225 ibx#247 ibx#324 ibx#334
-//! ibx#339 ibx#349 ibx#313 ibx#318 ibx#405 ibx#325 ibx#327 ibx#250 ibx#328 ibx#263. Each case checks
+//! ibx#339 ibx#349 ibx#313 ibx#318 ibx#405 ibx#325 ibx#327 ibx#250 ibx#328 ibx#263 ibx#717. Each case checks
 //! the server's own reply (captured from the engine's wire trace), not only
 //! that `place_order` returned: the replace confirmation must carry the new
 //! values, a bracket child must be cancelled by the server with its parent
@@ -59,7 +59,7 @@ fn wire() -> &'static WireLog {
 type Frame = Vec<(u32, String)>;
 
 fn parse_frame(line: &str) -> Frame {
-    // "WIRE> seq=N 8=FIX..|..." or "WIRE< ccp/comp 8=FIX..|..."
+    // "WIRE> seq=N <text frame>" or "WIRE< ccp/comp <text frame>"
     let body = line.find("8=").map(|i| &line[i..]).unwrap_or("");
     body.split('|')
         .filter_map(|f| {
@@ -83,7 +83,7 @@ fn frames(outbound: bool, msg_type: &str, clord: &str) -> Vec<Frame> {
         .collect()
 }
 
-/// The new orders sent for the API order id `id` (6121, ibx#466).
+/// The new orders sent for the API order id `id` (ibx#466).
 fn new_orders(id: i64) -> Vec<Frame> {
     let id = id.to_string();
     wire().lines.lock().unwrap().iter()
@@ -93,7 +93,7 @@ fn new_orders(id: i64) -> Vec<Frame> {
         .collect()
 }
 
-/// The ClOrdID of the order of API order id `id` at `version`: the server
+/// The client id of the order of API order id `id` at `version`: the server
 /// id its new order went out under, from the order id generator (ibx#466).
 fn clord_of(id: i64, version: u32) -> String {
     let server = new_orders(id).first()
@@ -121,6 +121,9 @@ struct State {
     /// Every order callback in arrival order ("status:<id>:<status>",
     /// "error:<id>:<code>").
     sequence: Vec<String>,
+    /// The order ids of the openOrder rows, and the openOrderEnd count.
+    open_rows: Vec<i64>,
+    open_ends: usize,
 }
 
 struct Probe {
@@ -142,6 +145,12 @@ impl Wrapper for Probe {
         let mut s = self.state.lock().unwrap();
         s.errors.push((req_id, code, msg.into()));
         s.sequence.push(format!("error:{}:{}", req_id, code));
+    }
+    fn open_order(&mut self, order_id: i64, _contract: &Contract, _order: &Order, _state: &ibx::api::types::OrderState) {
+        self.state.lock().unwrap().open_rows.push(order_id);
+    }
+    fn open_order_end(&mut self) {
+        self.state.lock().unwrap().open_ends += 1;
     }
 }
 
@@ -196,9 +205,11 @@ fn working(s: &State, id: i64) -> bool {
     matches!(last_status(s, id).as_deref(), Some("PreSubmitted" | "Submitted"))
 }
 
-/// 399 is an informational warning (order held until the open), not a refusal.
+/// 399 is an informational warning (order held until the open), not a
+/// refusal; nor is 10349, the time in force taken from the order preset
+/// for an order without one (ibx#660), after which the order goes on.
 fn refused(s: &State, id: i64) -> bool {
-    s.errors.iter().any(|(r, c, _)| *r == id && *c != 399)
+    s.errors.iter().any(|(r, c, _)| *r == id && *c != 399 && *c != 10349)
         || last_status(s, id).as_deref() == Some("Inactive")
 }
 
@@ -213,7 +224,7 @@ fn get_config() -> Option<EClientConfig> {
     let username = env::var("IB_USERNAME").ok()?;
     let password = env::var("IB_PASSWORD").ok()?;
     let host = env::var("IB_HOST").unwrap_or_else(|_| "cdc1.ibllc.com".to_string());
-    Some(EClientConfig { username, password, host, paper: true, core_id: None })
+    Some(EClientConfig { username, password, host, paper: true, core_id: None, client_id: 0, copied_waits: false, code_provider: None })
 }
 
 // ── Scenarios ──
@@ -275,21 +286,21 @@ fn modifies(paper: &mut Paper, base: i64) {
         lmt_price: px, outside_rth: rth, tif: tif.into(), ..Default::default()
     };
     let stp = |aux: f64| Order {
-        action: "SELL".into(), order_type: "STP".into(), total_quantity: 1.0, aux_price: aux, ..Default::default()
+        action: "SELL".into(), order_type: "STP".into(), total_quantity: 1.0, aux_price: aux, tif: "DAY".into(), ..Default::default()
     };
     let stp_lmt = |l: f64, aux: f64| Order {
         action: "SELL".into(), order_type: "STP LMT".into(), total_quantity: 1.0,
-        lmt_price: l, aux_price: aux, ..Default::default()
+        lmt_price: l, aux_price: aux, tif: "DAY".into(), ..Default::default()
     };
     let trail = |aux: f64| Order {
-        action: "SELL".into(), order_type: "TRAIL".into(), total_quantity: 1.0, aux_price: aux, ..Default::default()
+        action: "SELL".into(), order_type: "TRAIL".into(), total_quantity: 1.0, aux_price: aux, tif: "DAY".into(), ..Default::default()
     };
     let trail_lmt = |aux: f64| Order {
         action: "SELL".into(), order_type: "TRAIL LIMIT".into(), total_quantity: 1.0,
-        aux_price: aux, lmt_price_offset: 0.50, trail_stop_price: 50.0, ..Default::default()
+        aux_price: aux, lmt_price_offset: 0.50, trail_stop_price: 50.0, tif: "DAY".into(), ..Default::default()
     };
     let trail_percent = |p: f64| Order {
-        action: "SELL".into(), order_type: "TRAIL".into(), total_quantity: 1.0, trailing_percent: p, ..Default::default()
+        action: "SELL".into(), order_type: "TRAIL".into(), total_quantity: 1.0, trailing_percent: p, tif: "DAY".into(), ..Default::default()
     };
     let gtd_stp = |aux: f64| Order {
         action: "SELL".into(), order_type: "STP".into(), total_quantity: 1.0, aux_price: aux,
@@ -341,7 +352,7 @@ fn modifies(paper: &mut Paper, base: i64) {
         paper.check(!sent.is_empty() && flag == rth,
             &format!("modify {}: outside-RTH sent only when set ({})", label, rth));
         let s = paper.state.lock().unwrap();
-        let err = s.errors.iter().any(|(r, c, _)| *r == id && *c != 399);
+        let err = s.errors.iter().any(|(r, c, _)| *r == id && *c != 399 && *c != 10349);
         drop(s);
         paper.check(!err, &format!("modify {}: no error", label));
     }
@@ -366,7 +377,7 @@ fn modifies(paper: &mut Paper, base: i64) {
 fn fractional(paper: &mut Paper, id: i64) {
     println!("  fractional quantity (order {})", id);
     let order = Order {
-        action: "BUY".into(), order_type: "LMT".into(), total_quantity: 1.5, lmt_price: 200.0, ..Default::default()
+        action: "BUY".into(), order_type: "LMT".into(), total_quantity: 1.5, lmt_price: 200.0, tif: "DAY".into(), ..Default::default()
     };
     paper.place(id, &order);
     let got = paper.pump(5, |s| s.errors.iter().any(|(r, c, _)| *r == id && *c == 10243));
@@ -381,13 +392,13 @@ fn algos(paper: &mut Paper, base: i64) {
         action: "SELL".into(), order_type: "LMT".into(), total_quantity: 1.0, lmt_price: 5000.0,
         algo_strategy: "Adaptive".into(),
         algo_params: vec![TagValue { tag: "adaptivePriority".into(), value: "Normal".into() }],
-        ..Default::default()
+        tif: "DAY".into(), ..Default::default()
     };
     let twap = Order {
         action: "SELL".into(), order_type: "LMT".into(), total_quantity: 1.0, lmt_price: 5000.0,
         algo_strategy: "Twap".into(),
         algo_params: vec![TagValue { tag: "allowPastEndTime".into(), value: "1".into() }],
-        ..Default::default()
+        tif: "DAY".into(), ..Default::default()
     };
     // The server refuses GTC for TWAP (and VWAP, ArrivalPx) itself.
     for (i, (label, child, tif)) in [("Adaptive child, GTC", adaptive, "GTC"), ("TWAP child, DAY", twap, "DAY")]
@@ -432,6 +443,10 @@ fn algos(paper: &mut Paper, base: i64) {
             TagValue { tag: "noTakeLiq".into(), value: "0".into() },
             TagValue { tag: "allowPastEndTime".into(), value: "1".into() },
         ],
+        // DAY: the server refuses GTC for VWAP, and an order without a
+        // time in force takes the preset's, GTC on the paper user's
+        // stock preset (seen 18/10/2026; ibx#660).
+        tif: "DAY".into(),
         ..Default::default()
     };
     paper.place(id, &vwap);
@@ -447,7 +462,7 @@ fn algos(paper: &mut Paper, base: i64) {
         action: "BUY".into(), order_type: "STP".into(), total_quantity: 1.0, aux_price: 5000.0,
         algo_strategy: "Adaptive".into(),
         algo_params: vec![TagValue { tag: "adaptivePriority".into(), value: "Normal".into() }],
-        ..Default::default()
+        tif: "DAY".into(), ..Default::default()
     };
     paper.place(id, &adaptive_stop);
     let up = paper.wait_working(&[id]);
@@ -480,12 +495,17 @@ fn conditions(paper: &mut Paper, base: i64) {
             }],
             conditions_cancel_order: cancel_order,
             conditions_ignore_rth: ignore_rth,
-            ..Default::default()
+            tif: "DAY".into(), ..Default::default()
         };
         paper.place(id, &order);
         let up = paper.wait_working(&[id]);
         paper.check(up, &format!("{}: accepted", label));
-        let ack = reply(&clord_of(id, 0), &["0", "A"]);
+        // The reply that carries the condition: a GTC order (the time in
+        // force of the paper user's stock preset, ibx#660) gets a first
+        // report without it, then a second with it (paper, 18/10/2026).
+        let ack = frames(false, "8", &clord_of(id, 0)).into_iter()
+            .filter(|f| field(f, 150).is_some_and(|e| e == "0" || e == "A"))
+            .find(|f| field(f, 6136).is_some());
         let flag = |on: bool| if on { "1" } else { "0" };
         paper.check(ack.as_ref().and_then(|f| field(f, 6136)) == Some("1"),
             &format!("{}: server confirms the condition", label));
@@ -497,7 +517,7 @@ fn conditions(paper: &mut Paper, base: i64) {
 
 /// ibx#250, ibx#486: a server reject reaches the caller as the Inactive
 /// status, then error 201 with the server's reason, then the status once
-/// more, as the reference (every 39=8 of the four-leg recordings of 26/09
+/// more, as the reference (every Rejected report of the four-leg recordings of 26/09
 /// to 02/10/2026, ib-agent captures/four-leg). The server refuses FOK on
 /// this route (ib-agent#192 C7).
 fn server_reject(paper: &mut Paper, id: i64) {
@@ -521,13 +541,13 @@ fn server_reject(paper: &mut Paper, id: i64) {
 }
 
 /// ibx#486: an order on a contract given without a conId: its contract is
-/// looked up by symbol first (35=c FixSecDefReqBySymbol before the 35=D),
+/// looked up by symbol first (a contract lookup by symbol before the new order),
 /// the order goes out with the conId found, and the server takes it.
 ///
-/// Only the frames after the place call are read, each parsed: the 35=D
-/// is found by its API order id (6121; its ClOrdID is the server id of the
+/// Only the frames after the place call are read, each parsed: the new order
+/// is found by its API order id (its client id is the server id of the
 /// order, ibx#466), the lookup by its message type, request name and
-/// symbol, its answer by the lookup's 320.
+/// symbol, its answer by the lookup's request id.
 fn order_by_symbol(paper: &mut Paper, id: i64) {
     println!("  order by symbol (order {})", id);
     let by_symbol = Contract { con_id: 0, ..aapl() };
@@ -548,8 +568,34 @@ fn order_by_symbol(paper: &mut Paper, id: i64) {
     }
 }
 
+/// ibx#738: an order whose contract's lookup finds nothing gets 200, is
+/// not listed by reqOpenOrders, and its cancel gives 10147, as the
+/// reference 10.51 (paper, 17/10/2026, market closed).
+fn refused_at_lookup(paper: &mut Paper, id: i64) {
+    println!("  refused at its lookup (order {})", id);
+    let nowhere = Contract { con_id: 0, symbol: "ZZQXJV".into(), ..aapl() };
+    let order = Order {
+        action: "BUY".into(), order_type: "LMT".into(), total_quantity: 1.0, lmt_price: 50.0,
+        tif: "DAY".into(), ..Default::default()
+    };
+    paper.placed.push(id);
+    if let Err(e) = paper.client.place_order(id, &nowhere, &order) {
+        paper.fail(&format!("order {}: place_order returned {}", id, e));
+    }
+    let got = paper.pump(20, |s| s.errors.iter().any(|(r, c, _)| *r == id && *c == 200));
+    paper.check(got, "refused at its lookup: error 200");
+    let ends = paper.state.lock().unwrap().open_ends;
+    paper.client.req_open_orders(&mut paper.probe);
+    paper.pump(10, |s| s.open_ends > ends);
+    let listed = paper.state.lock().unwrap().open_rows.contains(&id);
+    paper.check(!listed, "refused at its lookup: not listed by reqOpenOrders");
+    let _ = paper.client.cancel_order(id, "");
+    let gone = paper.pump(10, |s| s.errors.iter().any(|(r, c, _)| *r == id && *c == 10147));
+    paper.check(gone, "refused at its lookup: its cancel gives 10147");
+}
+
 /// The wire checks of [`order_by_symbol`] on the frames logged after the
-/// place call: one lookup by symbol, its answer, then the order's 35=D with
+/// place call: one lookup by symbol, its answer, then the order's new order message with
 /// the conId found.
 fn order_by_symbol_checks(lines: &[String], id: i64, symbol: &str, con_id: &str) -> Vec<(bool, String)> {
     let lines: Vec<(bool, Frame)> = lines.iter()
@@ -574,7 +620,7 @@ fn order_by_symbol_checks(lines: &[String], id: i64, symbol: &str, con_id: &str)
 }
 
 // The checks of the order by symbol on the frame shapes the engine logs
-// (offline): the 35=D is found by its API order id (6121), its ClOrdID
+// (offline): the new order is found by its API order id, its client id
 // being the server id of the order (ibx#466).
 #[test]
 fn order_by_symbol_checks_read_the_logged_frames() {
@@ -584,7 +630,7 @@ fn order_by_symbol_checks_read_the_logged_frames() {
     let order = format!("WIRE> seq=9 8=FIX.4.1|9=0215|35=D|34=000009|52=x|11=1288736441.0|44=100.00|1=DU1|6122=c|6121={id}|6119=0|38=1|40=2|55=AAPL|167=STK|54=1|59=0|100=BEST|6210=BEST|6008=265598|6088=Socket|15=USD|10=096|");
     let ok = |lines: Vec<String>| order_by_symbol_checks(&lines, id, "AAPL", "265598").iter().all(|(ok, _)| *ok);
     assert!(ok(vec!["log line".into(), lookup.into(), answer.into(), order.clone()]));
-    // The 35=D first, no answer, no conId, two lookups: each fails.
+    // The new order first, no answer, no conId, two lookups: each fails.
     assert!(!ok(vec![order.clone(), lookup.into(), answer.into()]));
     assert!(!ok(vec![lookup.into(), order.clone()]));
     assert!(!ok(vec![lookup.into(), answer.into(), order.replace("|6008=265598", "")]));
@@ -701,6 +747,101 @@ fn contract_id_on_new_orders(paper: &mut Paper) {
         &format!("contract id after the routing field on all {} new orders ({} missing)", sent.len(), missing));
 }
 
+/// ibx#609 ibx#717 (the reference 10.51, paper, 16/10/2026, market
+/// closed): a stop loss and a profit taker asked from the order preset,
+/// when the paper user's stock preset does not auto-attach them: 10355
+/// naming the profit taker, the status Cancelled, then 202; nothing is
+/// sent to the server. Should this step start to fail with a working
+/// parent, the stock preset now auto-attaches them: that is the case
+/// ibx#717 waits for.
+fn attached_from_preset(paper: &mut Paper, id: i64) {
+    println!("  attached orders from the preset (order {})", id);
+    let order = Order {
+        action: "BUY".into(), order_type: "LMT".into(), total_quantity: 1.0, lmt_price: 100.0,
+        tif: "DAY".into(), sl_order_id: (id + 1) as i32, sl_order_type: "PRESET".into(),
+        pt_order_id: (id + 2) as i32, pt_order_type: "PRESET".into(), ..Default::default()
+    };
+    let start = wire().lines.lock().unwrap().len();
+    paper.place(id, &order);
+    let notice = format!("error:{}:202", id);
+    let done = paper.pump(20, |s| s.sequence.iter().any(|e| *e == notice) || working(s, id));
+    let s = paper.state.lock().unwrap();
+    let seq: Vec<String> = s.sequence.iter().filter(|e| e.split(':').nth(1).and_then(|v| v.parse::<i64>().ok())
+        .is_some_and(|i| (id..id + 3).contains(&i))).cloned().collect();
+    let text_ok = s.errors.iter().any(|(r, c, m)| *r == id && *c == 10355 && m == "Cannot auto-attach Profit Taker. Preset is not defined.");
+    drop(s);
+    let sent = wire().lines.lock().unwrap()[start..].iter().filter(|l| l.starts_with("WIRE>")).map(|l| parse_frame(l))
+        .any(|f| field(&f, 35) == Some("D"));
+    paper.check(done, "attached orders from the preset: answered");
+    paper.check(seq == [format!("error:{id}:10355"), format!("status:{id}:Cancelled"), notice.clone()],
+        &format!("attached orders from the preset: 10355, Cancelled, 202 ({seq:?})"));
+    paper.check(text_ok, "attached orders from the preset: 10355 names the profit taker");
+    paper.check(!sent, "attached orders from the preset: nothing sent");
+}
+
+/// ibx#743, ibx#744, ibx#745 (the reference 10.51, paper, 18/10/2026,
+/// market closed): AAPL by conId on a made-up exchange gets 200 and is
+/// gone (not listed, its cancel 10147); a stock combo with outside RTH
+/// gets 2109 and is sent; PEG STK on AAPL gets 387 and is kept (its cancel
+/// gives Cancelled, 202 and 161).
+fn refusals_of_10_51(paper: &mut Paper, id: i64) {
+    println!("  refusals of 10.51 (orders {}..{})", id, id + 2);
+    let lmt = Order {
+        action: "BUY".into(), order_type: "LMT".into(), total_quantity: 1.0, lmt_price: 50.0,
+        tif: "DAY".into(), ..Default::default()
+    };
+    let nowhere = Contract { exchange: "XYZ".into(), ..aapl() };
+    paper.placed.push(id);
+    if let Err(e) = paper.client.place_order(id, &nowhere, &lmt) {
+        paper.fail(&format!("order {}: place_order returned {}", id, e));
+    }
+    let got = paper.pump(20, |s| s.errors.iter().any(|(r, c, _)| *r == id && *c == 200));
+    paper.check(got, "an exchange without a definition: error 200");
+    let ends = paper.state.lock().unwrap().open_ends;
+    paper.client.req_open_orders(&mut paper.probe);
+    paper.pump(10, |s| s.open_ends > ends);
+    let listed = paper.state.lock().unwrap().open_rows.contains(&id);
+    paper.check(!listed, "an exchange without a definition: not listed by reqOpenOrders");
+    let _ = paper.client.cancel_order(id, "");
+    let gone = paper.pump(10, |s| s.errors.iter().any(|(r, c, _)| *r == id && *c == 10147));
+    paper.check(gone, "an exchange without a definition: its cancel gives 10147");
+
+    let leg = |con_id, action: &str| ibx::api::types::ComboLeg {
+        con_id, ratio: 1, action: action.into(), exchange: "SMART".into(), ..Default::default()
+    };
+    let combo = Contract {
+        symbol: "AAPL,MSFT".into(), sec_type: "BAG".into(), exchange: "SMART".into(), currency: "USD".into(),
+        combo_legs: vec![leg(265598, "BUY"), leg(272093, "SELL")], ..Default::default()
+    };
+    let combo_order = Order {
+        lmt_price: -500.0, outside_rth: true,
+        smart_combo_routing_params: vec![TagValue { tag: "NonGuaranteed".into(), value: "1".into() }],
+        ..lmt.clone()
+    };
+    paper.placed.push(id + 1);
+    if let Err(e) = paper.client.place_order(id + 1, &combo, &combo_order) {
+        paper.fail(&format!("order {}: place_order returned {}", id + 1, e));
+    }
+    let warned = paper.pump(20, |s| s.errors.iter().any(|(r, c, _)| *r == id + 1 && *c == 2109));
+    paper.check(warned, "a combo with outside RTH: warning 2109");
+    // The warning is no refusal: the order goes on.
+    let sent = paper.pump(20, |s| working(s, id + 1));
+    paper.check(sent, "a combo with outside RTH: sent and working");
+
+    let peg_stk = Order { order_type: "PEG STK".into(), lmt_price: 0.0, ..lmt };
+    paper.place(id + 2, &peg_stk);
+    let got = paper.pump(20, |s| s.errors.iter().any(|(r, c, _)| *r == id + 2 && *c == 387));
+    paper.check(got, "PEG STK on a stock: error 387");
+    let _ = paper.client.cancel_order(id + 2, "");
+    let ended = paper.pump(10, |s| s.errors.iter().any(|(r, c, _)| *r == id + 2 && *c == 161));
+    let s = paper.state.lock().unwrap();
+    let seq: Vec<String> = s.sequence.iter().filter(|e| e.split(':').nth(1) == Some((id + 2).to_string().as_str())).cloned().collect();
+    drop(s);
+    paper.check(ended && seq == [format!("error:{}:387", id + 2), format!("status:{}:Cancelled", id + 2),
+        format!("error:{}:202", id + 2), format!("error:{}:161", id + 2)],
+        &format!("PEG STK on a stock: kept, its cancel gives Cancelled, 202, 161 ({seq:?})"));
+}
+
 #[test]
 #[ignore = "live: logs in to the paper account (IB_USERNAME / IB_PASSWORD)"]
 fn order_paths_paper() {
@@ -730,6 +871,9 @@ fn order_paths_paper() {
     order_by_symbol(&mut paper, base + 600);
     bracket_with_transmit_off(&mut paper, base + 700);
     global_cancel_after_ended_orders(&mut paper, base + 800);
+    attached_from_preset(&mut paper, base + 900);
+    refused_at_lookup(&mut paper, base + 1000);
+    refusals_of_10_51(&mut paper, base + 1100);
 
     println!("  cleanup: cancelling every order still working");
     // A modified order is placed twice under one id: cancel it once.

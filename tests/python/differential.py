@@ -3,8 +3,9 @@ of the same scenarios, as a CSV of differences.
 
 The ibx side is the callback log of a scenario run on the ibx target
 (``events.jsonl`` and ``run.jsonl`` of the run folder). The reference side is
-either the recorded scenarios of tests/fixtures/gw1040/scenarios (default) or
-the callback log of a run of the same scenarios on the reference.
+either the recorded scenarios (default: those of tests/fixtures/gw1051/scenarios,
+the reference 10.51, else a scenario's recording of gw1040) or the callback log
+of a run of the same scenarios on the reference.
 
     python tests/python/differential.py --ibx <run folder> [--reference <run folder>] [--out report.csv]
 
@@ -156,6 +157,51 @@ def _unset(name, index):
         return None
 
 
+def decimal_paths(name):
+    """The arguments, and the fields of the object arguments, that the official
+    library gives as Decimal (ibx#592): {argument: None or {field, ...}}."""
+    out = {}
+    try:
+        from decimal import Decimal
+    except ImportError:
+        return out
+    for p in _parameters(name):
+        if p.annotation is Decimal:
+            out[p.name] = None
+        elif inspect.isclass(p.annotation):
+            try:
+                fields = {k for k, x in vars(p.annotation()).items() if isinstance(x, Decimal)}
+            except Exception:
+                continue
+            if fields:
+                out[p.name] = fields
+    return out
+
+
+def logged_type(v):
+    """The type of a quantity as a callback log keeps it: a Decimal is
+    written as its text, a float as a number."""
+    if isinstance(v, str):
+        return "Decimal"
+    return type(v).__name__
+
+
+def quantity_types(name, names, args):
+    """{path + ':type': type} of the Decimal quantities of a callback."""
+    out = {}
+    paths = decimal_paths(name)
+    for arg_name, v in zip(names, args):
+        if arg_name not in paths or empty(v):
+            continue
+        if paths[arg_name] is None:
+            out[f"{arg_name}:type"] = logged_type(v)
+        elif isinstance(v, dict):
+            for field in sorted(paths[arg_name]):
+                if field in v and not empty(v[field]):
+                    out[f"{arg_name}.{field}:type"] = logged_type(v[field])
+    return out
+
+
 def completed(value, unset):
     """`value` with the fields it lacks taken from `unset`."""
     if not isinstance(value, dict) or not isinstance(unset, dict):
@@ -202,9 +248,13 @@ def read_run(folder):
 
 
 def find_recording(root, scenario):
-    """The latest recording of a scenario under the fixture folder."""
-    found = sorted(glob.glob(os.path.join(root, "*", scenario + ".api.jsonl")))
-    return found[-1] if found else None
+    """The latest recording of a scenario under the fixture folder, or under
+    the first of several folders that has one."""
+    for folder in ([root] if isinstance(root, str) else root):
+        found = sorted(glob.glob(os.path.join(folder, "*", scenario + ".api.jsonl")))
+        if found:
+            return found[-1]
+    return None
 
 
 def read_recording(path):
@@ -285,6 +335,8 @@ def comparable(call, session, strict_prices):
     raw_id = args[0] if args else None
     for i, (arg_name, v) in enumerate(zip(names, args)):
         flat(arg_name, completed(v, _unset(name, i)) if isinstance(v, dict) else v, fields)
+    # The type of the quantities, which the numbers hide (ibx#592).
+    fields.update(quantity_types(name, names, args))
     for path in list(fields):
         leaf = re.split(r"[.\]]", path)[-1] or path
         v = fields[path]
@@ -316,7 +368,12 @@ def comparable(call, session, strict_prices):
 
 def shape_of(call):
     name, args = call[0], call[1:]
-    return name, "|".join(str(args[i]) for i in SHAPE[name] if i < len(args))
+    key = "|".join(str(args[i]) for i in SHAPE[name] if i < len(args))
+    # The type of its quantities is part of a row's shape (ibx#592).
+    types = quantity_types(name, argument_names(name, len(args)), args)
+    if types:
+        key += "|" + ",".join(f"{k}={t}" for k, t in sorted(types.items()))
+    return name, key
 
 
 def listings_by_id(calls):
@@ -344,11 +401,38 @@ def text(v):
     return "" if v is None else str(v)
 
 
+def _perm(order):
+    return order.get("permId") if isinstance(order, dict) else None
+
+
+def own_state(calls):
+    """The calls without the state earlier runs left on the account (#489,
+    step 4): the completed orders, the executions answered to a request and
+    their commission reports, of orders the scenario did not place. Every
+    run of the day adds to them, so the two sides never list the same."""
+    perms = {_perm(c[3]) for c in calls if c[0] == "openOrder" and len(c) > 3}
+    perms |= {c[6] for c in calls if c[0] == "orderStatus" and len(c) > 6}
+    perms.discard(None)
+    perms.discard(0)
+    kept, exec_ids = [], set()
+    for c in calls:
+        if c[0] == "completedOrder" and len(c) > 2 and _perm(c[2]) not in perms:
+            continue
+        if c[0] == "execDetails" and len(c) > 3 and isinstance(c[3], dict):
+            if c[1] != -1 and _perm(c[3]) not in perms:
+                continue
+            exec_ids.add(c[3].get("execId"))
+        if c[0] == "commissionAndFeesReport" and len(c) > 1 and isinstance(c[1], dict) and c[1].get("execId") not in exec_ids:
+            continue
+        kept.append(c)
+    return kept
+
+
 def compare(reference, ours, strict_prices=False):
     """The difference rows of one scenario (without the scenario columns)."""
     rows = []
-    reference = [c for c in reference if c[0] not in LEFT_OUT]
-    ours = [c for c in ours if c[0] not in LEFT_OUT]
+    reference = [c for c in own_state(reference) if c[0] not in LEFT_OUT]
+    ours = [c for c in own_state(ours) if c[0] not in LEFT_OUT]
 
     def add(kind, callback, key, field="", ref="", ibx="", at_connect=False):
         rows.append({"kind": kind, "callback": callback, "key": key, "field": field,
@@ -440,14 +524,16 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ibx", required=True, help="folder of the ibx run (events.jsonl, run.jsonl)")
     ap.add_argument("--reference", help="folder of a run of the same scenarios on the reference")
-    ap.add_argument("--fixtures", default=os.path.join(here, "..", "fixtures", "gw1040", "scenarios"),
-                    help="recorded scenarios, used without --reference")
+    ap.add_argument("--fixtures", action="append",
+                    help="recorded scenarios, used without --reference; may be given more than once, the first"
+                         " folder with a scenario's recording is used (default: gw1051, then gw1040)")
     ap.add_argument("--strict-prices", action="store_true", help="both sides ran on the same day: compare the prices")
     ap.add_argument("--out", help="the CSV (default <ibx folder>/differences.csv)")
     a = ap.parse_args(argv)
     if not a.reference and _Official is None:
         raise SystemExit("the recorded scenarios need the official client library to complete their objects")
-    rows, lines = report(a.ibx, a.fixtures, a.reference, a.strict_prices)
+    fixtures = a.fixtures or [os.path.join(here, "..", "fixtures", v, "scenarios") for v in ("gw1051", "gw1040")]
+    rows, lines = report(a.ibx, fixtures, a.reference, a.strict_prices)
     out = a.out or os.path.join(a.ibx, "differences.csv")
     write_csv(rows, out)
     print("\n".join(lines))

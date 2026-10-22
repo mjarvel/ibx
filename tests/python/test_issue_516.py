@@ -50,31 +50,56 @@ def connected(offset=None):
 def test_current_time_in_millis_adds_the_logon_offset():
     c, w = connected(offset=60_000)
     c.req_current_time_in_millis()
+    c._test_dispatch_once()
     (kind, t), = w.events
     assert kind == "millis" and isinstance(t, int)
     assert abs(t - int(time.time() * 1000) - 60_000) <= 1_000
 
 
-def test_the_two_cancels_are_refused_for_their_request():
+def test_the_two_cancels_answer_nothing_at_session_level_225():
+    # Below level 215 the official client library refused them with 503
+    # (CONTRACT_DATA, HISTORICAL_TICKS); from 215 the reference 10.51 takes
+    # them and answers nothing (ibx#557, ibx#602).
     c, w = connected()
     c.cancel_contract_data(7001)
     c.cancel_historical_ticks(7003)
     c._test_dispatch_once()
-    assert w.events == [("error", 7001, 503, CONTRACT_DATA), ("error", 7003, 503, HISTORICAL_TICKS)]
+    assert w.events == []
 
 
 def test_the_verify_requests_answer_as_the_reference():
+    # Without the intent to verify: 544 and 551, and the session goes on.
     c, w = connected()
     c.verify_request("app", "1.0")
-    c.verify_message("data")
     c.verify_and_auth_request("app", "1.0", "key")
-    c.verify_and_auth_message("data", "response")
+    c.req_current_time_in_millis()
     c._test_dispatch_once()
-    assert w.events == [
-        ("error", -1, 544, VERIFY_REQUEST),
-        ("error", -1, 10095, VERIFY_MESSAGE),
-        ("error", -1, 551, VERIFY_AND_AUTH_REQUEST),
-    ]
+    assert w.events[:2] == [("error", -1, 544, VERIFY_REQUEST), ("error", -1, 551, VERIFY_AND_AUTH_REQUEST)]
+    assert [e[0] for e in w.events[2:]] == ["millis"]
+
+
+# A plain verify_message, or a verify request with the intent to verify
+# (extraAuth): no answer, and the session answers no more request, as the
+# reference 10.51 (ibx#556; paper, pre-market 20/10/2026, an official client
+# at level 225).
+def test_a_verify_message_leaves_the_session_unanswered():
+    for start in range(4):
+        c, w = connected()
+        if start == 0:
+            c.verify_message("data")
+        elif start == 1:
+            c.verify_and_auth_message("data", "response")
+        else:
+            c.extraAuth = True
+            assert c.extraAuth
+            if start == 2:
+                c.verify_request("app", "1.0")
+            else:
+                c.verify_and_auth_request("app", "1.0", "key")
+        c.req_current_time_in_millis()
+        c.verify_request("app", "1.0")
+        c._test_dispatch_once()
+        assert w.events == [], (start, w.events)
 
 
 def test_not_connected_gives_504():

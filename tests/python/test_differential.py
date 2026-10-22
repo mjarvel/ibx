@@ -41,6 +41,28 @@ def test_two_sessions_of_the_same_behaviour_have_no_difference():
     assert d.compare(run(1, 111), run(31, 999, "DU7654321", 250.5)) == []
 
 
+def test_the_state_earlier_runs_left_is_not_compared():
+    # #489 step 4: the completed orders and the executions of the day that
+    # the scenario did not place, and their commission reports, are left
+    # out; the scenario's own are kept.
+    other = {**ORDER, "permId": 555}
+    earlier = [
+        ["completedOrder", CONTRACT, other, {"status": "Filled"}],
+        ["execDetails", 9001, CONTRACT, {"execId": "e-old", "permId": 555, "orderId": 3}],
+        ["commissionAndFeesReport", {"execId": "e-old", "commissionAndFees": 1.0}],
+    ]
+    mine = [
+        ["completedOrder", CONTRACT, {**ORDER, "permId": 111}, {"status": "Cancelled"}],
+        ["execDetails", 9001, CONTRACT, {"execId": "e-mine", "permId": 111, "orderId": 1}],
+        ["commissionAndFeesReport", {"execId": "e-mine", "commissionAndFees": 1.0}],
+    ]
+    calls = run(1, 111)
+    kept = d.own_state(calls[:-1] + earlier + mine + calls[-1:])
+    assert [c for c in kept if c in earlier] == []
+    assert [c for c in kept if c in mine] == mine
+    assert d.compare(run(1, 111), run(1, 111)[:-1] + earlier + run(1, 111)[-1:]) == []
+
+
 def test_a_field_that_differs_is_one_row():
     ours = run(1, 111)
     ours[4][2] = "PreSubmitted"
@@ -72,7 +94,25 @@ def test_data_callbacks_are_compared_by_the_kinds_of_rows():
     reference, ours = run(1, 111), run(1, 111)
     reference += [["tickPrice", 5, 2, 1.0, {}], ["tickPrice", 5, 2, 2.0, {}]]
     ours += [["tickSize", 5, 0, 3.0]]
-    assert kinds(d.compare(reference, ours)) == [("shape", "tickPrice", "5|2", ""), ("shape", "tickSize", "5|0", "")]
+    assert kinds(d.compare(reference, ours)) == [("shape", "tickPrice", "5|2", ""), ("shape", "tickSize", "5|0|size:type=float", "")]
+
+
+def test_the_type_of_a_quantity_is_compared():
+    # The official library gives Decimal quantities, which a callback log
+    # writes as text; a float is written as a number (ibx#592).
+    reference, ours = run(1, 111), run(1, 111)
+    ours[4][3:5] = [0.0, 1.0]
+    rows = d.compare(reference, ours)
+    assert kinds(rows) == [("field", "orderStatus", "{id+0}", "filled:type"), ("field", "orderStatus", "{id+0}", "remaining:type")]
+    assert (rows[0]["reference"], rows[0]["ibx"]) == ("Decimal", "float")
+    # In an object, and in the shape of a data row.
+    theirs, mine = run(1, 111), run(1, 111)
+    mine[3][3] = {**mine[3][3], "totalQuantity": 1.0}
+    assert [r["field"] for r in d.compare(theirs, mine)] == ["order.totalQuantity:type"]
+    reference, ours = run(1, 111), run(1, 111)
+    reference += [["tickSize", 5, 0, "3"]]
+    ours += [["tickSize", 5, 0, 3.0]]
+    assert kinds(d.compare(reference, ours)) == [("shape", "tickSize", "5|0|size:type=Decimal", ""), ("shape", "tickSize", "5|0|size:type=float", "")]
 
 
 def test_a_price_that_is_set_against_one_that_is_not():
@@ -153,9 +193,9 @@ def test_a_scenario_on_the_login_of_its_batch_has_no_connect_notices(tmp_path):
 
 def test_the_class_named_by_an_error_321_is_left_out():
     theirs = [["error", 9, None, 321, "Error validating request.-'D' : cause - End date not supported", ""]]
-    ours = [["error", 9, None, 321, "Error validating request.-'bM' : cause - End date not supported", ""]]
+    ours = [["error", 9, None, 321, "Error validating request.-'ReqHistoricalData(20)' : cause - End date not supported", ""]]
     assert d.compare(theirs, ours) == []
-    ours[0][4] = "Error validating request.-'bM' : cause - Another text"
+    ours[0][4] = "Error validating request.-'ReqHistoricalData(20)' : cause - Another text"
     assert [r["field"] for r in d.compare(theirs, ours)] == ["errorString"]
 
 

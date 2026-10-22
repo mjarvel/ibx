@@ -30,8 +30,10 @@ impl EClient {
         // A contract with no exchange: 321, the reference's first check.
         // An invalid generic tick list of a request that is no snapshot:
         // 321 (ibx#450).
-        if let Some((code, text)) = crate::client_core::ClientCore::market_data_exchange_refusal(&contract.exchange, &contract.sec_type)
-            .or_else(|| self.core.generic_tick_list_refusal(generic_tick_list, snapshot, &contract.sec_type))
+        // A contract text the 10.51 reference refuses (ibx#658).
+        if let Some((code, text)) = crate::client_core::ClientCore::contract_text_refusal(&contract.to_api(), "MarketDataRequest")
+            .or_else(|| crate::client_core::ClientCore::market_data_exchange_refusal(&contract.exchange, &contract.sec_type))
+            .or_else(|| self.core.generic_tick_list_refusal(generic_tick_list, snapshot, &contract.sec_type, shared.reference.fundamentals_allowed()))
         {
             shared.orders.push_order_error(req_id, code, text);
             return Ok(());
@@ -60,7 +62,7 @@ impl EClient {
         if let Some((code, text)) = self.core.news_tick_refusal(&shared, generic_tick_list, contract.con_id, &contract.sec_type) {
             shared.orders.push_order_error(req_id, code, text);
             if !snapshot {
-                self.core.note_news_refused(&shared, req_id, contract.con_id);
+                self.core.note_news_refused(&shared, req_id, contract.con_id, std::time::Instant::now());
             }
             return Ok(());
         }
@@ -192,6 +194,9 @@ impl EClient {
         if self.core.unregister_tbt(req_id).is_some() {
             let tx = self.tx()?;
             send_cmd(py, &tx, ControlCommand::UnsubscribeTbt { req_id })?;
+        } else {
+            // No such request: 300, as the reference (ibx#720).
+            self.shared_state()?.orders.push_order_error(req_id, 300, format!("Can't find EId with tickerId:{}", req_id));
         }
         Ok(())
     }
@@ -203,6 +208,7 @@ impl EClient {
     fn req_ping(&self, py: Python<'_>) -> PyResult<()> {
         // One API request for the pacing, whatever it sends (ibx#565).
         let _request = crate::engine::park::one_request();
+        if self.core.requests_ignored() { return Ok(()); }
         let tx = self.tx()?;
         send_cmd(py, &tx, ControlCommand::Ping)?;
         Ok(())
@@ -256,16 +262,20 @@ impl EClient {
         // An empty exchange is refused by the engine, as the reference
         // refuses it (#452).
         let exchange = contract.exchange.clone();
-        let sec_type = if contract.sec_type.is_empty() { "STK".to_string() } else { contract.sec_type.clone() };
+        // A contract given by its conId alone keeps no type: the engine
+        // takes its definition's (ibx#678).
+        let sec_type = if contract.sec_type.is_empty() && contract.con_id == 0 { "STK".to_string() } else { contract.sec_type.clone() };
         let tx = self.tx()?;
-        send_cmd(py, &tx, ControlCommand::SubscribeDepth {
+        // A contract with no conId is looked up first (ibx#643): the
+        // reference serves the book of a stock given by symbol.
+        send_cmd(py, &tx, crate::client_core::ClientCore::resolve_first(req_id, &contract.to_api(), ControlCommand::SubscribeDepth {
             req_id,
             con_id: contract.con_id,
             exchange,
             sec_type,
             num_rows,
             is_smart_depth,
-        })?;
+        }))?;
         Ok(())
     }
 

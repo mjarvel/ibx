@@ -36,10 +36,10 @@ fn start(farm: Connection, ccp: Connection, hmds: Option<Connection>) -> Running
     let shared = Arc::new(SharedState::new());
     let (mut engine, control) = HotLoop::with_connections(
         shared.clone(), None, "DUXXXXXXX".into(), farm, ccp, hmds, None);
-    let handle = std::thread::spawn(move || {
+    let handle = std::thread::Builder::new().stack_size(super::ENGINE_STACK).spawn(move || {
         engine.run();
         engine
-    });
+    }).unwrap();
     Running { handle, control, shared }
 }
 
@@ -264,7 +264,7 @@ fn a_failed_reconnect_waits_for_the_backoff() {
     assert!(next >= Instant::now() + Duration::from_secs(50));
 }
 
-/// A 35=P message of one block: the server tag, then (type, value) ticks
+/// A binary tick message of one block: the server tag, then (type, value) ticks
 /// of 4 bytes each.
 fn tick_message(server_tag: u32, ticks: &[(u64, u64)]) -> Vec<u8> {
     let mut bits: Vec<bool> = Vec::new();

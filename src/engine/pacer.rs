@@ -36,6 +36,29 @@ pub(crate) fn is_request(cmd: &ControlCommand) -> bool {
     !matches!(cmd, ControlCommand::Unpaced(_)) && !is_aside(cmd)
 }
 
+/// A request that may start a contract lookup: market data or a request
+/// resolved first, given without a conId (ibx#662).
+pub(crate) fn may_look_up(cmd: &ControlCommand) -> bool {
+    matches!(cmd,
+        ControlCommand::SubscribeBySymbol { .. }
+        | ControlCommand::ResolveContract { .. }
+        | ControlCommand::Subscribe { con_id: 0, .. })
+}
+
+/// A request taken while an earlier request waits for its contract
+/// lookup: orders and market data cancels (ibx#662; the reference 10.51,
+/// paper, regular hours 13/10/2026: an order's lookup went out before the
+/// answer of the market data lookup before it, a historical request's
+/// after it; 14/10/2026: a cancel ended its request at the lookup's
+/// answer).
+pub(crate) fn passes_lookup_hold(cmd: &ControlCommand) -> bool {
+    matches!(cmd,
+        ControlCommand::Order(_)
+        | ControlCommand::OrderGroup(_)
+        | ControlCommand::HoldOrder { .. }
+        | ControlCommand::Unsubscribe { .. })
+}
+
 /// A command that belongs to no request's answer: the registration of a
 /// contract ahead of its request (the caller waits for its reply), and
 /// housekeeping. It is taken at once, also past requests that wait, so
@@ -45,9 +68,11 @@ pub(crate) fn is_aside(cmd: &ControlCommand) -> bool {
         ControlCommand::RegisterInstrument { .. }
         | ControlCommand::MarketDataSlot { .. }
         | ControlCommand::RegisterOrderContract { .. }
+        | ControlCommand::RegisterOrderSlot { .. }
         | ControlCommand::SetInstrumentCurrency { .. }
         | ControlCommand::UpdateParam { .. }
         | ControlCommand::DropSnapshot { .. }
+        | ControlCommand::PnlQuotes { .. }
         | ControlCommand::Ping
         | ControlCommand::Shutdown)
 }
@@ -89,12 +114,23 @@ pub(crate) struct Pacer {
     interval: Option<Interval>,
     /// No request waited at the last look.
     was_empty: bool,
+    /// Every request is handled at once, in its order (ibx#564).
+    off: bool,
 }
 
 impl Pacer {
+    /// Handle every request at once (`true`), or pace them again.
+    pub(crate) fn set_off(&mut self, off: bool) {
+        self.off = off;
+        self.interval = None;
+    }
+
     /// Whether the request at the head of the queue is handled now;
     /// `waiting` counts it and the requests behind it.
     pub(crate) fn admit(&mut self, now: Instant, waiting: usize) -> bool {
+        if self.off {
+            return true;
+        }
         let waiting = waiting.max(1);
         // The queue was empty at the last look and the last request is
         // done: the pacer was at rest when this one came.

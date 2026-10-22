@@ -3,7 +3,7 @@
 //! Maintains per-connection state: buffer, seq counter,
 //! HMAC sign/read IVs (chained per message).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 
@@ -18,15 +18,15 @@ const RECV_BUF_SIZE: usize = 32768;
 /// A framed message extracted from the connection buffer.
 #[derive(Debug)]
 pub enum Frame {
-    /// Standard FIX 4.1 message (checksum-terminated).
+    /// Standard wire message (checksum-terminated).
     Fix(Vec<u8>),
     /// Compressed message (may contain multiple inner messages).
     FixComp(Vec<u8>),
-    /// 8=O binary protocol message (length-delimited).
+    /// Binary frame (length-delimited).
     Binary(Vec<u8>),
-    /// 8=1 / 8=X control message (token-auth / encrypted control state).
-    /// Same length-prefixed framing as 8=O; not consumed downstream, but
-    /// extracted explicitly so it cannot clobber FIXCOMP frames queued behind
+    /// Control frame (token-auth / encrypted control state).
+    /// Same length-prefixed framing as a binary frame; not consumed downstream, but
+    /// extracted explicitly so it cannot clobber compressed frames queued behind
     /// it in the same recv slice (ibx#185).
     Control(Vec<u8>),
 }
@@ -222,7 +222,7 @@ pub(crate) fn write_controlled_tls(
 pub struct Connection {
     stream: Stream,
     buf: Vec<u8>,
-    /// FIX message sequence number (6-digit zero-padded).
+    /// Wire message sequence number (6-digit zero-padded).
     pub seq: u32,
     /// HMAC key for signing outbound messages.
     pub sign_key: Vec<u8>,
@@ -239,11 +239,17 @@ pub struct Connection {
     /// When set, a send never blocks the caller: what the socket does not
     /// take at once waits in `out` and goes out with `flush_queued`.
     queued_writes: bool,
+    /// While set, frames wait in `out` and leave together at `release`
+    /// (ibx#548).
+    held: bool,
     /// The first write error. The connection is unusable from then on: the
     /// owner drops it and reconnects; no frame is written again.
     write_error: Option<(io::ErrorKind, String)>,
     /// The first bounded receive failure. Retire the transport after it.
     limited_read_error: Option<(io::ErrorKind, String)>,
+    /// The session series of the request names of symbol lookups and
+    /// reference-data queries (ibx#698).
+    query_names: QueryNames,
     /// The socket is in non-blocking mode for good (ibx#530): a read with
     /// nothing to read returns at once. Set with the queued writes, on a
     /// socket only.
@@ -276,8 +282,10 @@ impl Connection {
             out: VecDeque::new(),
             out_pos: 0,
             queued_writes: false,
+            held: false,
             write_error: None,
             limited_read_error: None,
+            query_names: QueryNames::default(),
             nonblocking: false,
             bytes_in: 0,
         }
@@ -389,14 +397,14 @@ impl Connection {
             }
 
             // Find earliest message start among all recognized headers.
-            // 8=1 (token-auth state) and 8=X (encrypted control) share the
-            // length-prefixed, trailer-free framing of 8=O. Recognizing them
+            // Token-auth state and encrypted control frames share the
+            // length-prefixed, trailer-free framing of binary frames. Recognizing them
             // here keeps them out of the buf.clear() arm below, which would
-            // otherwise wipe any FIXCOMP frame queued behind them in the same
+            // otherwise wipe any compressed frame queued behind them in the same
             // recv slice (ibx#185).
             // A compressed frame is recognized above only at offset 0. Search
             // for it here too: with a stray byte in front ("\x01" seen live),
-            // the "8=FIX." search does not match "8=FIXCOMP", the buffer was
+            // the plain-message header search does not match the compressed one, the buffer was
             // cleared, and the lost signed frame put the read IV chain out of
             // step, garbling every later frame on the connection.
             let fix_pos = find_subsequence(&self.buf, b"8=FIX.");
@@ -411,7 +419,7 @@ impl Connection {
                 .min();
             let earliest = match earliest {
                 Some(e) => e,
-                // A read can end inside a frame header ("8=FIXC" seen live,
+                // A read can end inside a frame header (a cut header seen live,
                 // ibx#436 paper run of 04/10/2026): those bytes start the
                 // next frame and are kept; dropping them lost a compressed
                 // frame and the reply it held.
@@ -439,7 +447,7 @@ impl Connection {
                 continue;
             }
 
-            // 8=O binary protocol: length-delimited via tag 9
+            // Binary frame: length-delimited via the body length field
             if self.buf.starts_with(b"8=O\x01") {
                 if let Some(total) = binary_msg_length(&self.buf) {
                     if self.buf.len() >= total {
@@ -451,8 +459,8 @@ impl Connection {
                 break; // incomplete
             }
 
-            // 8=1 / 8=X control protocol: same length-delimited framing as 8=O
-            // (body length in tag 9, no checksum trailer). Extracted as Control
+            // Control frames: same length-delimited framing as binary frames
+            // (body length field, no checksum trailer). Extracted as Control
             // frames and ignored downstream (ibx#185).
             if self.buf.starts_with(b"8=1\x01") || self.buf.starts_with(b"8=X\x01") {
                 if let Some(total) = binary_msg_length(&self.buf) {
@@ -465,7 +473,7 @@ impl Connection {
                 break; // incomplete
             }
 
-            // FIX.4.1: length-delimited via tag 9, +7 for checksum "10=XXX\x01"
+            // Plain wire message: length-delimited via the body length, +7 for the checksum trailer
             if self.buf.starts_with(b"8=FIX.") {
                 if let Some(total) = fix_msg_length(&self.buf) {
                     if self.buf.len() >= total {
@@ -696,6 +704,10 @@ impl Connection {
         if self.write_error.is_some() {
             return Err(self.failed());
         }
+        if self.held {
+            self.out.push_back(frame);
+            return Ok(());
+        }
         if !self.queued_writes {
             return self.stream.write_all(&frame).map_err(|e| self.record_write_error(e));
         }
@@ -705,6 +717,35 @@ impl Connection {
         } else {
             Ok(())
         }
+    }
+
+    /// Keep the frames sent from now on, until [`Self::release`] writes
+    /// them together. The reference writes the orders it sends together
+    /// (a bracket) in one write, and the server then answers for them as
+    /// one group; written one by one, a millisecond apart, the parent was
+    /// answered and set working before its children were read (ibx#548,
+    /// paper 11/10/2026: the same three messages, another order of the
+    /// status reports).
+    pub fn hold(&mut self) {
+        self.held = true;
+    }
+
+    /// Write the frames kept since [`Self::hold`], in one write.
+    pub fn release(&mut self) -> io::Result<()> {
+        if !std::mem::take(&mut self.held) {
+            return Ok(());
+        }
+        if self.queued_writes {
+            return self.flush_queued();
+        }
+        if self.write_error.is_some() {
+            return Err(self.failed());
+        }
+        let all: Vec<u8> = self.out.drain(..).flatten().collect();
+        if all.is_empty() {
+            return Ok(());
+        }
+        self.stream.write_all(&all).map_err(|e| self.record_write_error(e))
     }
 
     /// Write what the socket takes now of the waiting frames, in order,
@@ -765,12 +806,28 @@ impl Connection {
         }
     }
 
-    /// Build a FIX message, sign it, and send it. Increments seq and chains sign IV.
+    /// Build a wire message, sign it, and send it. Increments seq and chains sign IV.
     ///
     /// State (seq, sign_iv) is committed once the frame is accepted. A write
     /// error makes the connection unusable: it is dropped and reconnected,
     /// the frame is never retried, as in the reference (ibx#254).
     pub fn send_fix(&mut self, fields: &[(u32, &str)]) -> io::Result<()> {
+        // A symbol lookup or a reference-data query takes the next name of
+        // the session series (ibx#698).
+        if let Some(renamed) = self.query_names.rename(fields) {
+            let fields: Vec<(u32, &str)> = renamed.iter().map(|(t, v)| (*t, v.as_str())).collect();
+            return self.send_fix_named(&fields);
+        }
+        self.send_fix_named(fields)
+    }
+
+    /// The internal name of a request the series renamed, from the name an
+    /// answer carries; another name as it is (ibx#698).
+    pub fn internal_name(&self, wire: &str) -> String {
+        self.query_names.internal(wire).unwrap_or(wire).to_string()
+    }
+
+    fn send_fix_named(&mut self, fields: &[(u32, &str)]) -> io::Result<()> {
         let next_seq = self.seq + 1;
         let msg = fix::fix_build(fields, next_seq);
         if log::log_enabled!(log::Level::Trace) {
@@ -790,7 +847,7 @@ impl Connection {
         Ok(())
     }
 
-    /// Build a FIX message outside the sequence count, sign it, and send it.
+    /// Build a wire message outside the sequence count, sign it, and send it.
     /// The sequence counter does not move.
     pub fn send_fix_unsequenced(&mut self, fields: &[(u32, &str)]) -> io::Result<()> {
         let msg = fix::fix_build(fields, 0);
@@ -930,11 +987,11 @@ fn partial_header_len(buf: &[u8]) -> usize {
 }
 
 /// Compute total length of a length-prefixed, trailer-free message whose
-/// tag-8 header is 4 bytes: `8=O\x01`, `8=1\x01`, or `8=X\x01`, each followed
-/// by `9=<body_len>\x01 ...`.
+/// header is 4 bytes (a binary frame or one of the two control frames), followed
+/// by the body length field and the body.
 fn binary_msg_length(data: &[u8]) -> Option<usize> {
-    // 4-byte tag-8 header ("8=O\x01" / "8=1\x01" / "8=X\x01"), then find 9=
-    let after_8 = 4; // "8=O\x01"
+    // 4-byte frame header (binary or control), then find the body length field
+    let after_8 = 4; // the 4-byte frame header
     let tag9_pos = find_subsequence(&data[after_8..], b"9=").map(|p| after_8 + p)?;
     let soh_pos = data[tag9_pos..].iter().position(|&b| b == SOH).map(|p| tag9_pos + p)?;
     let body_len: usize = std::str::from_utf8(&data[tag9_pos + 2..soh_pos])
@@ -947,8 +1004,8 @@ fn binary_msg_length(data: &[u8]) -> Option<usize> {
     (soh_pos + 1).checked_add(body_len)
 }
 
-/// Compute total length of a `8=FIX.4.1\x01 9=<body_len>\x01 ...` message.
-/// Includes the 7-byte checksum trailer `10=XXX\x01`.
+/// Compute total length of a plain wire message from its body length field.
+/// Includes the 7-byte checksum trailer.
 fn fix_msg_length(data: &[u8]) -> Option<usize> {
     let tag9_pos = find_subsequence(data, b"9=").filter(|&p| p < 20)?;
     let soh_pos = data[tag9_pos..].iter().position(|&b| b == SOH).map(|p| tag9_pos + p)?;
@@ -956,7 +1013,7 @@ fn fix_msg_length(data: &[u8]) -> Option<usize> {
         .ok()?
         .parse()
         .ok()?;
-    // header up to and including SOH after tag 9, + body + "10=XXX\x01" (7 bytes)
+    // header up to and including SOH after the body length, + body + checksum trailer (7 bytes)
     (soh_pos + 1 + 7).checked_add(body_len)
 }
 
@@ -1150,9 +1207,112 @@ mod mem {
     }
 }
 
+
+/// The names the reference gives its requests on the auth connection, in
+/// two session series (ibx#698; the reference 10.51's messages of 12/10 and
+/// 13/10/2026): its symbol lookups and reference-data queries share one,
+/// "FixSecDefReqBySymbol{n}" and "SubMsgXMLQuery{n}" (FixSecDefReqBySymbol14,
+/// SubMsgXMLQuery20, FixSecDefReqBySymbol21 ...); its lookups by conId share
+/// the other, each kind keeping its name ("...ReqByConid{n}": 1, 2, 3 ...).
+/// ibx names them internally by the request that asked; the internal name
+/// of the recent ones is kept for their answers.
+#[derive(Debug, Default)]
+struct QueryNames {
+    next: u32,
+    next_by_con_id: u32,
+    /// The wire names in the order sent, the oldest forgotten first.
+    sent: VecDeque<String>,
+    /// The internal name of each wire name kept.
+    internal: HashMap<String, String>,
+}
+
+impl QueryNames {
+    /// The names kept for answers: every request of a fan-out still
+    /// unanswered (an option chain sends about 71,000, answered up to half
+    /// a minute behind; with 4,096 kept most answers were lost, ibx#740).
+    const KEPT: usize = 1 << 18;
+    const PREFIXES: [&'static str; 2] = ["FixSecDefReqBySymbol", "SubMsgXMLQuery"];
+    const BY_CON_ID: &'static str = "ReqByConid";
+
+    /// The prefix of a name of the series and which series, None for
+    /// another name.
+    fn series(name: &str) -> Option<(&str, bool)> {
+        if let Some(p) = Self::PREFIXES.iter().find(|p| name.starts_with(**p)) {
+            return Some((p, false));
+        }
+        let end = name.find(Self::BY_CON_ID)? + Self::BY_CON_ID.len();
+        name[end..].bytes().all(|b| b.is_ascii_digit()).then(|| (&name[..end], true))
+    }
+
+    /// The fields with the request name of its series, None for a message
+    /// that is not such a request.
+    fn rename(&mut self, fields: &[(u32, &str)]) -> Option<Vec<(u32, String)>> {
+        if !matches!(fields.first(), Some((35, "c" | "U"))) {
+            return None;
+        }
+        let (at, prefix, by_con_id) = fields.iter().enumerate()
+            .find_map(|(i, &(t, v))| (t == 320).then(|| Self::series(v).map(|(p, c)| (i, p, c))).flatten())?;
+        let number = if by_con_id { &mut self.next_by_con_id } else { &mut self.next };
+        *number += 1;
+        let wire = format!("{prefix}{number}");
+        if self.sent.len() >= Self::KEPT && let Some(old) = self.sent.pop_front() {
+            self.internal.remove(&old);
+        }
+        self.sent.push_back(wire.clone());
+        self.internal.insert(wire.clone(), fields[at].1.to_string());
+        Some(fields.iter().enumerate()
+            .map(|(i, &(t, v))| (t, if i == at { wire.clone() } else { v.to_string() })).collect())
+    }
+
+    fn internal(&self, wire: &str) -> Option<&str> {
+        self.internal.get(wire).map(String::as_str)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ibx#698: symbol lookups and reference-data queries share one session
+    // series, as the reference numbers them; other messages keep their
+    // ids; an answer's name maps back to the internal one.
+    #[test]
+    fn lookups_and_queries_share_one_session_series() {
+        let mut names = QueryNames::default();
+        let name = |f: &Option<Vec<(u32, String)>>| f.as_ref().and_then(|v| v.iter().find(|(t, _)| *t == 320)).map(|(_, v)| v.clone());
+        let lookup = names.rename(&[(35, "c"), (320, "FixSecDefReqBySymbol101"), (55, "AAPL")]);
+        let query = names.rename(&[(35, "U"), (6040, "106"), (320, "SubMsgXMLQuery1"), (6256, "k")]);
+        let order_lookup = names.rename(&[(35, "c"), (320, "FixSecDefReqBySymbol3221225472")]);
+        assert_eq!([name(&lookup), name(&query), name(&order_lookup)],
+            [Some("FixSecDefReqBySymbol1".into()), Some("SubMsgXMLQuery2".into()), Some("FixSecDefReqBySymbol3".into())]);
+        assert_eq!(lookup.unwrap()[2], (55, "AAPL".to_string()), "the other fields as given");
+        // The by-conId lookups: their own series, each kind its name.
+        let by_con_id = names.rename(&[(35, "c"), (320, "PreferredReqByConid40")]);
+        let rule = names.rename(&[(35, "c"), (320, "getECsForConidExchangePairsReqByConid9")]);
+        assert_eq!([name(&by_con_id), name(&rule)],
+            [Some("PreferredReqByConid1".into()), Some("getECsForConidExchangePairsReqByConid2".into())]);
+        assert_eq!(names.internal("getECsForConidExchangePairsReqByConid2"), Some("getECsForConidExchangePairsReqByConid9"));
+        // Not renamed: another request name, another message type.
+        assert!(names.rename(&[(35, "c"), (320, "ibxrth4")]).is_none());
+        assert!(names.rename(&[(35, "D"), (320, "FixSecDefReqBySymbol5")]).is_none());
+        assert_eq!(names.internal("FixSecDefReqBySymbol1"), Some("FixSecDefReqBySymbol101"));
+        assert_eq!(names.internal("SubMsgXMLQuery2"), Some("SubMsgXMLQuery1"));
+        assert_eq!(names.internal("FixSecDefReqBySymbol3"), Some("FixSecDefReqBySymbol3221225472"));
+        assert_eq!(names.internal("FixSecDefReqBySymbol7"), None, "an unknown name is not mapped");
+    }
+
+    // ibx#740: every request of a whole option chain's fan-out keeps its
+    // name until answered (about 71,000, answered up to half a minute
+    // behind); 4,096 kept lost the answers of the older ones.
+    #[test]
+    fn a_whole_chain_of_names_is_kept() {
+        let mut names = QueryNames::default();
+        for i in 0..80_000 {
+            names.rename(&[(35, "c"), (320, &format!("getECsForConidExchangePairsReqByConid{}", i + 100))]);
+        }
+        assert_eq!(names.internal("getECsForConidExchangePairsReqByConid1"), Some("getECsForConidExchangePairsReqByConid100"));
+        assert_eq!(names.internal("getECsForConidExchangePairsReqByConid80000"), Some("getECsForConidExchangePairsReqByConid80099"));
+    }
     use crate::protocol::fix::fix_build;
     use crate::protocol::fixcomp::fixcomp_build;
 
@@ -1175,7 +1335,7 @@ mod tests {
 
     #[test]
     fn binary_msg_length_basic() {
-        // Build a minimal 8=O message
+        // Build a minimal binary frame
         let body = b"35=P\x01data";
         let msg = format!("8=O\x019={}\x01", body.len());
         let mut full = msg.into_bytes();
@@ -1226,7 +1386,7 @@ mod tests {
         let mut buf = o_full.clone();
         buf.extend_from_slice(&fix_msg);
 
-        // First message is 8=O
+        // First message is a binary frame
         assert!(buf.starts_with(b"8=O\x01"));
         let len1 = binary_msg_length(&buf).unwrap();
         assert_eq!(len1, o_full.len());
@@ -1277,6 +1437,29 @@ mod tests {
         match &mut conn.stream {
             Stream::Mem(t) => t,
             _ => unreachable!("an in-memory connection"),
+        }
+    }
+
+    // ibx#548: frames sent while the connection is held leave together at
+    // the release, in one write, in both write modes; nothing is written
+    // before.
+    #[test]
+    fn held_frames_leave_in_one_write() {
+        for queued in [false, true] {
+            let (mut conn, mut server) = loopback();
+            conn.set_queued_writes(queued);
+            conn.hold();
+            for frame in [&b"one|"[..], b"two|", b"three|"] {
+                conn.send_raw(frame).unwrap();
+            }
+            assert!(read_available(&mut server, 64).is_empty(), "queued {queued}: nothing before the release");
+            conn.release().unwrap();
+            assert_eq!(read_available(&mut server, 64), b"one|two|three|", "queued {queued}");
+            assert!(!conn.has_queued_output());
+            // Not held any more: a frame leaves at once; a release with nothing kept is nothing.
+            conn.send_raw(b"four|").unwrap();
+            conn.release().unwrap();
+            assert_eq!(read_available(&mut server, 64), b"four|", "queued {queued}");
         }
     }
 
@@ -1357,7 +1540,7 @@ mod tests {
 
     // A stray byte in front of a compressed frame used to clear the whole
     // buffer, losing the frame (seen live as "dropping 391B (no header)",
-    // first byte 0x01 then "8=FIXCOMP").
+    // first byte 0x01 then the compressed frame header).
     #[test]
     fn frame_extraction_stray_byte_before_fixcomp() {
         let inner = fix_build(&[(35, "Q")], 1);
@@ -1374,7 +1557,7 @@ mod tests {
     }
 
     // ibx#436: a read that ends inside the header of a compressed frame
-    // ("8=FIXC", seen live) keeps those bytes: the frame is read whole with
+    // (a cut header, seen live) keeps those bytes: the frame is read whole with
     // the next bytes, for every cut of its header.
     #[test]
     fn frame_extraction_header_cut_by_the_read_end() {
@@ -1476,7 +1659,7 @@ mod tests {
         }
     }
 
-    /// Build a length-prefixed, trailer-free control frame (`8=1` / `8=X`).
+    /// Build a length-prefixed, trailer-free control frame (token-auth or encrypted).
     fn build_control_frame(tag8: &str, body: &[u8]) -> Vec<u8> {
         let header = format!("8={}\x019={}\x01", tag8, body.len());
         let mut msg = header.into_bytes();
@@ -1486,7 +1669,7 @@ mod tests {
 
     #[test]
     fn frame_extraction_control_8_1() {
-        // 8=1 token-auth state message (35=X family). Mirrors ib-agent#152 slice 2.
+        // Token-auth state control frame. Mirrors ib-agent#152 slice 2.
         let msg = build_control_frame("1", b"35=X\x011137=ABCDEF\x01");
         let mut conn = test_connection_with_buf(msg.clone());
         let frames = conn.extract_frames();
@@ -1500,7 +1683,7 @@ mod tests {
 
     #[test]
     fn frame_extraction_control_8_x() {
-        // 8=X encrypted control / auth state-machine message.
+        // Encrypted control / auth state-machine control frame.
         let msg = build_control_frame("X", b"35=X\x01encctl\x01");
         let mut conn = test_connection_with_buf(msg.clone());
         let frames = conn.extract_frames();
@@ -1514,8 +1697,8 @@ mod tests {
 
     #[test]
     fn frame_extraction_control_then_fixcomp_zero_loss() {
-        // ibx#185 acceptance: an 8=1 control frame ahead of a FIXCOMP frame in
-        // the same buffer must NOT trigger buf.clear() — the FIXCOMP queued
+        // ibx#185 acceptance: a token-auth control frame ahead of a compressed frame in
+        // the same buffer must NOT trigger buf.clear() — the compressed frame queued
         // behind it has to survive byte-for-byte.
         let control = build_control_frame("1", b"35=X\x019=0045\x01PASSED\x01");
         let inner = fix_build(&[(35, "0")], 1);
@@ -1540,7 +1723,7 @@ mod tests {
 
     #[test]
     fn frame_extraction_incomplete_control() {
-        // A partial 8=1 frame must wait for more bytes, not drop the buffer.
+        // A partial token-auth control frame must wait for more bytes, not drop the buffer.
         let msg = build_control_frame("1", b"35=X\x01partialbodythatislong\x01");
         let half = msg.len() / 2;
         let buf = msg[..half].to_vec();

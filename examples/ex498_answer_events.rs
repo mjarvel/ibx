@@ -22,6 +22,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         username: env::var("IB_USERNAME")?, password: env::var("IB_PASSWORD")?,
         host: env::var("IB_HOST").unwrap_or_else(|_| "cdc1.ibllc.com".into()),
         paper: true, core_id: None,
+        client_id: 0,
+        copied_waits: false,
+        code_provider: None,
     }, 4096)?;
     println!("logged in paper (account {})", client.account_id);
 
@@ -36,7 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     client.req_historical_ticks(5, &aapl, "20261009 10:00:00 US/Eastern", "", 10, "TRADES", true, false, &[])?;
     client.req_scanner_parameters()?;
     client.req_account_summary(6, "All", "NetLiquidation");
-    // Answered by the client itself: its error has no queue.
+    // Answered by the client itself, from process_msgs at its place (ibx#532).
     client.req_market_rule(999_999, &mut Quiet);
 
     let expected = [

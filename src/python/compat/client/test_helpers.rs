@@ -23,6 +23,8 @@ impl EClient {
             return Err(PyRuntimeError::new_err("Already connected"));
         }
         let shared = Arc::new(SharedState::new());
+        // No logon: the client's copied waits are off (ibx#723).
+        shared.portfolio.set_pnl_first_wait_off();
         let (tx, rx) = match control_capacity {
             Some(n) => crossbeam_channel::bounded(n),
             None => crossbeam_channel::unbounded(),
@@ -103,7 +105,7 @@ impl EClient {
             })).collect::<PyResult<Vec<MdStep>>>()?),
             None => None,
         };
-        let message = TestMessage { steps: steps.as_deref(), halted, auto_bits, sizes_seen };
+        let message = TestMessage { steps: steps.as_deref(), halted, auto_bits, sizes_seen, pre_open: None };
         shared.market.push_test_message(instrument, &q, &message);
         Ok(())
     }
@@ -146,10 +148,14 @@ impl EClient {
     /// Run the second-factor code provider built from `callable` the way the
     /// login runs it: on its own thread, with the interpreter lock released
     /// by the caller (ibx#208).
+    /// The factor's details too (ibx#350).
     #[doc(hidden)]
-    fn _test_code_provider(&self, py: Python<'_>, callable: Py<PyAny>, display_id: String, avth_url: String) -> PyResult<String> {
+    #[pyo3(signature = (callable, display_id, avth_url, kind=String::new(), message=String::new(), image=Vec::new(), delivery=String::new()))]
+    #[allow(clippy::too_many_arguments)]
+    fn _test_code_provider(&self, py: Python<'_>, callable: Py<PyAny>, display_id: String, avth_url: String,
+        kind: String, message: String, image: Vec<u8>, delivery: String) -> PyResult<String> {
         let provider = super::python_code_provider(callable);
-        let challenge = crate::auth::session::IbKeyChallenge { display_id, avth_url };
+        let challenge = crate::auth::session::IbKeyChallenge { display_id, avth_url, kind, message, image, delivery };
         py.detach(|| std::thread::spawn(move || provider(challenge)).join())
             .map_err(|_| PyRuntimeError::new_err("code provider thread panicked"))?
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -215,10 +221,10 @@ impl EClient {
             "Rejected" => OrderStatus::Rejected,
             _ => return Err(PyRuntimeError::new_err(format!("Invalid status: {}", status))),
         };
-        shared.orders.push_completed_order(crate::types::CompletedOrder {
-            order_id, instrument, status: st, filled_qty_fixed: filled_qty * QTY_SCALE, timestamp_ns: 100,
-        });
-        shared.orders.push_order_info(order_id, crate::bridge::RichOrderInfo {
+        let _ = (instrument, st, filled_qty);
+        // A row of the server's answer to reqCompletedOrders, then its end,
+        // as the engine writes them (ibx#695).
+        let info = crate::bridge::RichOrderInfo {
             contract: ApiContract {
                 symbol: symbol.to_string(),
                 sec_type: "STK".into(),
@@ -244,7 +250,10 @@ impl EClient {
                 ..Default::default()
             },
             last_exec: ApiExecution::default(),
-        });
+        };
+        shared.orders.push_completed_row(Some(Box::new((info.contract, info.order, info.order_state))));
+        shared.orders.push_completed_row(None);
+        shared.notify();
         Ok(())
     }
 
@@ -263,7 +272,7 @@ impl EClient {
         Ok(())
     }
 
-    /// Set the smart combo conIds of the logon, tag 6611 (ibx#470,
+    /// Set the smart combo conIds the logon gives (ibx#470,
     /// test-only).
     #[doc(hidden)]
     fn _test_set_smart_combo_con_ids(&self, raw: &str) -> PyResult<()> {
@@ -413,7 +422,7 @@ impl EClient {
     /// Push a TBT trade into SharedState.
     #[doc(hidden)]
     fn _test_push_tbt_trade(
-        &self, instrument: u32, price: f64, size: i64, exchange: &str,
+        &self, instrument: u32, price: f64, size: f64, exchange: &str,
     ) -> PyResult<()> {
         let shared = self.shared_state()?;
         let ps = PRICE_SCALE as f64;
@@ -438,6 +447,32 @@ impl EClient {
             bid: (bid * ps) as i64, ask: (ask * ps) as i64,
             bid_size, ask_size, timestamp: 12345,
             bid_past_low: false, ask_past_high: false,
+        });
+        Ok(())
+    }
+
+    /// Push a depth update (ibx#592).
+    #[doc(hidden)]
+    fn _test_push_depth(&self, req_id: ReqId, position: i32, side: i32, price: f64, size: f64, l2: bool) -> PyResult<()> {
+        self.shared_state()?.market.push_depth_update(DepthUpdate {
+            req_id, position, market_maker: String::new(), operation: 0, side, price, size, is_smart_depth: false, l2,
+        });
+        Ok(())
+    }
+
+    /// Push a histogram: (price, count) pairs (ibx#592).
+    #[doc(hidden)]
+    fn _test_push_histogram(&self, req_id: ReqId, entries: Vec<(f64, i64)>) -> PyResult<()> {
+        let entries = entries.into_iter().map(|(price, count)| crate::control::histogram::HistogramEntry { price, count }).collect();
+        self.shared_state()?.reference.push_histogram_data(req_id, entries);
+        Ok(())
+    }
+
+    /// Push a five-second bar (ibx#592).
+    #[doc(hidden)]
+    fn _test_push_real_time_bar(&self, req_id: ReqId, volume: f64, wap: f64, count: i32) -> PyResult<()> {
+        self.shared_state()?.market.push_real_time_bar(req_id, RealTimeBar {
+            timestamp: 1_760_000_000, open: 1.0, high: 2.0, low: 0.5, close: 1.5, volume, wap, count,
         });
         Ok(())
     }
@@ -636,9 +671,10 @@ impl EClient {
     #[doc(hidden)]
     fn _test_set_position(&self, con_id: i64, position: i64, avg_cost: f64) -> PyResult<()> {
         let shared = self.shared_state()?;
-        let ps = PRICE_SCALE as f64;
+        // With a symbol, as a portfolio row carries one: a row known by its
+        // conId alone waits a little for its contract (ibx#742).
         shared.portfolio.set_position_info(PositionInfo {
-            con_id, position_fixed: position * QTY_SCALE, avg_cost: (avg_cost * ps) as i64, ..Default::default()
+            con_id, position_fixed: position * QTY_SCALE, avg_cost, symbol: con_id.to_string(), ..Default::default()
         });
         Ok(())
     }
@@ -739,6 +775,14 @@ impl EClient {
         Ok(())
     }
 
+    /// The server's answer to a calendar data request, as the engine gives
+    /// it (test-only, ibx#443).
+    #[doc(hidden)]
+    fn _test_push_wsh_answer(&self, req_id: i64, meta: bool, ok: bool, text: String) -> PyResult<()> {
+        self.shared_state()?.reference.push_wsh_answer(crate::bridge::WshAnswer { req_id, meta, ok, text });
+        Ok(())
+    }
+
     /// Queue a link status notice, as the engine does (test-only).
     #[doc(hidden)]
     fn _test_push_connection_notice(&self, code: i64, message: &str) -> PyResult<()> {
@@ -761,5 +805,49 @@ impl EClient {
         let logon = crate::gateway::LogonValues { clock_offset_ms, features: Some(features.to_string()), ..Default::default() };
         crate::gateway::apply_first_logon(&logon, version_cutoff, version_cutoff_date, max_backfill_years, &*self.shared_state()?);
         Ok(())
+    }
+
+    /// The request read from an `updateConfigProtoBuf` argument, in the
+    /// form of the Rust client (ibx#612, test-only).
+    #[doc(hidden)]
+    fn _test_update_config_request(&self, request: Bound<'_, PyAny>) -> PyResult<String> {
+        Ok(format!("{:?}", super::super::config::update_config_request(&request)?))
+    }
+
+    /// Give an update answer to the wrapper, as the official library builds
+    /// it (ibx#612, test-only). `warnings`: (message id, title, text).
+    #[doc(hidden)]
+    #[pyo3(signature = (req_id, status, message, changed_fields, errors, warnings))]
+    fn _test_update_config_response(
+        &self, py: Python<'_>, req_id: Option<i32>, status: Option<String>, message: Option<String>,
+        changed_fields: Vec<String>, errors: Vec<String>, warnings: Vec<(i32, String, String)>,
+    ) -> PyResult<()> {
+        let response = crate::api::config::UpdateConfigResponse {
+            req_id, status, message, changed_fields, errors,
+            warnings: warnings.into_iter()
+                .map(|(id, title, text)| crate::api::config::UpdateConfigWarning {
+                    message_id: Some(id), title: Some(title), message: Some(text),
+                })
+                .collect(),
+        };
+        let object = super::super::config::update_config_response(py, &response)?;
+        self.wrapper.call_method1(py, "update_config_response_proto_buf", (object,))?;
+        Ok(())
+    }
+
+    /// `req_config_proto_buf` on a session of level `level` (ibx#610,
+    /// test-only).
+    #[doc(hidden)]
+    fn _test_req_config_at(&self, py: Python<'_>, level: i32, request: Bound<'_, PyAny>) -> PyResult<()> {
+        let request = super::super::config::config_request(&request)?;
+        self.req_config_at(py, level, &request)
+    }
+
+    /// `update_config_proto_buf` on a session of level `level` (ibx#612,
+    /// test-only).
+    #[doc(hidden)]
+    fn _test_update_config_at(&self, py: Python<'_>, level: i32, request: Bound<'_, PyAny>) -> PyResult<()> {
+        let request = super::super::config::update_config_request(&request)?;
+        self.update_config_at(py, level, &request)
     }
 }

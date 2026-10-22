@@ -54,7 +54,9 @@ impl EClient {
             return Ok(());
         }
         let tx = self.tx()?;
-        let request = crate::types::ControlCommand::CalcOption { req_id, con_id: contract.con_id, kind, under_price };
+        let request = crate::types::ControlCommand::CalcOption {
+            req_id, con_id: contract.con_id, exchange: api.exchange.clone(), kind, under_price,
+        };
         super::send_cmd(py, &tx, crate::client_core::ClientCore::resolve_first(req_id, &api, request))?;
         Ok(())
     }
@@ -73,6 +75,7 @@ impl EClient {
     ) -> PyResult<()> {
         // One API request for the pacing, whatever it sends (ibx#565).
         let _request = crate::engine::park::one_request();
+        if self.core.requests_ignored() { return Ok(()); }
         let _ = implied_vol_options;
         self.calculate_option(py, req_id, contract, crate::control::optcalc::CalcKind::ImpliedVol { option_price }, under_price)
     }
@@ -86,6 +89,7 @@ impl EClient {
     ) -> PyResult<()> {
         // One API request for the pacing, whatever it sends (ibx#565).
         let _request = crate::engine::park::one_request();
+        if self.core.requests_ignored() { return Ok(()); }
         let _ = opt_prc_options;
         self.calculate_option(py, req_id, contract, crate::control::optcalc::CalcKind::Price { volatility }, under_price)
     }
@@ -113,6 +117,7 @@ impl EClient {
     ) -> PyResult<()> {
         // One API request for the pacing, whatever it sends (ibx#565).
         let _request = crate::engine::park::one_request();
+        if self.core.requests_ignored() { return Ok(()); }
         let _ = (req_id, contract, exercise_action, exercise_quantity, account, _override);
         log::warn!("exercise_options: not yet implemented in engine");
         Ok(())
@@ -168,27 +173,32 @@ impl EClient {
 
     // ── Requests a session of the reference does not have (ibx#516) ──
 
-    /// Error 503 for the request, as the official client library answers
-    /// on such a session; a running contract details request goes on.
+    /// Below session level 215, error 503 for the request, as the official
+    /// client library answers; from 215 nothing (ibx#557). A running
+    /// contract details request goes on in both cases.
     fn cancel_contract_data(&self, py: Python<'_>, req_id: i64) -> PyResult<()> {
         // One API request for the pacing, whatever it sends (ibx#565).
         let _request = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(req_id) { return r; }
-        if self.later(move |this, py| this.cancel_contract_data(py, req_id)) { return Ok(()); }
-        let (code, text) = crate::client_core::CANCEL_CONTRACT_DATA_UNSUPPORTED;
-        self.wrapper.call_method1(py, "error", (req_id, code, text, ""))?;
+        // The official client library's own check, on the caller's thread
+        // before anything is sent: never put off (ibx#532).
+        if let Some((code, text)) = crate::client_core::lookup_cancel_refusal(crate::client_core::session_level(), false) {
+            self.wrapper.call_method1(py, "error", (req_id, code, text, ""))?;
+        }
         Ok(())
     }
 
-    /// Error 503 for the request; a running historical ticks request goes
-    /// on.
+    /// Below session level 215, error 503 for the request; from 215
+    /// nothing (ibx#557). A running historical ticks request goes on.
     fn cancel_historical_ticks(&self, py: Python<'_>, req_id: i64) -> PyResult<()> {
         // One API request for the pacing, whatever it sends (ibx#565).
         let _request = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(req_id) { return r; }
-        if self.later(move |this, py| this.cancel_historical_ticks(py, req_id)) { return Ok(()); }
-        let (code, text) = crate::client_core::CANCEL_HISTORICAL_TICKS_UNSUPPORTED;
-        self.wrapper.call_method1(py, "error", (req_id, code, text, ""))?;
+        // The official client library's own check, on the caller's thread
+        // before anything is sent: never put off (ibx#532).
+        if let Some((code, text)) = crate::client_core::lookup_cancel_refusal(crate::client_core::session_level(), true) {
+            self.wrapper.call_method1(py, "error", (req_id, code, text, ""))?;
+        }
         Ok(())
     }
 
@@ -199,6 +209,12 @@ impl EClient {
         let _request = crate::engine::park::one_request();
         let _ = (api_name, api_version);
         if let Some(r) = self.not_connected(-1) { return r; }
+        // With the intent to verify: sent, and the session answers no more
+        // request, as the reference 10.51 (ibx#556).
+        if self.core.extra_auth() {
+            self.core.verify_sent();
+            return Ok(());
+        }
         let (name, version) = (api_name.to_string(), api_version.to_string());
         if self.later(move |this, py| this.verify_request(py, &name, &version)) { return Ok(()); }
         let (id, code, text) = crate::client_core::VERIFY_REQUEST_NO_INTENT;
@@ -206,7 +222,9 @@ impl EClient {
         Ok(())
     }
 
-    /// No verification is in progress: error 10095 as the reference.
+    /// No verification is in progress: no answer, as the reference 10.51
+    /// (ibx#556; paper, 17/10/2026, a client at level 214); error 10095 as
+    /// the reference 10.40 in its replays.
     #[pyo3(signature = (api_data))]
     fn verify_message(&self, py: Python<'_>, api_data: &str) -> PyResult<()> {
         // One API request for the pacing, whatever it sends (ibx#565).
@@ -215,8 +233,14 @@ impl EClient {
         if let Some(r) = self.not_connected(-1) { return r; }
         let data = api_data.to_string();
         if self.later(move |this, py| this.verify_message(py, &data)) { return Ok(()); }
-        let (id, code, text) = crate::client_core::VERIFY_MESSAGE_OUT_OF_SEQUENCE;
-        self.wrapper.call_method1(py, "error", (id, code, text, ""))?;
+        if self.shared_state()?.reference.form_10_40() {
+            let (id, code, text) = crate::client_core::VERIFY_MESSAGE_OUT_OF_SEQUENCE;
+            self.wrapper.call_method1(py, "error", (id, code, text, ""))?;
+            return Ok(());
+        }
+        // No answer, and the session answers no more request, as the
+        // reference 10.51 (ibx#556).
+        self.core.verify_sent();
         Ok(())
     }
 
@@ -227,6 +251,10 @@ impl EClient {
         let _request = crate::engine::park::one_request();
         let _ = (api_name, api_version, opaque_isv_key);
         if let Some(r) = self.not_connected(-1) { return r; }
+        if self.core.extra_auth() {
+            self.core.verify_sent();
+            return Ok(());
+        }
         let (name, version, key) = (api_name.to_string(), api_version.to_string(), opaque_isv_key.to_string());
         if self.later(move |this, py| this.verify_and_auth_request(py, &name, &version, &key)) { return Ok(()); }
         let (id, code, text) = crate::client_core::VERIFY_AND_AUTH_REQUEST_NO_INTENT;
@@ -241,23 +269,72 @@ impl EClient {
         let _request = crate::engine::park::one_request();
         let _ = (api_data, xyz_response);
         if let Some(r) = self.not_connected(-1) { return r; }
+        // The session answers no more request, as the reference 10.51
+        // (ibx#556).
+        if !self.shared_state()?.reference.form_10_40() {
+            self.core.verify_sent();
+        }
         Ok(())
+    }
+
+    // ── Configuration ──
+
+    /// Request the configuration, as the official `reqConfigProtoBuf`
+    /// (session level 219): a `ConfigRequest` of the official library, or
+    /// an object with its attributes; None does nothing. The answer is
+    /// `config_response_proto_buf`: the paper installation's configuration
+    /// with the changes kept from `update_config_proto_buf` (ibx#610).
+    /// Below level 219, error 503 for the request, as the official client
+    /// library answers, and nothing sent. From 219 a logon that forbids
+    /// configuration access gets 321.
+    #[pyo3(signature = (config_request_proto))]
+    fn req_config_proto_buf(&self, py: Python<'_>, config_request_proto: Option<Bound<'_, PyAny>>) -> PyResult<()> {
+        let Some(proto) = config_request_proto.filter(|p| !p.is_none()) else { return Ok(()) };
+        let request = super::super::config::config_request(&proto)?;
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
+        if let Some(r) = self.not_connected(request.req_id.map_or(-1, i64::from)) { return r; }
+        self.req_config_at(py, crate::client_core::session_level(), &request)
+    }
+
+    /// Update the configuration, as the official `updateConfigProtoBuf`
+    /// (session level 221): an `UpdateConfigRequest` of the official
+    /// library, or an object with its attributes; None does nothing. The
+    /// answer is `update_config_response_proto_buf`. Below level 221, error
+    /// 503 for the request, as the official client library answers, and
+    /// nothing sent (ibx#612). From 221 a logon that forbids configuration
+    /// access gets 321; otherwise the update is checked as the reference
+    /// checks it, then a value ibx cannot follow is refused with the field
+    /// named, and the rest is kept (decision of 18/10/2026 on ibx#610).
+    #[pyo3(signature = (update_config_request_proto))]
+    fn update_config_proto_buf(&self, py: Python<'_>, update_config_request_proto: Option<Bound<'_, PyAny>>) -> PyResult<()> {
+        let Some(proto) = update_config_request_proto.filter(|p| !p.is_none()) else { return Ok(()) };
+        let request = super::super::config::update_config_request(&proto)?;
+        // One API request for the pacing, whatever it sends (ibx#565).
+        let _request = crate::engine::park::one_request();
+        if let Some(r) = self.not_connected(request.req_id.map_or(-1, i64::from)) { return r; }
+        self.update_config_at(py, crate::client_core::session_level(), &request)
     }
 
     // ── FA (Financial Advisor) ──
 
-    fn request_fa(&self, py: Python<'_>, _fa_data_type: i32) -> PyResult<()> {
+    fn request_fa(&self, py: Python<'_>, fa_data_type: i32) -> PyResult<()> {
         // One API request for the pacing, whatever it sends (ibx#565).
         let _request = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(-1) { return r; }
-        if self.later(move |this, py| this.request_fa(py, _fa_data_type)) { return Ok(()); }
+        if self.later(move |this, py| this.request_fa(py, fa_data_type)) { return Ok(()); }
         // Not an FA session: error 321 as the reference (ibx#481).
-        if !self.shared_state()?.reference.fa_session() {
+        let shared = self.shared_state()?;
+        if !shared.reference.fa_session() {
             let (id, code, text) = crate::client_core::REQUEST_FA_NOT_FA;
             self.wrapper.call_method1(py, "error", (id, code, text, ""))?;
             return Ok(());
         }
-        log::warn!("request_fa: not yet implemented — needs FIX capture");
+        // From the session's FA data (ibx#507).
+        match crate::client_core::fa_request(&shared, fa_data_type) {
+            Ok(xml) => { self.wrapper.call_method1(py, "receive_fa", (fa_data_type, xml))?; }
+            Err((id, code, text)) => { self.wrapper.call_method1(py, "error", (id, code, text, ""))?; }
+        }
         Ok(())
     }
 
@@ -271,13 +348,22 @@ impl EClient {
         if !crate::client_core::ClientCore::ids_fit("replace_fa", &[req_id]) { return Ok(()); }
         // Not an FA session: error 321 for the request as the reference
         // (ibx#481).
-        if !self.shared_state()?.reference.fa_session() {
+        let shared = self.shared_state()?;
+        if !shared.reference.fa_session() {
             let (code, text) = crate::client_core::REPLACE_FA_NOT_FA;
             self.wrapper.call_method1(py, "error", (req_id, code, text, ""))?;
             return Ok(());
         }
-        let _ = (fa_data_type, cxml);
-        log::warn!("replace_fa: not yet implemented — needs FIX capture");
+        // Checked, replaced and saved; `replace_fa_end` when the saves are
+        // answered (ibx#507).
+        match crate::client_core::fa_replace(&shared, req_id, fa_data_type, cxml) {
+            Ok(Some(save)) => {
+                let tx = self.tx()?;
+                super::send_cmd(py, &tx, save)?;
+            }
+            Ok(None) => {}
+            Err((code, text)) => { self.wrapper.call_method1(py, "error", (req_id, code, text, ""))?; }
+        }
         Ok(())
     }
 
@@ -464,33 +550,36 @@ impl EClient {
 
     // ── WSH ──
 
-    /// The permission check of the reference (ibx#443): error 10276 when
-    /// the session has no WSH news source, 10277 when it is not
-    /// subscribed. The data request itself is not implemented: with the
-    /// permission, error 10279.
+    /// As the reference (ibx#443): error 10276 when the session has no WSH
+    /// news source, 10277 when it is not subscribed; the meta data held is
+    /// given at once; 10278 while a request is on its way; else the request
+    /// goes to the server and its answer comes as `wsh_meta_data`.
     fn req_wsh_meta_data(&self, py: Python<'_>, req_id: i64) -> PyResult<()> {
         // One API request for the pacing, whatever it sends (ibx#565).
         let _request = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(-1) { return r; }
         if self.later(move |this, py| this.req_wsh_meta_data(py, req_id)) { return Ok(()); }
         if !crate::client_core::ClientCore::ids_fit("req_wsh_meta_data", &[req_id]) { return Ok(()); }
-        let (code, text) = crate::client_core::wsh_meta_data_error(&self.shared_state()?.reference);
-        self.wrapper.call_method1(py, "error", (req_id, code, text, ""))?;
-        Ok(())
+        let step = self.core.wsh_meta_request(&*self.shared_state()?, req_id);
+        self.wsh_step(py, req_id, true, step)
     }
 
-    /// No answer, as the reference (ibx#443).
+    /// The request on its way is let go; no answer, as the reference
+    /// (ibx#443).
     fn cancel_wsh_meta_data(&self, req_id: i64) -> PyResult<()> {
         // One API request for the pacing, whatever it sends (ibx#565).
         let _request = crate::engine::park::one_request();
         let _ = req_id;
         if let Some(r) = self.not_connected(-1) { return r; }
+        self.core.wsh_cancel(&*self.shared_state()?);
         Ok(())
     }
 
-    /// The permission check of the reference (ibx#443), as
-    /// `req_wsh_meta_data`. The data request itself is not implemented:
-    /// with the permission, error 10282, since no meta data is held.
+    /// As the reference (ibx#443): the permission errors; 10282 before the
+    /// meta data is held; 10309 unless exactly one of a contract and a
+    /// filter is given; 10283 for a filter that is not a JSON object;
+    /// nothing at all for a date that is not `yyyyMMdd`; 10281 while a
+    /// request is on its way; else the events come as `wsh_event_data`.
     #[pyo3(signature = (req_id, wsh_event_data=None))]
     fn req_wsh_event_data(&self, py: Python<'_>, req_id: i64, wsh_event_data: Option<WshEventDataPy>) -> PyResult<()> {
         // One API request for the pacing, whatever it sends (ibx#565).
@@ -499,18 +588,90 @@ impl EClient {
         let data_later = wsh_event_data.clone();
         if self.later(move |this, py| this.req_wsh_event_data(py, req_id, data_later)) { return Ok(()); }
         if !crate::client_core::ClientCore::ids_fit("req_wsh_event_data", &[req_id]) { return Ok(()); }
-        let _ = wsh_event_data;
-        let (code, text) = crate::client_core::wsh_event_data_error(&self.shared_state()?.reference);
-        self.wrapper.call_method1(py, "error", (req_id, code, text, ""))?;
-        Ok(())
+        let d = wsh_event_data.unwrap_or_default();
+        let request = crate::control::wsh::EventRequest {
+            con_id: d.con_id, filter: d.filter, fill_watchlist: d.fill_watchlist,
+            fill_portfolio: d.fill_portfolio, fill_competitors: d.fill_competitors,
+            start_date: d.start_date, end_date: d.end_date, total_limit: d.total_limit,
+        };
+        let step = self.core.wsh_event_request(&*self.shared_state()?, req_id, &request);
+        self.wsh_step(py, req_id, false, step)
     }
 
-    /// No answer, as the reference (ibx#443).
+    /// As the reference (ibx#443): the meta data request on its way is
+    /// let go, the event request goes on; no answer.
     fn cancel_wsh_event_data(&self, req_id: i64) -> PyResult<()> {
         // One API request for the pacing, whatever it sends (ibx#565).
         let _request = crate::engine::park::one_request();
         let _ = req_id;
         if let Some(r) = self.not_connected(-1) { return r; }
+        self.core.wsh_cancel(&*self.shared_state()?);
+        Ok(())
+    }
+}
+
+impl EClient {
+    /// The outcome of a calendar data request (ibx#443).
+    fn wsh_step(&self, py: Python<'_>, req_id: i64, meta: bool, step: crate::client_core::WshStep) -> PyResult<()> {
+        use crate::client_core::WshStep;
+        match step {
+            WshStep::Refused(code, text) => { self.wrapper.call_method1(py, "error", (req_id, code, text.as_str(), ""))?; }
+            WshStep::Answer(json) => { self.wrapper.call_method1(py, "wsh_meta_data", (req_id, json.as_str()))?; }
+            WshStep::Send(body) => {
+                let tx = self.tx()?;
+                super::send_cmd(py, &tx, crate::types::ControlCommand::WshRequest { req_id, meta, body })?;
+            }
+            WshStep::Nothing => {}
+        }
+        Ok(())
+    }
+
+    /// `req_config_proto_buf` on a session of level `level` (ibx#610).
+    pub(crate) fn req_config_at(&self, py: Python<'_>, level: i32, request: &crate::api::config::ConfigRequest) -> PyResult<()> {
+        let shared = self.shared_state()?;
+        match self.core.config_answer(level, request, &shared.reference.logon_features()) {
+            Err((id, code, text)) if level < crate::client_core::LEVEL_CONFIG => {
+                // The official client library's own check, on the caller's
+                // thread before anything is sent: never put off (ibx#532).
+                self.wrapper.call_method1(py, "error", (id, code, text, ""))?;
+            }
+            Err((id, code, text)) => shared.orders.push_order_error(id, code, text.to_string()),
+            Ok(response) => self.give_config(py, response)?,
+        }
+        Ok(())
+    }
+
+    /// `update_config_proto_buf` on a session of level `level` (ibx#612).
+    pub(crate) fn update_config_at(
+        &self, py: Python<'_>, level: i32, request: &crate::api::config::UpdateConfigRequest,
+    ) -> PyResult<()> {
+        let shared = self.shared_state()?;
+        match self.core.update_config_answer(level, request, &shared.reference.logon_features()) {
+            Err((id, code, text)) if level < crate::client_core::LEVEL_UPDATE_CONFIG => {
+                // The official client library's own check, as above.
+                self.wrapper.call_method1(py, "error", (id, code, text, ""))?;
+            }
+            Err((id, code, text)) => shared.orders.push_order_error(id, code, text.to_string()),
+            Ok(response) => self.give_update_config(py, response)?,
+        }
+        Ok(())
+    }
+
+    /// The configuration to the wrapper, from the event loop (ibx#532).
+    fn give_config(&self, py: Python<'_>, response: crate::api::config::ConfigResponse) -> PyResult<()> {
+        let again = response.clone();
+        if self.later(move |this, py| this.give_config(py, again)) { return Ok(()); }
+        let object = super::super::config::config_response(py, &response)?;
+        self.wrapper.call_method1(py, "config_response_proto_buf", (object,))?;
+        Ok(())
+    }
+
+    /// The answer to an update to the wrapper, from the event loop.
+    fn give_update_config(&self, py: Python<'_>, response: crate::api::config::UpdateConfigResponse) -> PyResult<()> {
+        let again = response.clone();
+        if self.later(move |this, py| this.give_update_config(py, again)) { return Ok(()); }
+        let object = super::super::config::update_config_response(py, &response)?;
+        self.wrapper.call_method1(py, "update_config_response_proto_buf", (object,))?;
         Ok(())
     }
 }

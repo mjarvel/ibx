@@ -91,6 +91,50 @@ def test_the_plain_objects_start_as_the_official_ones():
         assert vars(ours()) == vars(theirs()), ours.__name__
 
 
+# ibx#697 (decision of 15/10/2026): a callback object lists the official names
+# only; the second spelling stays usable. One known difference (ibx#712): the
+# bar keeps the time zone of its date, which the official object drops.
+CALLBACK_OBJECTS = {
+    "Contract": "ibapi.contract", "ContractDetails": "ibapi.contract", "ComboLeg": "ibapi.contract",
+    "ContractDescription": "ibapi.contract", "Order": "ibapi.order", "OrderComboLeg": "ibapi.order",
+    "OrderState": "ibapi.order_state", "Execution": "ibapi.execution", "TagValue": "ibapi.tag_value",
+    "BarData": "ibapi.common", "TickAttrib": "ibapi.common", "TickAttribLast": "ibapi.common",
+    "TickAttribBidAsk": "ibapi.common", "HistoricalTick": "ibapi.common", "HistoricalTickLast": "ibapi.common",
+    "HistoricalTickBidAsk": "ibapi.common", "HistogramData": "ibapi.common",
+    "CommissionAndFeesReport": "ibapi.commission_and_fees_report", "SoftDollarTier": "ibapi.softdollartier",
+    "NewsProvider": "ibapi.common", "SmartComponent": "ibapi.common", "DepthMktDataDescription": "ibapi.common",
+    "IneligibilityReason": "ibapi.ineligibility_reason", "WshEventData": "ibapi.common",
+    "OrderAllocation": "ibapi.order_state", "PriceCondition": "ibapi.order_condition",
+    "TimeCondition": "ibapi.order_condition", "MarginCondition": "ibapi.order_condition",
+    "ExecutionCondition": "ibapi.order_condition", "VolumeCondition": "ibapi.order_condition",
+    "PercentChangeCondition": "ibapi.order_condition",
+}
+CONDITION_TYPES = {"Price", "Time", "Margin", "Execution", "Volume", "PercentChange"}
+# None left: BarData's timezone went with ibx#654.
+KNOWN_ATTRIBUTE_DIFFERENCES = {}
+
+
+def test_callback_objects_list_the_official_names():
+    pytest.importorskip("ibapi")
+    import importlib
+
+    import ibx
+
+    def listed(obj):
+        return {n for n in dir(obj) if not n.startswith("_") and not callable(getattr(obj, n))}
+
+    for name, module in CALLBACK_OBJECTS.items():
+        theirs = listed(getattr(importlib.import_module(module), name)())
+        obj = getattr(ibx, name)()
+        ours = listed(obj)
+        missing, extra = KNOWN_ATTRIBUTE_DIFFERENCES.get(name, (set(), set()))
+        assert (theirs - ours, ours - theirs) == (missing, extra), name
+    # The second spelling is still there.
+    attrib = ibx.TickAttrib()
+    attrib.can_auto_execute = True
+    assert attrib.canAutoExecute and "can_auto_execute" not in dir(attrib)
+
+
 class App(on.EWrapper, on.EClient):
     """A client in the form of the scripts written for the official library."""
 
@@ -189,3 +233,49 @@ def test_live_script_in_the_official_form_runs_on_the_paper_account():
     finally:
         app.disconnect()
         loop.join(timeout=5)
+
+
+# ibx#712: the execution's exercise or lapse type, the condition type numbers
+# and the trigger methods, as the official objects give them.
+def test_exercise_type_condition_numbers_and_trigger_methods():
+    pytest.importorskip("ibapi")
+    import ibx
+    from ibapi.execution import Execution, OptionExerciseType
+    from ibapi.order_condition import PriceCondition, VolumeCondition
+
+    ours, theirs = ibx.Execution(), Execution()
+    assert ours.optExerciseOrLapseType.value == theirs.optExerciseOrLapseType.value == (-1, "None")
+    ours.optExerciseOrLapseType = OptionExerciseType.Lapse
+    assert ours.optExerciseOrLapseType.name == "Lapse" and "OptExerciseOrLapseType: Lapse" in str(ours)
+    for name in ["Price", "Time", "Margin", "Execution", "Volume", "PercentChange"]:
+        assert getattr(ibx.VolumeCondition, name) == getattr(VolumeCondition, name), name
+    ours, theirs = ibx.PriceCondition.TriggerMethodEnum, PriceCondition.TriggerMethodEnum
+    assert ours.idx2name == theirs.idx2name and ours.MidPoint == theirs.MidPoint == 8
+    assert ours.toStr(7) == "LastBidAsk" and ours.toStr(99) == "NOTFOUND"
+
+
+# ibx#602: at session level 225 the official contract row carries the fund
+# asset type and distribution policy as members of its enums (NoneItem when
+# the row has none), and 0 as an integer for an absent multiplier or coupon.
+def test_contract_details_fund_enums_and_absent_numbers():
+    pytest.importorskip("ibapi")
+    import ibx
+    from ibapi.contract import ContractDetails, FundAssetType, FundDistributionPolicyIndicator
+
+    ours, theirs = ibx.ContractDetails(), ContractDetails()
+    for name in ("fundAssetType", "fundDistributionPolicyIndicator"):
+        a, b = getattr(ours, name), getattr(theirs, name)
+        assert (type(a).__name__, a.name, a.value) == (type(b).__name__, b.name, b.value), name
+    for name in ("evMultiplier", "coupon"):
+        assert type(getattr(ours, name)) is type(getattr(theirs, name)) is int and getattr(ours, name) == 0, name
+    assert [(m.name, m.value) for m in type(ours.fundAssetType)] == [(m.name, m.value) for m in FundAssetType]
+    assert [(m.name, m.value) for m in type(ours.fundDistributionPolicyIndicator)] ==         [(m.name, m.value) for m in FundDistributionPolicyIndicator]
+    ours.fund_asset_type, ours.fund_distribution_policy_indicator = "004", "Y"
+    assert (ours.fundAssetType.name, ours.fundDistributionPolicyIndicator.name) == ("Equity", "IncomeFund")
+    ours.fund_asset_type = "000"          # the official lookup finds no member for it
+    assert ours.fundAssetType.name == "NoneItem"
+    ours.fundAssetType = FundAssetType.Sector
+    ours.fundDistributionPolicyIndicator = FundDistributionPolicyIndicator.NoneItem
+    assert (ours.fund_asset_type, ours.fund_distribution_policy_indicator) == ("005", "")
+    ours.evMultiplier, ours.coupon = 2.5, 1.25
+    assert (ours.evMultiplier, ours.ev_multiplier, ours.coupon) == (2.5, 2.5, 1.25)

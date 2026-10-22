@@ -18,13 +18,12 @@ impl EClient {
         if !crate::client_core::ClientCore::ids_fit("req_pnl", &[req_id]) { return Ok(()); }
         // Several requests can run; an empty or unknown account gives 321, a
         // request id already running gives 102 (ibx#478).
+        // Nothing is sent to the server: the P&L quotes go from the next
+        // event loop pass, as for the Rust client (ibx#511).
         if let Err((code, message)) = self.core.request_pnl(req_id, account, &self.account()) {
             self.shared_state()?.orders.push_order_error(req_id, code, message);
-            return Ok(());
         }
-        let tx = self.tx()?;
-        send_cmd(py, &tx, ControlCommand::SubscribePnl { req_id, account: account.to_string() })?;
-        let _ = model_code;
+        let _ = (py, model_code);
         Ok(())
     }
 
@@ -35,12 +34,11 @@ impl EClient {
         if let Some(r) = self.not_connected(-1) { return r; }
         if !crate::client_core::ClientCore::ids_fit("cancel_pnl", &[req_id]) { return Ok(()); }
         // A request id not running gives 10185 (ibx#478).
+        // Nothing is sent: the reference keeps its P&L quotes (ibx#511).
         if let Some((code, message)) = self.core.cancel_pnl_request(req_id) {
             self.shared_state()?.orders.push_order_error(req_id, code, message);
-            return Ok(());
         }
-        let tx = self.tx()?;
-        let _ = send_cmd(py, &tx, ControlCommand::CancelPnl { req_id });
+        let _ = py;
         Ok(())
     }
 
@@ -125,6 +123,14 @@ impl EClient {
         }
         // A subscription, as the reference (ibx#477): the snapshot and
         // position_end once the data is in, then a row on each change.
+        // Made at its turn among the requests, as the Rust client: the
+        // session's state answers it only then (ibx#662).
+        // From the event loop, at its place among the answers (ibx#532).
+        if self.later(|this, py| {
+            this.core.subscribe_positions();
+            let shared = this.shared_state()?;
+            this.dispatch_positions(py, &shared)
+        }) { return Ok(()); }
         self.core.subscribe_positions();
         self.dispatch_positions(py, &shared)
     }
@@ -134,6 +140,8 @@ impl EClient {
         // One API request for the pacing, whatever it sends (ibx#565).
         let _request = crate::engine::park::one_request();
         if let Some(r) = self.not_connected(-1) { return r; }
+        // After the request it follows, made at its turn (ibx#662).
+        if self.later(|this, _py| { this.core.unsubscribe_positions(); Ok(()) }) { return Ok(()); }
         self.core.unsubscribe_positions();
         Ok(())
     }
@@ -184,6 +192,8 @@ impl EClient {
             shared.orders.push_order_error(req_id, code, message);
             return Ok(());
         }
+        // From the event loop, at its place among the answers (ibx#532).
+        if self.later(|this, py| { let shared = this.shared_state()?; this.dispatch_multi(py, &shared) }) { return Ok(()); }
         self.dispatch_multi(py, &shared)
     }
 
@@ -212,6 +222,8 @@ impl EClient {
             return Ok(());
         }
         self.core.subscribe_positions_multi(req_id, account, model_code);
+        // From the event loop, at its place among the answers (ibx#532).
+        if self.later(|this, py| { let shared = this.shared_state()?; this.dispatch_multi(py, &shared) }) { return Ok(()); }
         self.dispatch_multi(py, &shared)
     }
 

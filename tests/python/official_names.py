@@ -229,17 +229,30 @@ class EClient:
 
     def connect(self, host="127.0.0.1", port=4002, clientId=0):
         """Logs in to the paper system with the credentials of the environment.
-        ``host`` and ``port`` name the reference's socket and are not used."""
+        ``host`` and ``port`` name the reference's socket and are not used.
+        ``IBX_COPIED_WAITS=1`` turns the copied waits on (ibx#564)."""
         username, password = os.environ.get("IB_USERNAME"), os.environ.get("IB_PASSWORD")
         if not username or not password:
             raise RuntimeError("IB_USERNAME / IB_PASSWORD of the paper account are not set")
         to = {"host": os.environ["IB_HOST"]} if os.environ.get("IB_HOST") else {}
+        # IBX_COPIED_WAITS=1: the reference's own waits copied, for a
+        # comparison of timings (ibx#564).
+        to["copied_waits"] = os.environ.get("IBX_COPIED_WAITS") == "1"
         self.ibx.connect(client_id=clientId, username=username, password=password, paper=True, **to)
         try:
             assert_paper_account(self.ibx.get_account_id())
         except SystemExit:
             self.ibx.disconnect()
             raise
+
+    @property
+    def extraAuth(self):
+        """The intent to verify, as the official client's attribute (ibx#556)."""
+        return self.ibx.extraAuth
+
+    @extraAuth.setter
+    def extraAuth(self, on):
+        self.ibx.extraAuth = on
 
     def cancelOrder(self, orderId, orderCancel=None):
         return self.ibx.cancel_order(orderId, getattr(orderCancel, "manualOrderCancelTime", ""))

@@ -603,6 +603,7 @@ class TestReqOpenOrdersOrderState:
             action="BUY", total_quantity=100.0, lmt_price=400.0,
         )
         c.req_open_orders()
+        c._test_dispatch_once()
 
         open_events = [e for e in w.events if e[0] == "open_order"]
         assert len(open_events) == 1, f"expected 1 open_order, got {open_events}"
@@ -681,7 +682,7 @@ class TestOpenOrderValues:
     def _last_open_order(self, w):
         return [e for e in w.events if e[0] == "open_order"][-1]
 
-    def test_a_filled_order_shows_what_was_filled_and_no_completed_fields(self):
+    def test_a_filled_order_shows_what_was_filled_and_its_filled_size(self):
         w, c = self._placed()
         c._test_set_instrument_count(1)
         c._test_push_fill(0, order_id=42, side="BUY", price=10.0, qty=40, remaining=60)
@@ -695,7 +696,8 @@ class TestOpenOrderValues:
         c._test_dispatch_once()
         _, _, contract, order, state = self._last_open_order(w)
         assert state["status"] == "Filled" and float(order.filled_quantity) == 100.0
-        assert (state["completed_status"], state["completed_time"]) == ("", ""), "those are for completedOrder"
+        # On 10.51 a filled order's openOrder carries its filled size (ibx#605).
+        assert state["completed_status"] == "Filled Size: 100"
         assert order.cash_qty == sys.float_info.max
 
     def test_no_commission_is_unset_in_open_order(self):
@@ -708,6 +710,7 @@ class TestOpenOrderValues:
     def test_open_order_shows_the_conditions_of_the_order(self):
         w, c = self._placed(conditions=[TimeCondition(True, "20991231-23:59:59"), PriceCondition()])
         c.req_open_orders()
+        c._test_dispatch_once()
         order = self._last_open_order(w)[3]
         first, second = order.conditions
         assert (type(first).__name__, first.isMore, first.time, first.condType) == ("TimeCondition", True, "20991231-23:59:59", 3)
@@ -729,6 +732,7 @@ class TestReqCompletedOrdersOrderState:
             commission_and_fees=2.50,
         )
         c.req_completed_orders(False)
+        c._test_dispatch_once()
 
         completed_events = [e for e in w.events if e[0] == "completed_order"]
         assert len(completed_events) == 1, f"expected 1 completed_order, got {completed_events}"
@@ -778,6 +782,10 @@ class TestReqCompletedOrdersOrderState:
             threading.Thread(target=c.run, daemon=True).start()
             time.sleep(0.05)
             c.req_completed_orders(False)
+            # The answer comes through the event loop (ibx#695): wait for its end.
+            deadline = time.time() + 5
+            while "end" not in w.seen and time.time() < deadline:
+                time.sleep(0.01)
             print(",".join(w.seen))
         ''')
         done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=30)
@@ -1008,16 +1016,16 @@ class TestAccountDispatch:
         assert "BuyingPower" in tags
         assert tags["NetLiquidation"] == "100000.00"
 
-        # Each frame twice, as the reference (ibx#486: its listener is
-        # registered twice).
         end_events = [e for e in w.events if e[0] == "account_summary_end"]
-        assert len(end_events) == 2
+        # Each frame once at session level 225 (twice at 214, ibx#662, ibx#602).
+        assert len(end_events) == 1
 
     def test_positions(self):
         w, c = make_test_client("DU12345")
         c._test_set_position(265598, 100, 150.50)
         c._test_account_download_complete()  # positions answer then (ibx#477)
         c.req_positions()
+        c._test_dispatch_once()  # from the event loop (ibx#532)
 
         pos_events = [e for e in w.events if e[0] == "position"]
         end_events = [e for e in w.events if e[0] == "position_end"]
