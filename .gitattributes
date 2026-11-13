@@ -1,0 +1,6 @@
+# LF everywhere in the working tree, so editors and tools agree; batch files need CRLF.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ico binary
+*.png binary
